@@ -1,4 +1,6 @@
 __pycache__/
+.venv/
+venv/
 data/
 report.html
 models/tinyphysics_*.onnx
