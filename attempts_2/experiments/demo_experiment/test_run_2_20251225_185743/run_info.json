@@ -1,0 +1,16 @@
+{
+  "run_name": "test_run_2",
+  "experiment": "demo_experiment",
+  "timestamp": "2025-12-25T18:57:43.360083",
+  "status": "completed",
+  "params": {
+    "lr": 0.0001,
+    "batch_size": 512
+  },
+  "metrics": {
+    "train_loss": 0.089,
+    "val_loss": 0.234
+  },
+  "artifacts": [],
+  "duration": 0.5045349597930908
+}

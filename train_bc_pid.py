@@ -30,23 +30,30 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import trange, tqdm
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, set_start_method
 import glob
+
+# Fix for macOS multiprocessing hang when imported (not run as __main__)
+try:
+    set_start_method('fork')
+except RuntimeError:
+    pass  # Already set
 
 from tinyphysics import TinyPhysicsModel, TinyPhysicsSimulator, CONTROL_START_IDX
 from controllers import BaseController
 from controllers.pid import Controller as PIDController
 
 # Same architecture as train_ppo_pure.py
-state_dim, action_dim = 57, 1
+state_dim, action_dim = 56, 1
 hidden_dim = 128
 trunk_layers, head_layers = 1, 3
 STEER_RANGE = (-2.0, 2.0)
 
 # State normalization (matching PID's actual computation)
 # error_diff is ~10× larger than error_derivative (no /dt), so scale accordingly
+# a_ego removed: it's redundant (already in future_plan.v_ego)
 OBS_SCALE = np.array(
-    [10.0, 1.0, 1.0, 2.0, 0.03, 20.0, 1000.0] +  # [error, error_diff, error_integral, lataccel, v_ego, a_ego, curv]
+    [10.0, 1.0, 0.1, 2.0, 0.03, 1000.0] +  # [error, error_diff, error_integral, lataccel, v_ego, curv]
     [1000.0] * 50,
     dtype=np.float32
 )
@@ -54,8 +61,9 @@ OBS_SCALE = np.array(
 device = torch.device('cpu')
 
 def build_state(target_lataccel, current_lataccel, state, future_plan, prev_error, error_integral):
-    """57D: PID terms (3) + current state (4) + 50 future curvatures
+    """56D: PID terms (3) + current state (3) + 50 future curvatures
     NOTE: Match PID's actual computation (no dt scaling, no clipping)
+    NOTE: a_ego removed - already baked into future_plan.v_ego
     """
     eps = 1e-6
     error = target_lataccel - current_lataccel
@@ -74,7 +82,7 @@ def build_state(target_lataccel, current_lataccel, state, future_plan, prev_erro
     while len(future_curvs) < 50:
         future_curvs.append(0.0)
     
-    state_vec = [error, error_diff, error_integral, current_lataccel, state.v_ego, state.a_ego, curv_now] + future_curvs
+    state_vec = [error, error_diff, error_integral, current_lataccel, state.v_ego, curv_now] + future_curvs
     return np.array(state_vec, dtype=np.float32)
 
 class BCNetwork(nn.Module):
@@ -140,17 +148,13 @@ class LoggingController(BaseController):
 # Global model per worker (initialized once per process)
 _worker_model = None
 
-def _init_worker():
-    """Initialize model once per worker process"""
-    global _worker_model
-    _worker_model = TinyPhysicsModel("./models/tinyphysics.onnx", debug=False)
-
 def _collect_single_file(data_file):
     """Worker function to process a single file (for multiprocessing)"""
-    global _worker_model
+    # Load model in each call (slower but avoids deadlock)
+    model = TinyPhysicsModel("./models/tinyphysics.onnx", debug=False)
     pid = PIDController()
     logger = LoggingController(pid)
-    sim = TinyPhysicsSimulator(_worker_model, data_file, controller=logger, debug=False)
+    sim = TinyPhysicsSimulator(model, data_file, controller=logger, debug=False)
     sim.rollout()
     
     # Only keep states after control starts
@@ -166,16 +170,23 @@ def collect_expert_data(data_files, n_files=1000):
     print(f"Collecting PID demonstrations from {n_files} files (parallel)...")
     
     # Use multiprocessing to speed up data collection
-    n_workers = min(cpu_count(), 16)  # Cap at 16 to avoid overwhelming system
+    # NOTE: Load model in each worker call (not initializer) to avoid deadlock
+    n_workers = min(cpu_count() // 2, 4)  # Conservative: max 4 workers
     
-    with Pool(n_workers, initializer=_init_worker) as pool:
-        # Use larger chunksize to reduce overhead
-        chunksize = max(1, len(files_to_process) // (n_workers * 4))
-        results = list(tqdm(
-            pool.imap(_collect_single_file, files_to_process, chunksize=chunksize),
-            total=len(files_to_process),
-            desc="Collecting expert data"
-        ))
+    if n_workers > 1:
+        with Pool(n_workers) as pool:  # No initializer
+            # Use larger chunksize to reduce model loading overhead
+            chunksize = max(1, len(files_to_process) // (n_workers * 2))
+            results = list(tqdm(
+                pool.imap(_collect_single_file, files_to_process, chunksize=chunksize),
+                total=len(files_to_process),
+                desc="Collecting expert data"
+            ))
+    else:
+        # Serial fallback
+        results = []
+        for f in tqdm(files_to_process, desc="Collecting expert data"):
+            results.append(_collect_single_file(f))
     
     # Aggregate results
     all_states = []
@@ -228,7 +239,7 @@ def evaluate_bc(network, model, data_files, n_eval=20):
     
     return np.mean(costs)
 
-def train_bc():
+def train_bc(n_expert_files=5000):
     model = TinyPhysicsModel("./models/tinyphysics.onnx", debug=False)
     all_files = sorted(glob.glob("./data/*.csv"))
     
@@ -245,8 +256,8 @@ def train_bc():
     print(f"Train: {len(train_files)}, Val: {len(val_files)}")
     print("="*60)
     
-    # Collect expert data (1000 files for better coverage of difficulty distribution)
-    states, actions = collect_expert_data(train_files, n_files=1000)
+    # Collect expert data
+    states, actions = collect_expert_data(train_files, n_files=n_expert_files)
     
     # Create network
     network = BCNetwork(state_dim, action_dim, hidden_dim, trunk_layers, head_layers).to(device)

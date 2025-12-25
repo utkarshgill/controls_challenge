@@ -1,0 +1,26 @@
+{
+  "run_name": "bc_1000_for_ppo",
+  "experiment": "bc_experiments",
+  "timestamp": "2025-12-25T19:31:52.983927",
+  "status": "completed",
+  "params": {
+    "state_dim": 56,
+    "action_dim": 1,
+    "hidden_dim": 128,
+    "trunk_layers": 1,
+    "head_layers": 3,
+    "n_expert_files": 1000,
+    "n_epochs": 50,
+    "batch_size": 256,
+    "lr": 0.001
+  },
+  "metrics": {},
+  "artifacts": [
+    "bc_pid_best.pth",
+    "bc_pid_checkpoint.pth"
+  ],
+  "notes": [
+    "Metrics logged by train_bc() - see stdout"
+  ],
+  "duration": 227.38491582870483
+}
