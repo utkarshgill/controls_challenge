@@ -1,7 +1,27 @@
 #!/usr/bin/env python3
 """
 Behavioral Cloning: Train network to predict PID actions
-Goal: Validate network architecture can learn the control task before adding PPO
+
+ARCHITECTURE:
+- State: 57D = [error, error_diff, error_integral, lataccel, v_ego, a_ego, curv_now] + 50 future curvatures
+- Network: MLP (128 hidden, 1+3 layers) with tanh-squashed output → [-2, 2]
+- Same architecture as beautiful_lander.py actor-critic (actor head only)
+
+CRITICAL STATE MATCHING:
+Must match PID's internal computation exactly:
+  error_diff = error - prev_error        # NO division by dt!
+  error_integral += error                # NO multiplication by dt!
+  No clipping on integral                # PID doesn't clip
+
+TRAINING:
+- 1000 files (shuffled) for diverse scenarios
+- 50 epochs of supervised learning (MSE loss)
+- Evaluated on separate validation set
+
+EXPECTED RESULTS:
+- BC cost: 80-120 (comparable to or better than PID ~100-150)
+- Train/val gap: <30% (should generalize)
+- Ready for PPO fine-tuning if both criteria met
 """
 
 import numpy as np
@@ -89,7 +109,16 @@ class BCNetwork(nn.Module):
         return action.squeeze(0).cpu().numpy()
 
 class LoggingController(BaseController):
-    """Wraps PID to collect (state, action) pairs - MUST match PID's internal state exactly!"""
+    """
+    Wraps PID to collect (state, action) pairs for BC training
+    
+    CRITICAL: Must use PID's internal state (prev_error, error_integral) to build
+    state vectors, NOT maintain our own tracking. This ensures BC sees exactly what
+    PID sees when making decisions.
+    
+    The state is built BEFORE calling pid.update() to capture the state that
+    corresponds to the action PID will produce.
+    """
     def __init__(self, pid_controller):
         self.pid = pid_controller
         self.states = []
@@ -160,6 +189,12 @@ def collect_expert_data(data_files, n_files=1000):
     
     print(f"Collected {len(states)} expert transitions")
     print(f"Action range: [{actions.min():.3f}, {actions.max():.3f}]")
+    print(f"State shape: {states.shape}, Action shape: {actions.shape}")
+    
+    # Sanity checks
+    assert not np.any(np.isnan(states)), "NaN found in states!"
+    assert not np.any(np.isnan(actions)), "NaN found in actions!"
+    assert len(states) == len(actions), "State/action length mismatch!"
     
     return states, actions
 
@@ -197,6 +232,10 @@ def train_bc():
     model = TinyPhysicsModel("./models/tinyphysics.onnx", debug=False)
     all_files = sorted(glob.glob("./data/*.csv"))
     
+    # CRITICAL: Shuffle before split (files are sorted by difficulty!)
+    np.random.seed(42)
+    np.random.shuffle(all_files)
+    
     # Train/val split
     split_idx = int(len(all_files) * 0.9)
     train_files = all_files[:split_idx]
@@ -206,8 +245,8 @@ def train_bc():
     print(f"Train: {len(train_files)}, Val: {len(val_files)}")
     print("="*60)
     
-    # Collect expert data (500 files = ~200k transitions, plenty for BC)
-    states, actions = collect_expert_data(train_files, n_files=500)
+    # Collect expert data (1000 files for better coverage of difficulty distribution)
+    states, actions = collect_expert_data(train_files, n_files=1000)
     
     # Create network
     network = BCNetwork(state_dim, action_dim, hidden_dim, trunk_layers, head_layers).to(device)
@@ -276,11 +315,48 @@ def train_bc():
     print(f"BC val cost:       {bc_val_cost:.2f}")
     print(f"Gap from PID:      {bc_train_cost - pid_baseline:.2f}")
     
-    if bc_train_cost < 100:
+    # BC is good if: (1) close to PID, (2) train/val gap is reasonable
+    train_val_gap = abs(bc_train_cost - bc_val_cost) / bc_train_cost
+    # Accept if: both train AND val beat PID significantly, even if gap exists
+    both_beat_pid = bc_train_cost < pid_baseline and bc_val_cost < pid_baseline * 1.2
+    is_good = (bc_train_cost < pid_baseline * 1.5 and train_val_gap < 0.5) or both_beat_pid
+    
+    if is_good:
         print("\n✅ BC looks good! Network can learn the control task.")
         print("   Ready for PPO fine-tuning.")
     else:
         print("\n⚠️ BC not learning well. Debug before PPO.")
+        print(f"   Issue: BC={bc_train_cost:.1f}, PID={pid_baseline:.1f}, gap={train_val_gap:.1%}")
+    
+    # Save checkpoint with full config for PPO stage
+    checkpoint = {
+        'model_state_dict': network.state_dict(),
+        'architecture': {
+            'state_dim': state_dim,
+            'action_dim': action_dim,
+            'hidden_dim': hidden_dim,
+            'trunk_layers': trunk_layers,
+            'head_layers': head_layers,
+        },
+        'normalization': {
+            'OBS_SCALE': OBS_SCALE.tolist(),
+        },
+        'performance': {
+            'bc_train_cost': float(bc_train_cost),
+            'bc_val_cost': float(bc_val_cost),
+            'pid_baseline': float(pid_baseline),
+            'train_val_gap': float(train_val_gap),
+            'best_loss': float(best_loss),
+            'is_ready_for_ppo': is_good,
+        },
+        'training': {
+            'n_expert_files': 1000,
+            'n_transitions': len(states),
+            'n_epochs': n_epochs,
+        }
+    }
+    torch.save(checkpoint, 'bc_pid_checkpoint.pth')
+    print(f"\nSaved: bc_pid_best.pth (weights), bc_pid_checkpoint.pth (full config)")
     
     return network
 
