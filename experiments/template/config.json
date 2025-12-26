@@ -1,0 +1,47 @@
+{
+  "experiment": {
+    "name": "expXX_name",
+    "date": "YYYY-MM-DD",
+    "description": "Short description"
+  },
+  "state": {
+    "dim": 56,
+    "features": [
+      "error",
+      "error_diff", 
+      "error_integral",
+      "current_lataccel",
+      "v_ego",
+      "curv_now",
+      "future_curv_0_49"
+    ],
+    "obs_scale": [10.0, 1.0, 0.1, 2.0, 0.03, 1000.0],
+    "includes_a_ego": false,
+    "anti_windup_bounds": [-14, 14]
+  },
+  "model": {
+    "architecture": "BCNetwork",
+    "trunk_dim": 128,
+    "hidden_dim": 128,
+    "num_layers": 3,
+    "action_dim": 1
+  },
+  "training": {
+    "algorithm": "BC",
+    "n_files": 5000,
+    "epochs": 50,
+    "batch_size": 512,
+    "learning_rate": 0.001,
+    "optimizer": "Adam",
+    "weight_decay": 1e-4
+  },
+  "evaluation": {
+    "n_test_files": 100,
+    "test_seed": 42
+  },
+  "hardware": {
+    "device": "cpu",
+    "n_workers": 16
+  }
+}
+

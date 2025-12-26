@@ -31,17 +31,17 @@ OBS_SCALE = np.array(
     dtype=np.float32
 )
 
-# PPO hyperparameters (what worked before = 180 cost)
+# PPO hyperparameters (FIXED to match beautiful_lander.py)
 n_epochs = 100
 num_envs = 8  # Parallel environments
 steps_per_epoch = 10_000  # Total steps across all envs per epoch (~25 episodes)
-batch_size = 2048
-K_epochs = 4
-lr = 1e-5  # Same as before
+batch_size = 10_000  # Match reference
+K_epochs = 10  # Match reference
+lr = 1e-3  # FIXED: was 1e-5 (100× too slow!)
 gamma = 0.99
 gae_lambda = 0.95
-eps_clip = 0.1
-entropy_coef = 0.0
+eps_clip = 0.2  # Match reference
+entropy_coef = 0.001  # FIXED: was 0.0 (no exploration!)
 
 device = torch.device('cpu')
 SEED = 42
@@ -136,18 +136,18 @@ class TinyPhysicsGymEnv(gym.Env):
         self.sim.sim_step(self.sim.step_idx)
         self.sim.step_idx += 1
         
-        # Compute reward - SIMPLE version that worked before (180 cost)
-        # Just add target tracking to the lat_cost
+        # Compute reward - FIXED to match evaluation cost exactly!
+        # Eval: total = (50 × lat_cost) + jerk_cost
         lat_cost = (current_lataccel - target_lataccel) ** 2
-        jerk_cost = (current_lataccel - self.prev_lataccel) ** 2
-        reward = -(lat_cost + jerk_cost) / 100.0
+        jerk_cost = ((current_lataccel - self.prev_lataccel) / 0.1) ** 2  # dt = 0.1
+        reward = -(50 * lat_cost + jerk_cost) / 100.0  # FIXED: was equal weight!
         
-        # Accumulate episode cost
-        self.episode_cost += (lat_cost + jerk_cost)
+        # Accumulate episode cost (match eval: 50:1 weighting!)
+        self.episode_cost += (50 * lat_cost + jerk_cost)
         
-        # Update internal state
+        # Update internal state with anti-windup
         error = target_lataccel - current_lataccel
-        self.error_integral += error
+        self.error_integral = np.clip(self.error_integral + error, -14, 14)  # Anti-windup
         self.prev_error = error
         self.prev_lataccel = current_lataccel
         
@@ -195,8 +195,8 @@ class ActorCritic(nn.Module):
         self.actor_layers = nn.Sequential(*[layer for _ in range(head_layers)
                                            for layer in [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]])
         self.actor_mean = nn.Linear(hidden_dim, action_dim)
-        # Conservative std for fine-tuning (0.05)
-        self.log_std = nn.Parameter(torch.ones(action_dim) * np.log(0.05))
+        # FIXED: Match reference (std=1.0, not 0.05!)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
         
         # Critic head
         self.critic_layers = nn.Sequential(*[layer for _ in range(head_layers)
@@ -286,7 +286,7 @@ class PPO:
             for batch in DataLoader(dataset, batch_size=self.batch_size, shuffle=True):
                 self.optimizer.zero_grad()
                 self.compute_losses(*batch).backward()
-                torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), max_norm=0.1)
+                torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), max_norm=0.5)  # Match reference
                 self.optimizer.step()
         
         self.states, self.actions = [], []
@@ -301,6 +301,7 @@ def rollout(env, policy, num_steps):
     episode_costs = []
     step_count = 0
     
+    pbar = tqdm(total=num_steps, desc="Rollout", leave=False)
     while step_count < num_steps:
         actions = policy(states)
         states, rewards, terminated, truncated, infos = env.step(actions)
@@ -309,20 +310,18 @@ def rollout(env, policy, num_steps):
         traj_rewards.append(rewards)
         traj_dones.append(dones)
         step_count += env.num_envs
+        pbar.update(env.num_envs)
         
-        # Extract episode costs from info dict (AsyncVectorEnv format)
-        # When an episode finishes, Gymnasium puts final info in infos['final_info']
-        if 'final_info' in infos:
-            for info_dict in infos['final_info']:
-                if info_dict is not None and 'episode_cost' in info_dict:
-                    episode_costs.append(info_dict['episode_cost'])
-        
-        # Fallback: check individual info dicts (for older Gymnasium versions)
-        elif isinstance(infos, dict) and len(infos) > 0:
-            for i in range(env.num_envs):
-                if dones[i] and 'episode_cost' in infos.get(i, {}):
-                    episode_costs.append(infos[i]['episode_cost'])
+        # Extract episode costs - AsyncVectorEnv puts episode_cost directly in infos dict
+        # infos = {'episode_cost': array([...]), '_episode_cost': array([...])}
+        if isinstance(infos, dict) and 'episode_cost' in infos:
+            # Get costs for all envs that finished this step
+            costs_array = np.array(infos['episode_cost'])
+            for i, done_flag in enumerate(dones):
+                if done_flag and not np.isnan(costs_array[i]):
+                    episode_costs.append(float(costs_array[i]))
     
+    pbar.close()
     return traj_rewards, traj_dones, episode_costs
 
 def train_ppo(bc_checkpoint_path='bc_pid_checkpoint.pth'):
@@ -405,9 +404,9 @@ def train_ppo(bc_checkpoint_path='bc_pid_checkpoint.pth'):
             if epoch % 5 == 0:
                 pbar.write(f"Epoch {epoch:3d} | Cost: {mean_cost:6.2f} | Best: {best_cost:6.2f} | Episodes: {len(episode_costs)}")
             
-            # Early stopping if cost explodes
-            if mean_cost > 1000:
-                pbar.write(f"\n⚠️  Cost exploded to {mean_cost:.2f}. Stopping early.")
+            # Early stopping if cost explodes (only after learning starts)
+            if epoch > 20 and mean_cost > 10 * best_cost:
+                pbar.write(f"\n⚠️  Cost exploded to {mean_cost:.2f} (10× best of {best_cost:.2f}). Stopping early.")
                 break
         else:
             # Debug: no episodes completed this epoch
@@ -425,5 +424,11 @@ def train_ppo(bc_checkpoint_path='bc_pid_checkpoint.pth'):
     return actor_critic
 
 if __name__ == '__main__':
-    train_ppo()
+    import argparse
+    parser = argparse.ArgumentParser(description='Train PPO')
+    parser.add_argument('--init-from', type=str, default='bc_pid_checkpoint.pth',
+                       help='Path to BC checkpoint for initialization')
+    args = parser.parse_args()
+    
+    train_ppo(bc_checkpoint_path=args.init_from)
 

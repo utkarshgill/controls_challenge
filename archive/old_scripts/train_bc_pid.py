@@ -228,7 +228,8 @@ def evaluate_bc(network, model, data_files, n_eval=20):
                 action = network.act(state_vec)
                 
                 # Update state AFTER (match PID's update order)
-                self.error_integral += error  # No dt, no clipping!
+                # ANTI-WINDUP: Clamp to training distribution (±14 = 99.9% coverage)
+                self.error_integral = np.clip(self.error_integral + error, -14, 14)
                 self.prev_error = error
                 
                 return float(action[0]) if len(action.shape) > 0 else float(action)

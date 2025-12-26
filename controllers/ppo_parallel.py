@@ -119,8 +119,8 @@ class Controller(BaseController):
         # Get action from policy (deterministic for evaluation)
         action = self.actor_critic.act(state_vec, deterministic=True)
         
-        # Update state tracking
-        self.error_integral += error
+        # Update state tracking with anti-windup (±14 = 99.9% training coverage)
+        self.error_integral = np.clip(self.error_integral + error, -14, 14)
         self.prev_error = error
         
         return float(action)

@@ -1,0 +1,80 @@
+# Experiment Configuration Template
+
+experiment:
+  name: "expXXX_name"
+  description: "Brief description"
+  hypothesis: "What we're testing"
+
+model:
+  type: "bc"  # or "ppo"
+  architecture:
+    hidden_dim: 128
+    num_layers: 3
+    activation: "relu"
+  
+  state:
+    dim: 56
+    features:
+      - error
+      - error_diff
+      - error_integral
+      - current_lataccel
+      - v_ego
+      - curv_now
+      - future_curv_50
+    
+    obs_scale:
+      error: 10.0
+      error_diff: 1.0
+      error_integral: 0.1
+      current_lataccel: 2.0
+      v_ego: 0.03
+      curv: 1000.0
+  
+  action:
+    type: "continuous"
+    range: [-2.0, 2.0]
+
+training:
+  dataset:
+    path: "./data"
+    num_files: 5000
+    train_split: 0.9
+    val_split: 0.1
+  
+  hyperparameters:
+    epochs: 50
+    batch_size: 256
+    learning_rate: 1e-3
+    weight_decay: 0.0
+    grad_clip: 1.0
+  
+  anti_windup:
+    enabled: true
+    error_integral_range: [-14, 14]
+  
+  checkpointing:
+    save_every: 10
+    keep_best: true
+
+evaluation:
+  test_files: 100
+  metrics:
+    - mean_cost
+    - median_cost
+    - std_cost
+    - failure_rate
+  
+  failure_threshold: 2.0  # × median
+
+logging:
+  wandb: false
+  tensorboard: false
+  log_interval: 100
+  save_plots: true
+
+compute:
+  device: "cpu"  # or "cuda", "mps"
+  num_workers: 16
+  seed: 42
+
