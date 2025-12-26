@@ -1,60 +1,78 @@
-# Experiment 003: PPO with BC Initialization
+# Experiment 003: Clean BC from PID
 
-**Status**: 🏃 Ready to run  
+**Status**: 🏃 Running  
 **Date**: 2024-12-26
 
 ---
 
 ## Hypothesis
 
-PPO training is unstable because it starts from random initialization (cost=15k).
+Train a clean BC from PID with carefully designed state representation:
+- **State**: 55D = [error, roll_lataccel, v_ego, a_ego, current_lataccel, future_lataccel×50]
+- **Key insight**: Include `a_ego` (friction circle) and full future trajectory
 
-BC already achieves cost~100. If we **initialize PPO with BC weights**, training should be:
-- More stable (start from working policy)
-- Faster (skip random exploration)
-- Better (can explore improvements from good baseline)
+Expected: BC should match PID (~85 cost), providing solid baseline for future PPO.
 
-## Changes from exp002
+## State Design
 
-1. ✅ Initialize actor from BC checkpoint
-2. ✅ Same hyperparameters (proven to cause learning)
-3. ✅ Let PPO improve beyond BC
+```python
+State (55D):
+├── error (1)             # target - current
+├── roll_lataccel (1)     # road effect  
+├── v_ego (1)             # velocity
+├── a_ego (1)             # longitudinal accel (CRITICAL for friction circle)
+├── current_lataccel (1)  # where we are now
+└── future_lataccel (50)  # what's coming next 5 seconds
+```
+
+**Why this works:**
+- `a_ego`: Constraint is √(a_lat² + a_long²) ≤ μg
+- `future_lataccel`: Network learns to prepare for upcoming maneuvers
+- Simple scalars + trajectory = interpretable and effective
+
+## Network
+
+```
+Architecture: 55 → 128 → 128 → 128 → 1
+Activation: ReLU + Tanh output
+Output: steer in [-2, 2]
+```
+
+## Training
+
+```bash
+cd experiments/exp003_ppo_bc_init
+python train_bc.py
+```
+
+- Collect data: 1000 files with PID
+- Train: 30 epochs, lr=1e-3, batch=256
+
+## Evaluation
+
+```bash
+cd /Users/engelbart/Desktop/stuff/controls_challenge
+source .venv/bin/activate
+python tinyphysics.py --model_path ./models/tinyphysics.onnx --data_path ./data --num_segs 100 --controller bc
+```
 
 ## Expected Results
 
 ```
-Baseline:
-- exp002 (random): 15k → 500 (unstable)
-- BC: ~100 (stable but can't improve)
-
-exp003 (BC init):
-- Start: ~100
-- After training: < 100 (hopefully < 45!)
-```
-
-## Comparison
-
-```
-Target:    45
-PID:      100
-BC:       100
-exp002:   497 (random init, unstable)
-exp003:   ??? (BC init)
-```
-
-## Run
-
-```bash
-bash experiments/exp003_ppo_bc_init/run.sh
+Target:    45.0
+PID:       84.85
+BC:        ~85 (should match PID)
 ```
 
 ## Results
 
-*TBD after run*
+*TBD*
 
 ---
 
-## Analysis
+## Next Steps
 
-*TBD*
+If BC works (~85):
+1. Use as initialization for PPO (exp004)
+2. PPO can explore beyond BC to reach < 45
 

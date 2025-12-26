@@ -1,26 +1,29 @@
 #!/bin/bash
-# Experiment 003: PPO with BC Initialization
+# Experiment 003: Clean BC from PID
 # Run from project root: bash experiments/exp003_ppo_bc_init/run.sh
 
 set -e
 cd "$(dirname "$0")"  # cd to experiment folder
 
 echo "=========================================="
-echo "Experiment 003: PPO with BC Init"
+echo "Experiment 003: Clean BC from PID"
 echo "=========================================="
 
-# Train PPO with BC initialization
-echo "[1/2] Training PPO (BC initialized)..."
-python train.py \
-    --init-from ../baseline/results/checkpoints/bc_pid_best.pth \
-    2>&1 | tee results/logs/training.log
+# Train BC
+echo "[1/2] Training BC..."
+python train_bc.py 2>&1 | tee results/training.log
 
-# Move checkpoint
-echo "[2/2] Saving results..."
-mv ../../ppo_parallel_best.pth results/checkpoints/
+# Evaluate
+echo ""
+echo "[2/2] Evaluating BC..."
+cd ../..
+source .venv/bin/activate
+python tinyphysics.py --model_path ./models/tinyphysics.onnx --data_path ./data --num_segs 100 --controller bc
 
+echo ""
 echo "=========================================="
 echo "✅ Experiment complete!"
-echo "Best checkpoint: results/checkpoints/ppo_parallel_best.pth"
+echo "Checkpoint: experiments/exp003_ppo_bc_init/results/checkpoints/bc_best.pth"
+echo "Controller: controllers/bc.py"
 echo "=========================================="
 

@@ -1,7 +1,8 @@
 # Project Status
 
 **Goal**: Control cost < 45  
-**Current best**: 100 (PID/BC)  
+**PID baseline**: 101.74 ± (median 80.76) on 100 files
+**Current best**: ~100 (BC)  
 **Gap**: 2.2×
 
 ---
