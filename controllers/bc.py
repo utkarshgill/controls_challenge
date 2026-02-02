@@ -90,4 +90,3 @@ class Controller(BaseController):
             action = self.network(state_tensor)
         
         return float(action.item())
-

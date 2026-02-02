@@ -32,6 +32,36 @@ python train.py --init-from ../baseline/results/checkpoints/bc_pid_best.pth
 
 ---
 
+## Evaluating an Experiment
+
+After training, create a controller to evaluate your experiment:
+
+**1. Create a controller in `controllers/` directory**
+   - Example: `controllers/exp003_ppo_bc.py`
+   - Load your trained model checkpoint
+   - Implement `update()` method to predict actions
+
+**2. Test on single route with debug visualization:**
+```bash
+python tinyphysics.py --model_path ./models/tinyphysics.onnx --data_path ./data/00000.csv --debug --controller exp003_ppo_bc
+```
+
+**3. Get batch metrics on multiple routes:**
+```bash
+# batch Metrics of a controller on lots of routes
+python tinyphysics.py --model_path ./models/tinyphysics.onnx --data_path ./data --num_segs 100 --controller exp003_ppo_bc
+```
+
+**4. Generate a report comparing to baseline:**
+```bash
+# generate a report comparing two controllers
+python eval.py --model_path ./models/tinyphysics.onnx --data_path ./data --num_segs 100 --test_controller exp003_ppo_bc --baseline_controller pid
+```
+
+**Important**: Each experiment needs a corresponding controller in `controllers/` that loads its trained checkpoint. The controller is what gets evaluated by the simulator, not the training code directly.
+
+---
+
 ## Creating New Experiment
 
 ```bash
@@ -49,7 +79,17 @@ cp -r experiments/template experiments/exp003_my_idea
 # 4. Run it
 bash experiments/exp003_my_idea/run.sh
 
-# 5. Document results in README.md
+# 5. Create controller in controllers/ for evaluation
+#    - Load your trained checkpoint
+#    - Implement update() method
+
+# 6. Get batch metrics
+python tinyphysics.py --model_path ./models/tinyphysics.onnx --data_path ./data --num_segs 100 --controller exp003_my_idea
+
+# 7. Generate comparison report
+python eval.py --model_path ./models/tinyphysics.onnx --data_path ./data --num_segs 100 --test_controller exp003_my_idea --baseline_controller pid
+
+# 8. Document results in README.md
 ```
 
 ---
@@ -82,7 +122,7 @@ experiments/exp003_ppo_bc_init/
 
 ### ✅ In root:
 - `tinyphysics.py` - Simulator only
-- `controllers/` - Reusable controllers
+- `controllers/` - Reusable controllers (create one per experiment for evaluation)
 - `data/` - Shared data
 - `experiments/` - All experiments
 
@@ -124,4 +164,3 @@ cat experiments/*/README.md | grep "Best cost"
 - exp004: PPO with a_ego in state (57D)
 - exp005: PPO with smaller network
 - exp006: PPO with reduced future steps (10 instead of 50)
-

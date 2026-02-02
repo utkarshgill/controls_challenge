@@ -102,6 +102,9 @@ class TinyPhysicsSimulator:
     self.data = self.get_data(data_path)
     self.controller = controller
     self.debug = debug
+    # Give controller access to model if it needs it (for MPC)
+    if hasattr(controller, 'set_model'):
+      controller.set_model(model)
     self.reset()
 
   def reset(self) -> None:

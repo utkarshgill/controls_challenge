@@ -51,4 +51,3 @@ for file in files:
     costs.append(cost_dict['total_cost'])
 
 print(f"exp008 (Shallow, 3 feat): {np.mean(costs):.1f}")
-

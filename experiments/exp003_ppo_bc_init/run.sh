@@ -26,4 +26,3 @@ echo "✅ Experiment complete!"
 echo "Checkpoint: experiments/exp003_ppo_bc_init/results/checkpoints/bc_best.pth"
 echo "Controller: controllers/bc.py"
 echo "=========================================="
-

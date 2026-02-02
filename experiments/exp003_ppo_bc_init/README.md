@@ -75,4 +75,3 @@ BC:        ~85 (should match PID)
 If BC works (~85):
 1. Use as initialization for PPO (exp004)
 2. PPO can explore beyond BC to reach < 45
-

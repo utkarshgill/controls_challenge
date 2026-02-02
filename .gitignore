@@ -1,8 +1,42 @@
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# PyTorch models
+*.pth
+!experiments/*/model.pth
+
+# Virtual environment
 .venv/
 venv/
-data/
-report.html
-models/tinyphysics_*.onnx
+ENV/
+
+# IDE
+.vscode/
+.idea/
 *.swp
-*.pth
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Analysis outputs
+*.log
+*.png
+*.pdf
+
+# Large data files
+*.pkl
+data/
