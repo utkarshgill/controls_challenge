@@ -1,38 +1,34 @@
-"""exp050: Rich-obs PPO controller (207-dim, ReLU, 5-layer actor, deterministic)"""
+"""exp050: Physics-Aligned PPO controller (381-dim, Beta, ReLU, 4+4 layers, deterministic)"""
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pathlib import Path
 from . import BaseController
-from tinyphysics import CONTROL_START_IDX, CONTEXT_LENGTH, STEER_RANGE
+from tinyphysics import CONTROL_START_IDX, CONTEXT_LENGTH, STEER_RANGE, DEL_T
 
 torch.set_num_threads(1)
 
 HIST_LEN    = 20
-STATE_DIM   = 248
+STATE_DIM   = 256
 HIDDEN      = 256
 A_LAYERS    = 4
 C_LAYERS    = 4
-DELTA_SCALE = 0.3
-MAX_DELTA   = 0.3
+DELTA_SCALE = 0.25
+MAX_DELTA   = 0.5
 WARMUP_N    = CONTROL_START_IDX - CONTEXT_LENGTH
 FUTURE_K    = 50
 
-OBS_SCALE = torch.tensor(
-    [1/0.75, 1/114, 1/0.04, 1/34, 1/0.65, 1/0.05, 1/2]
-    + [667.0]*51 + [10000.0]*50
-    + [1/0.65]*50
-    + [1/2.0]*50
-    + [1/2]*HIST_LEN + [1/0.75]*HIST_LEN,
-    dtype=torch.float32)
+S_LAT   = 5.0
+S_STEER = 2.0
+S_VEGO  = 40.0
+S_AEGO  = 4.0
+S_ROLL  = 2.0
+S_CURV  = 0.02
 
 
-def _kappa(lat, roll, v):
-    return np.clip((lat - roll) / max(v * v, 25.0), -1.0, 1.0)
-
-
-def _future_profile(fplan, attr, fallback, k=FUTURE_K):
+def _future_raw(fplan, attr, fallback, k=FUTURE_K):
     vals = getattr(fplan, attr, None) if fplan else None
     if vals is not None and len(vals) >= k:
         return np.asarray(vals[:k], np.float32)
@@ -42,15 +38,33 @@ def _future_profile(fplan, attr, fallback, k=FUTURE_K):
     return np.full(k, fallback, dtype=np.float32)
 
 
+def _curv(lat, roll, v):
+    return (lat - roll) / max(v * v, 1.0)
+
+
+def _predict_expected(model, h_act, h_roll, h_v, h_a, h_lat):
+    """Expected (mean) lataccel from ONNX model — deterministic, no sampling."""
+    tokenized = model.tokenizer.encode(h_lat)                     # (20,)
+    h_states = list(zip(h_roll, h_v, h_a))
+    raw_states = [list(s) for s in h_states]
+    states = np.column_stack([h_act, raw_states])                 # (20, 4)
+    input_data = {
+        'states': np.expand_dims(states, 0).astype(np.float32),
+        'tokens': np.expand_dims(tokenized, 0).astype(np.int64),
+    }
+    logits = model.ort_session.run(None, input_data)[0]           # (1, 20, 1024)
+    probs = model.softmax(logits / 0.8, axis=-1)[0, -1, :]       # (1024,)
+    return float(np.sum(probs * model.tokenizer.bins))
+
+
 class ActorCritic(nn.Module):
     def __init__(self):
         super().__init__()
         a = [nn.Linear(STATE_DIM, HIDDEN), nn.ReLU()]
         for _ in range(A_LAYERS - 1):
             a += [nn.Linear(HIDDEN, HIDDEN), nn.ReLU()]
-        a.append(nn.Linear(HIDDEN, 1))
+        a.append(nn.Linear(HIDDEN, 2))       # Beta: (α_raw, β_raw)
         self.actor = nn.Sequential(*a)
-        self.log_std = nn.Parameter(torch.zeros(1))
 
         c = [nn.Linear(STATE_DIM, HIDDEN), nn.ReLU()]
         for _ in range(C_LAYERS - 1):
@@ -71,68 +85,102 @@ class Controller(BaseController):
                 raise FileNotFoundError(f"No checkpoint in {exp}")
 
         self.ac = ActorCritic()
-        self.ac.load_state_dict(
-            torch.load(checkpoint_path, weights_only=False, map_location='cpu'))
+        data = torch.load(checkpoint_path, weights_only=False, map_location='cpu')
+        self.ac.load_state_dict(data['ac'])
         self.ac.eval()
-        self.n, self.prev_act = 0, 0.0
-        self._ei, self._pe = 0.0, 0.0
-        self._act_hist = [0.0] * HIST_LEN
-        self._err_hist = [0.0] * HIST_LEN
+        self.n = 0
+        self._h_act   = [0.0] * HIST_LEN
+        self._h_lat   = [0.0] * HIST_LEN
+        self._h_v     = [0.0] * HIST_LEN
+        self._h_a     = [0.0] * HIST_LEN
+        self._h_roll  = [0.0] * HIST_LEN
+        self._h_innov = [0.0] * HIST_LEN
+        self._pred_la = None
+        self._model   = None
+
+    def set_model(self, model):
+        """Receive ONNX model reference (called by TinyPhysicsSimulator)."""
+        self._model = model
+
+    def _push(self, action, current, state, innov):
+        self._h_act.append(action);              self._h_act.pop(0)
+        self._h_lat.append(current);             self._h_lat.pop(0)
+        self._h_v.append(state.v_ego);           self._h_v.pop(0)
+        self._h_a.append(state.a_ego);           self._h_a.pop(0)
+        self._h_roll.append(state.roll_lataccel); self._h_roll.pop(0)
+        self._h_innov.append(innov);             self._h_innov.pop(0)
+
+    def _predict_next(self):
+        """Expected next lataccel from ONNX model (deterministic mean)."""
+        if self._model is None:
+            return None
+        return _predict_expected(self._model,
+                                 self._h_act, self._h_roll, self._h_v,
+                                 self._h_a, self._h_lat)
 
     def update(self, target_lataccel, current_lataccel, state, future_plan):
         self.n += 1
-        e = target_lataccel - current_lataccel
-        self._ei += e
+
+        # Innovation: actual − expected
+        if self._pred_la is not None:
+            innov = current_lataccel - self._pred_la
+        else:
+            innov = 0.0
 
         if self.n <= WARMUP_N:
-            self._pe = e
-            self._err_hist.append(e); self._err_hist.pop(0)
-            return 0.0  # sim overrides with CSV steer; prev_act stays 0.0
+            self._push(0.0, current_lataccel, state, innov)
+            self._pred_la = self._predict_next()
+            return 0.0
 
-        # Build 167-dim obs
+        error = target_lataccel - current_lataccel
+
+        # Build 321-dim obs inline
         obs = np.empty(STATE_DIM, np.float32)
-        obs[0] = e
-        obs[1] = self._ei
-        obs[2] = e - self._pe           # error_diff
-        obs[3] = state.v_ego
-        obs[4] = state.a_ego
-        obs[5] = state.roll_lataccel
-        obs[6] = self.prev_act
-        obs[7] = _kappa(target_lataccel, state.roll_lataccel, state.v_ego)
-        self._pe = e
-
-        n_f = len(future_plan.lataccel) if future_plan else 0
-        if n_f >= FUTURE_K:
-            fl = np.asarray(future_plan.lataccel[:FUTURE_K], np.float32)
-            fr = np.asarray(future_plan.roll_lataccel[:FUTURE_K], np.float32)
-            fv = np.asarray(future_plan.v_ego[:FUTURE_K], np.float32)
-            fk = np.clip((fl - fr) / np.maximum(fv**2, 25.0), -1.0, 1.0)
-        elif n_f > 0:
-            fl = np.array(future_plan.lataccel, np.float32)
-            fr = np.array(future_plan.roll_lataccel, np.float32)
-            fv = np.array(future_plan.v_ego, np.float32)
-            p = FUTURE_K - n_f
-            fl, fr, fv = [np.pad(x, (0, p), 'edge') for x in (fl, fr, fv)]
-            fk = np.clip((fl - fr) / np.maximum(fv**2, 25.0), -1.0, 1.0)
-        else:
-            fk = np.full(FUTURE_K, obs[7], dtype=np.float32)
-
-        obs[8:58] = fk
-        obs[58:108] = np.diff(np.concatenate([[obs[7]], fk]))
-        obs[108:158] = _future_profile(future_plan, 'a_ego', state.a_ego)
-        obs[158:208] = _future_profile(future_plan, 'lataccel', target_lataccel) - current_lataccel
-        obs[208:208+HIST_LEN] = self._act_hist
-        obs[208+HIST_LEN:208+2*HIST_LEN] = self._err_hist
-        np.clip(obs * OBS_SCALE.numpy(), -5.0, 5.0, out=obs)
+        i = 0
+        # Core (11 dims)
+        obs[i] = target_lataccel / S_LAT;                          i += 1
+        obs[i] = current_lataccel / S_LAT;                         i += 1
+        obs[i] = error / S_LAT;                                    i += 1
+        k_tgt = _curv(target_lataccel, state.roll_lataccel, state.v_ego)
+        k_cur = _curv(current_lataccel, state.roll_lataccel, state.v_ego)
+        obs[i] = k_tgt / S_CURV;                                   i += 1
+        obs[i] = k_cur / S_CURV;                                   i += 1
+        obs[i] = (k_tgt - k_cur) / S_CURV;                         i += 1
+        obs[i] = state.v_ego / S_VEGO;                             i += 1
+        obs[i] = state.a_ego / S_AEGO;                             i += 1
+        obs[i] = state.roll_lataccel / S_ROLL;                     i += 1
+        obs[i] = self._h_act[-1] / S_STEER;                        i += 1
+        obs[i] = innov / S_LAT;                                    i += 1
+        # Physics features (5 dims)
+        _flat = getattr(future_plan, 'lataccel', None)
+        fplan_lat0 = _flat[0] if (_flat and len(_flat) > 0) else target_lataccel
+        obs[i] = (fplan_lat0 - target_lataccel) / DEL_T / S_LAT;  i += 1  # target_rate
+        obs[i] = (current_lataccel - self._h_lat[-1]) / DEL_T / S_LAT; i += 1  # current_rate
+        obs[i] = (self._h_act[-1] - self._h_act[-2]) / DEL_T / S_STEER; i += 1  # steer_rate
+        obs[i] = np.sqrt(current_lataccel**2 + state.a_ego**2) / 7.0; i += 1  # friction_circle
+        obs[i] = max(0.0, 1.0 - np.sqrt(current_lataccel**2 + state.a_ego**2) / 7.0); i += 1  # grip_headroom
+        # History (40 dims = 2 × 20)
+        obs[i:i+HIST_LEN] = np.array(self._h_act, np.float32) / S_STEER;  i += HIST_LEN
+        obs[i:i+HIST_LEN] = np.array(self._h_lat, np.float32) / S_LAT;    i += HIST_LEN
+        # Future plan (200 dims = 4 × 50)
+        f_lat  = _future_raw(future_plan, 'lataccel',      target_lataccel)
+        f_roll = _future_raw(future_plan, 'roll_lataccel',  state.roll_lataccel)
+        f_v    = _future_raw(future_plan, 'v_ego',          state.v_ego)
+        f_a    = _future_raw(future_plan, 'a_ego',          state.a_ego)
+        obs[i:i+FUTURE_K] = f_lat / S_LAT;   i += FUTURE_K
+        obs[i:i+FUTURE_K] = f_roll / S_ROLL;  i += FUTURE_K
+        obs[i:i+FUTURE_K] = f_v / S_VEGO;     i += FUTURE_K
+        obs[i:i+FUTURE_K] = f_a / S_AEGO;     i += FUTURE_K
+        np.clip(obs, -5.0, 5.0, out=obs)
 
         with torch.no_grad():
-            raw = self.ac.actor(
-                torch.from_numpy(obs).unsqueeze(0)).item()
+            out = self.ac.actor(torch.from_numpy(obs).unsqueeze(0))
+            a_p = F.softplus(out[..., 0]) + 1.0
+            b_p = F.softplus(out[..., 1]) + 1.0
+            raw = (2.0 * a_p / (a_p + b_p) - 1.0).item()   # Beta mean
 
         delta  = float(np.clip(raw * DELTA_SCALE, -MAX_DELTA, MAX_DELTA))
-        action = float(np.clip(self.prev_act + delta, *STEER_RANGE))
-        self.prev_act = action
-
-        self._act_hist.append(action); self._act_hist.pop(0)
-        self._err_hist.append(e); self._err_hist.pop(0)
+        action = float(np.clip(self._h_act[-1] + delta, *STEER_RANGE))
+        self._push(action, current_lataccel, state, innov)
+        self._pred_la = self._predict_next()
         return action
