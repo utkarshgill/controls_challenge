@@ -1,118 +1,66 @@
-"""
-exp050 — Physics-Aligned PPO
-==============================
-381-dim obs = 11 core + 6×20 history + 4×50 future + 50 future_κ.
-Core: target, current, error, κ_tgt, κ_cur, Δκ, v, a, roll, prev_act, innovation.
-Beta policy. Kalman innovation. Delta actions. BC pretrain. ReLU. Huber VF loss.
-"""
+# exp050 — 256-dim Beta PPO with delta actions, NLL BC pretrain, Huber VF loss
 
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import time, os, random, json, subprocess, tempfile, multiprocessing
+import numpy as np, pandas as pd, sys, os, time, random, json, subprocess, tempfile, multiprocessing
+import torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim
 from pathlib import Path
-import sys
+from tqdm.contrib.concurrent import process_map
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
-from tinyphysics import (
-    TinyPhysicsModel, TinyPhysicsSimulator, BaseController,
+from tinyphysics import (TinyPhysicsModel, TinyPhysicsSimulator, BaseController,
     CONTROL_START_IDX, COST_END_IDX, CONTEXT_LENGTH, FUTURE_PLAN_STEPS,
-    STEER_RANGE, DEL_T, LAT_ACCEL_COST_MULTIPLIER, ACC_G,
-    VOCAB_SIZE, LATACCEL_RANGE, MAX_ACC_DELTA,
-    State, FuturePlan,
-)
-from tinyphysics_batched import (
-    BatchedSimulator, pool_init, get_pool_cache,
-    chunk_list, run_parallel_chunked,
-)
-import pandas as pd
-from tqdm.contrib.concurrent import process_map
+    STEER_RANGE, DEL_T, LAT_ACCEL_COST_MULTIPLIER, ACC_G, State, FuturePlan)
+from tinyphysics_batched import BatchedSimulator, pool_init, get_pool_cache, run_parallel_chunked
 
-# ── Config ────────────────────────────────────────────────────
+torch.manual_seed(42); np.random.seed(42)
 
-torch.manual_seed(42)
-np.random.seed(42)
+# architecture
+HIST_LEN, FUTURE_K   = 20, 50
+STATE_DIM, HIDDEN     = 256, 256        # 16 core + 40 hist + 200 future
+A_LAYERS, C_LAYERS    = 4, 4
+DELTA_SCALE, MAX_DELTA = 0.25, 0.5
 
-HIST_LEN    = 20
-STATE_DIM   = 256        # 16 core + 40 history (2×20) + 200 future (4×50)
-HIDDEN      = 256
-A_LAYERS    = 4
-C_LAYERS    = 4
-FUTURE_K    = 50
+# PPO
+PI_LR, VF_LR     = 3e-4, 3e-4
+GAMMA, LAMDA      = 0.95, 0.95
+K_EPOCHS, EPS_CLIP = 3, 0.1
+VF_COEF, ENT_COEF = 1.0, 0.01
+MINI_BS           = 5000
+CRITIC_WARMUP     = 3
 
-DELTA_SCALE = 0.25
-MAX_DELTA   = 0.5
+# BC
+BC_EPOCHS    = int(os.getenv('BC_EPOCHS', '40'))
+BC_LR        = float(os.getenv('BC_LR', '3e-4'))
+BC_BS        = int(os.getenv('BC_BS', '8192'))
+BC_GRAD_CLIP = float(os.getenv('BC_GRAD_CLIP', '1.0'))
 
-PI_LR       = 3e-4
-VF_LR       = 3e-4
-GAMMA       = 0.95
-LAMDA       = 0.95
-K_EPOCHS    = 3
-EPS_CLIP    = 0.1
-VF_COEF     = 1.0
-ENT_COEF    = 0.01
-MINI_BS     = 5000
+# runtime
+CSVS_EPOCH = int(os.getenv('CSVS',    '500'))
+MAX_EP     = int(os.getenv('EPOCHS',   '200'))
+EVAL_EVERY, EVAL_N = 5, 100
+WORKERS    = int(os.getenv('WORKERS',  '10'))
+BC_WORKERS = int(os.getenv('BC_WORKERS', '10'))
+RESUME     = os.getenv('RESUME', '0') == '1'
+BATCHED    = os.getenv('BATCHED', '1') == '1'
 
-CSVS_EPOCH  = int(os.getenv('CSVS',    '500'))
-MAX_EP      = int(os.getenv('EPOCHS',   '200'))
-EVAL_EVERY  = 5
-EVAL_N      = 100
-WORKERS     = int(os.getenv('WORKERS',  '10'))
-BC_WORKERS  = int(os.getenv('BC_WORKERS', '10'))
-RESUME      = os.getenv('RESUME', '0') == '1'
-BATCHED     = os.getenv('BATCHED', '1') == '1'
-
-SCORED_N    = COST_END_IDX - CONTROL_START_IDX     # 400
-
-INIT_SIGMA  = 0.20   # reference for diagnostics only
-BC_EPOCHS     = int(os.getenv('BC_EPOCHS', '40'))
-BC_LR         = float(os.getenv('BC_LR', '3e-4'))
-BC_BS         = int(os.getenv('BC_BS', '8192'))
-BC_GRAD_CLIP  = float(os.getenv('BC_GRAD_CLIP', '1.0'))
-CRITIC_WARMUP = 3    # epochs: critic-only before actor unfreezes
-
-# ── Scaling ───────────────────────────────────────────────────
-S_LAT   = 5.0    # lataccel [-5, 5]
-S_STEER = 2.0    # steer    [-2, 2]
-S_VEGO  = 40.0   # v_ego    [0, ~40] m/s
-S_AEGO  = 4.0    # a_ego    [-4, 4] m/s²
-S_ROLL  = 2.0    # roll_lataccel [-1.7, 1.7]
-S_CURV  = 0.02   # curvature: ~5 / 20² = 0.0125 typical max
-
+# observation scaling
+S_LAT, S_STEER = 5.0, 2.0
+S_VEGO, S_AEGO = 40.0, 4.0
+S_ROLL, S_CURV = 2.0, 0.02
 
 EXP_DIR = Path(__file__).parent
 TMP     = EXP_DIR / '.ckpt.pt'
 BEST_PT = EXP_DIR / 'best_model.pt'
 
-# ── Distributed config ───────────────────────────────────────
-# Set REMOTE=1 to enable distributed rollouts. Without it, pure local.
-REMOTE_HOST = os.getenv('REMOTE_HOST', 'hawking@169.254.35.179')
-REMOTE_DIR  = os.getenv('REMOTE_DIR',
-    '~/Desktop/stuff/controls_challenge')
-REMOTE_PY   = os.getenv('REMOTE_PY',
-    '~/Desktop/stuff/controls_challenge/.venv/bin/python')
+REMOTE_HOST    = os.getenv('REMOTE_HOST', 'hawking@169.254.35.179')
+REMOTE_DIR     = os.getenv('REMOTE_DIR', '~/Desktop/stuff/controls_challenge')
+REMOTE_PY      = os.getenv('REMOTE_PY', '~/Desktop/stuff/controls_challenge/.venv/bin/python')
 REMOTE_WORKERS = int(os.getenv('REMOTE_WORKERS', '10'))
-SSH_KEY     = os.path.expanduser('~/.ssh/id_ed25519')
-USE_REMOTE  = os.getenv('REMOTE', '0') == '1'  # master switch
-REMOTE_FRAC = float(os.getenv('REMOTE_FRAC', '0.4'))  # fraction of CSVs sent to remote
-
-
-# ── Innovation helpers (Kalman-style expected prediction) ─────
+SSH_KEY        = os.path.expanduser('~/.ssh/id_ed25519')
+USE_REMOTE     = os.getenv('REMOTE', '0') == '1'
+REMOTE_FRAC    = float(os.getenv('REMOTE_FRAC', '0.4'))
 
 def predict_expected_la(model, h_act, h_states, h_lat):
-    """Expected (mean) lataccel from the ONNX model — deterministic, no sampling.
-
-    Args:
-        model: TinyPhysicsModel instance (has .ort_session, .tokenizer, .softmax)
-        h_act:    list of 20 floats — recent steer actions
-        h_states: list of 20 (roll_la, v_ego, a_ego) tuples
-        h_lat:    list of 20 floats — recent current_lataccel values
-    Returns:
-        float — expected lataccel (weighted mean over 1024 bins)
-    """
     tokenized = model.tokenizer.encode(h_lat)                     # (20,)
     raw_states = [list(s) for s in h_states]
     states = np.column_stack([h_act, raw_states])                 # (20, 4)
@@ -125,37 +73,7 @@ def predict_expected_la(model, h_act, h_states, h_lat):
     return float(np.sum(probs * model.tokenizer.bins))
 
 
-def predict_expected_la_batch(sim_model, h_act, h_roll, h_v, h_a, h_lat):
-    """Batched expected (mean) lataccel — no sampling, deterministic.
-
-    Args:
-        sim_model: BatchedPhysicsModel instance
-        h_act:  (N, 20) float64 — steer actions
-        h_roll: (N, 20) float32 — roll_lataccel
-        h_v:    (N, 20) float32 — v_ego
-        h_a:    (N, 20) float32 — a_ego
-        h_lat:  (N, 20) float32 — current_lataccel values
-    Returns:
-        (N,) float64 — expected lataccel per episode
-    """
-    sim_states = np.stack([h_roll, h_v, h_a], axis=-1)            # (N, 20, 3)
-    tokenized = sim_model.tokenizer.encode(h_lat)                 # (N, 20)
-    states = np.concatenate([h_act[:, :, None], sim_states], axis=-1)  # (N, 20, 4)
-    input_data = {
-        'states': states.astype(np.float32),
-        'tokens': tokenized.astype(np.int64),
-    }
-    logits = sim_model.ort_session.run(None, input_data)[0]       # (N, 20, 1024)
-    probs = sim_model.softmax(logits / 0.8, axis=-1)[:, -1, :]   # (N, 1024)
-    return np.sum(probs * sim_model.tokenizer.bins[None, :], axis=-1)  # (N,)
-
-
-# ── Observation (381 dims) ────────────────────────────────────
-
-
-
 def _future_raw(fplan, attr, fallback, k=FUTURE_K):
-    """Extract raw (unscaled) future profile."""
     vals = getattr(fplan, attr, None) if fplan else None
     if vals is not None and len(vals) >= k:
         return np.asarray(vals[:k], np.float32)
@@ -164,38 +82,18 @@ def _future_raw(fplan, attr, fallback, k=FUTURE_K):
         return np.pad(a, (0, k - len(a)), 'edge')
     return np.full(k, fallback, dtype=np.float32)
 
-
-def _curv(lat, roll, v):
-    """Curvature: κ = (lat - roll) / max(v², 1.0)"""
-    return (lat - roll) / max(v * v, 1.0)
-
-
-def _hist(buf, scale):
-    """Convert history buffer to scaled numpy array."""
-    return np.array(buf, np.float32) / scale
-
+def _curv(lat, roll, v): return (lat - roll) / max(v * v, 1.0)
+def _hist(buf, scale): return np.array(buf, np.float32) / scale
 
 def build_obs(target, current, state, fplan,
               hist_act, hist_lat, hist_v, hist_a, hist_roll,
-              innov=0.0, hist_innov=None):
-    """256-dim observation:
-      16 core + 2×20 history + 4×50 future.
-
-    Core (16): target, current, error, κ_target, κ_current, κ_error,
-               v_ego, a_ego, roll_lataccel, prev_act, innovation,
-               target_rate, current_rate, steer_rate, friction_circle, v².
-    History (40): prev_act, current_lataccel (20 each).
-    Future (200): lataccel, roll_lataccel, v_ego, a_ego (50 each).
-    """
-    if hist_innov is None:
-        hist_innov = [0.0] * HIST_LEN
+              innov=0.0):
     error = target - current
     k_target  = _curv(target, state.roll_lataccel, state.v_ego)
     k_current = _curv(current, state.roll_lataccel, state.v_ego)
 
-    obs = np.empty(STATE_DIM, np.float32)
-    i = 0
-    # Core (11 dims)
+    obs = np.empty(STATE_DIM, np.float32); i = 0
+    # core (16)
     obs[i] = target / S_LAT;               i += 1
     obs[i] = current / S_LAT;              i += 1
     obs[i] = error / S_LAT;                i += 1
@@ -207,7 +105,6 @@ def build_obs(target, current, state, fplan,
     obs[i] = state.roll_lataccel / S_ROLL; i += 1
     obs[i] = hist_act[-1] / S_STEER;       i += 1   # prev_act
     obs[i] = innov / S_LAT;                i += 1   # innovation
-    # Physics features (5 dims)
     _flat = getattr(fplan, 'lataccel', None)
     fplan_lat0 = _flat[0] if (_flat and len(_flat) > 0) else target
     obs[i] = (fplan_lat0 - target) / DEL_T / S_LAT;              i += 1  # target_rate
@@ -215,10 +112,10 @@ def build_obs(target, current, state, fplan,
     obs[i] = (hist_act[-1] - hist_act[-2]) / DEL_T / S_STEER;   i += 1  # steer_rate
     obs[i] = np.sqrt(current**2 + state.a_ego**2) / 7.0;        i += 1  # friction_circle
     obs[i] = max(0.0, 1.0 - np.sqrt(current**2 + state.a_ego**2) / 7.0); i += 1  # grip_headroom
-    # History (40 dims = 2 × 20)
-    obs[i:i+HIST_LEN] = _hist(hist_act,   S_STEER); i += HIST_LEN
-    obs[i:i+HIST_LEN] = _hist(hist_lat,   S_LAT);   i += HIST_LEN
-    # Future plan (200 dims = 4 × 50)
+    # history (40)
+    obs[i:i+HIST_LEN] = _hist(hist_act, S_STEER); i += HIST_LEN
+    obs[i:i+HIST_LEN] = _hist(hist_lat, S_LAT);   i += HIST_LEN
+    # future (200)
     f_lat  = _future_raw(fplan, 'lataccel',      target)
     f_roll = _future_raw(fplan, 'roll_lataccel',  state.roll_lataccel)
     f_v    = _future_raw(fplan, 'v_ego',          state.v_ego)
@@ -229,15 +126,10 @@ def build_obs(target, current, state, fplan,
     obs[i:i+FUTURE_K] = f_a / S_AEGO;     i += FUTURE_K
     return np.clip(obs, -5.0, 5.0)
 
-
-# ── Network (orthogonal init, σ floor) ───────────────────────
-
 def _ortho_init(module, gain=np.sqrt(2)):
-    """Orthogonal init for Linear layers (standard PPO)."""
     if isinstance(module, nn.Linear):
         nn.init.orthogonal_(module.weight, gain=gain)
         nn.init.zeros_(module.bias)
-
 
 class ActorCritic(nn.Module):
     def __init__(self):
@@ -254,7 +146,6 @@ class ActorCritic(nn.Module):
         c.append(nn.Linear(HIDDEN, 1))
         self.critic = nn.Sequential(*c)
 
-        # Orthogonal init: √2 for hidden, 0.01 for actor output, 1.0 for critic output
         for layer in self.actor[:-1]:
             _ortho_init(layer)
         _ortho_init(self.actor[-1], gain=0.01)
@@ -263,8 +154,7 @@ class ActorCritic(nn.Module):
         _ortho_init(self.critic[-1], gain=1.0)
 
     def beta_params(self, obs_t):
-        """Return (alpha, beta) each shape (...,) from actor output."""
-        out = self.actor(obs_t)                    # (..., 2)
+        out = self.actor(obs_t)
         alpha = F.softplus(out[..., 0]) + 1.0
         beta  = F.softplus(out[..., 1]) + 1.0
         return alpha, beta
@@ -282,8 +172,6 @@ class ActorCritic(nn.Module):
         return raw, val
 
 
-# ── Controller ───────────────────────────────────────────────
-
 class DeltaController(BaseController):
     def __init__(self, ac, deterministic=False):
         self.ac, self.det = ac, deterministic
@@ -293,25 +181,21 @@ class DeltaController(BaseController):
         self._h_v     = [0.0] * HIST_LEN
         self._h_a     = [0.0] * HIST_LEN
         self._h_roll  = [0.0] * HIST_LEN
-        self._h_innov = [0.0] * HIST_LEN
         self._pred_la = None        # expected lataccel from previous step
         self._model   = None        # ONNX model (set via set_model)
         self.traj = []
 
     def set_model(self, model):
-        """Receive ONNX model reference (called by TinyPhysicsSimulator)."""
         self._model = model
 
-    def _push(self, action, current, state, innov):
+    def _push(self, action, current, state):
         self._h_act.append(action);                  self._h_act.pop(0)
         self._h_lat.append(current);                  self._h_lat.pop(0)
         self._h_v.append(state.v_ego);                self._h_v.pop(0)
         self._h_a.append(state.a_ego);                self._h_a.pop(0)
         self._h_roll.append(state.roll_lataccel);     self._h_roll.pop(0)
-        self._h_innov.append(innov);                  self._h_innov.pop(0)
 
     def _predict_next(self):
-        """Run ONNX model to get expected next lataccel (deterministic mean)."""
         if self._model is None:
             return None
         h_states = list(zip(self._h_roll, self._h_v, self._h_a))
@@ -321,25 +205,24 @@ class DeltaController(BaseController):
         self.n += 1
         step_idx = CONTEXT_LENGTH + self.n - 1
 
-        # Compute innovation: actual − expected
         if self._pred_la is not None:
             innov = current_lataccel - self._pred_la
         else:
             innov = 0.0
 
         if step_idx < CONTROL_START_IDX:
-            self._push(0.0, current_lataccel, state, innov)
+            self._push(0.0, current_lataccel, state)
             self._pred_la = self._predict_next()
             return 0.0   # simulator overrides anyway
 
         obs = build_obs(target_lataccel, current_lataccel, state, future_plan,
                         self._h_act, self._h_lat, self._h_v, self._h_a, self._h_roll,
-                        innov=innov, hist_innov=self._h_innov)
+                        innov=innov)
         raw, val = self.ac.act(obs, self.det)
 
         delta  = float(np.clip(raw * DELTA_SCALE, -MAX_DELTA, MAX_DELTA))
         action = float(np.clip(self._h_act[-1] + delta, *STEER_RANGE))
-        self._push(action, current_lataccel, state, innov)
+        self._push(action, current_lataccel, state)
         self._pred_la = self._predict_next()
 
         if step_idx < COST_END_IDX:
@@ -348,8 +231,6 @@ class DeltaController(BaseController):
         return action
 
 
-# ── Rewards ──────────────────────────────────────────────────
-
 def compute_rewards(traj):
     tgt = np.array([t['tgt'] for t in traj], np.float32)
     cur = np.array([t['cur'] for t in traj], np.float32)
@@ -357,8 +238,6 @@ def compute_rewards(traj):
     jerk = np.diff(cur, prepend=cur[0]) / DEL_T
     return (-(lat + jerk**2 * 100) / 500.0).astype(np.float32)
 
-
-# ── PPO ──────────────────────────────────────────────────────
 
 class PPO:
     def __init__(self, ac):
@@ -380,8 +259,7 @@ class PPO:
         return (a - a.mean()) / (a.std() + 1e-8), r
 
     @staticmethod
-    def _beta_sigma(a, b):
-        """Std of 2*Beta(a,b)-1 in [-1,1]."""
+    def _beta_sigma(a, b):  # std of 2*Beta(a,b)-1 in [-1,1]
         return 2.0 * torch.sqrt(a * b / ((a + b) ** 2 * (a + b + 1.0)))
 
     def update(self, all_obs, all_raw, all_rew, all_val, all_done,
@@ -393,15 +271,13 @@ class PPO:
 
         ret_t = torch.FloatTensor(ret)
 
-        # Map raw actions to Beta support (0,1) with clamping for log-prob safety
-        x_t = ((raw_t + 1.0) / 2.0).clamp(1e-6, 1 - 1e-6)
+        x_t = ((raw_t + 1.0) / 2.0).clamp(1e-6, 1 - 1e-6)  # raw → Beta support (0,1)
 
         with torch.no_grad():
             a_old, b_old = self.ac.beta_params(obs_t)
             old_lp = torch.distributions.Beta(a_old, b_old).log_prob(x_t.squeeze(-1))
             old_val = self.ac.critic(obs_t).squeeze(-1)
 
-        _LOG2 = np.log(2.0)
         N = len(obs_t)
         for _ in range(K_EPOCHS):
             for idx in torch.randperm(N).split(MINI_BS):
@@ -437,7 +313,6 @@ class PPO:
 
         pi_val = pi_loss.item() if not critic_only else 0.0
         ent_val = ent.item() if not critic_only else 0.0
-        # Report mean σ of the Beta policy for diagnostics
         with torch.no_grad():
             a_d, b_d = self.ac.beta_params(obs_t[:1000])
             sigma = self._beta_sigma(a_d, b_d).mean().item()
@@ -446,20 +321,15 @@ class PPO:
                     lr=PI_LR)
 
 
-# ── Batched rollout via BatchedSimulator ──────────────────────
-
 def build_obs_batch(target, current, roll_la, v_ego, a_ego,
                     h_act, h_lat, fplan_data, step_idx,
-                    innov=None, h_innov=None):
-    """Vectorized build_obs for N episodes.  Returns (N, 256) float32."""
+                    innov=None):
     N = target.shape[0]
     T = fplan_data['target_lataccel'].shape[1]
     obs = np.empty((N, STATE_DIM), np.float32)
 
     if innov is None:
         innov = np.zeros(N, np.float32)
-    if h_innov is None:
-        h_innov = np.zeros((N, HIST_LEN), np.float32)
 
     error = target - current
     v2 = np.maximum(v_ego * v_ego, 1.0)
@@ -476,12 +346,9 @@ def build_obs_batch(target, current, roll_la, v_ego, a_ego,
     obs[:, i] = v_ego / S_VEGO;                i += 1
     obs[:, i] = a_ego / S_AEGO;                i += 1
     obs[:, i] = roll_la / S_ROLL;              i += 1
-    # History: cast to float32 before dividing, matching _hist() in build_obs
-    # which does np.array(lst, float32) / scale
     h_act32 = h_act.astype(np.float32) if h_act.dtype != np.float32 else h_act
     obs[:, i] = h_act32[:, -1] / S_STEER;       i += 1
     obs[:, i] = innov / S_LAT;                   i += 1   # innovation
-    # Physics features (5 dims)
     T_ = fplan_data['target_lataccel'].shape[1]
     fplan_lat0 = fplan_data['target_lataccel'][:, min(step_idx + 1, T_ - 1)]
     obs[:, i] = (fplan_lat0 - target) / DEL_T / S_LAT;           i += 1  # target_rate
@@ -492,8 +359,6 @@ def build_obs_batch(target, current, roll_la, v_ego, a_ego,
     obs[:, i:i+HIST_LEN] = h_act32 / S_STEER;   i += HIST_LEN
     obs[:, i:i+HIST_LEN] = h_lat / S_LAT;        i += HIST_LEN
 
-    # Future plan: cast to float32 before dividing, matching _future_raw()
-    # which does np.asarray(vals[:k], float32)
     end = min(step_idx + FUTURE_PLAN_STEPS, T)
     def _pad_future(arr_slice, k=FUTURE_K):
         if arr_slice.shape[1] == 0: return None
@@ -501,7 +366,6 @@ def build_obs_batch(target, current, roll_la, v_ego, a_ego,
             return np.concatenate([arr_slice,
                 np.repeat(arr_slice[:, -1:], k - arr_slice.shape[1], axis=1)], 1)
         return arr_slice
-    future_raw = {}
     fallback = {'target_lataccel': target, 'roll_lataccel': roll_la,
                 'v_ego': v_ego, 'a_ego': a_ego}
     for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
@@ -510,32 +374,24 @@ def build_obs_batch(target, current, roll_la, v_ego, a_ego,
         padded = _pad_future(slc)
         if padded is None:
             padded = np.repeat(fallback[attr][:, None], FUTURE_K, axis=1)
-        padded32 = padded.astype(np.float32)
-        future_raw[attr] = padded32
-        obs[:, i:i+FUTURE_K] = padded32 / scale;  i += FUTURE_K
+        obs[:, i:i+FUTURE_K] = padded.astype(np.float32) / scale;  i += FUTURE_K
     return np.clip(obs, -5.0, 5.0)
 
 
 def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=None):
-    """Run N rollouts via BatchedSimulator.  Returns list of per-episode tuples
-    (obs, raw, rewards, values, dones, cost) for train, or list of costs for eval.
-    """
     sim = BatchedSimulator(str(mdl_path), csv_files, ort_session=ort_session)
-    sim.compute_expected = True   # piggyback E[lataccel] from sim_step's ONNX pass
+    sim.compute_expected = True
     N = sim.N
 
-    # Controller state (lives outside the simulator)
-    # h_act must be float64 — actions accumulate via prev + delta, matching
-    # DeltaController which stores Python floats (float64) in a list.
+    # h_act float64: actions accumulate via prev + delta (Python float precision)
     h_act   = np.zeros((N, HIST_LEN), np.float64)
     h_lat   = np.zeros((N, HIST_LEN), np.float32)
-    h_innov = np.zeros((N, HIST_LEN), np.float32)
 
     all_obs, all_raw, all_val = [], [], []
     tgt_hist, cur_hist = [], []
 
     def controller_fn(step_idx, target, current_la, state_dict, future_plan):
-        nonlocal h_act, h_lat, h_innov
+        nonlocal h_act, h_lat
 
         roll_la = state_dict['roll_lataccel']
         v_ego   = state_dict['v_ego']
@@ -543,24 +399,18 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
 
         cla32  = np.float32(current_la)
 
-        # Innovation: actual − expected  (piggybacked from previous sim_step)
         if sim.expected_lataccel is not None:
             innov = np.float32(current_la - sim.expected_lataccel)
         else:
             innov = np.zeros(N, np.float32)
 
         if step_idx < CONTROL_START_IDX:
-            # Warmup: controller pushes 0.0 action (matches DeltaController)
-            h_act   = np.concatenate([h_act[:, 1:],   np.zeros((N, 1), np.float64)], axis=1)
-            h_lat   = np.concatenate([h_lat[:, 1:],   cla32[:, None]], axis=1)
-            h_innov = np.concatenate([h_innov[:, 1:], innov[:, None]], axis=1)
-            return np.zeros(N)  # placeholder; sim overrides with CSV steer
+            h_act = np.concatenate([h_act[:, 1:], np.zeros((N, 1), np.float64)], axis=1)
+            h_lat = np.concatenate([h_lat[:, 1:], cla32[:, None]], axis=1)
+            return np.zeros(N)
 
-        # Build obs → policy forward
         obs = build_obs_batch(target, current_la, roll_la, v_ego, a_ego,
-                              h_act, h_lat,
-                              sim.data, step_idx,
-                              innov=innov, h_innov=h_innov)
+                              h_act, h_lat, sim.data, step_idx, innov=innov)
 
         obs_t = torch.from_numpy(obs)
         with torch.inference_mode():
@@ -576,16 +426,13 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
         delta  = np.clip(np.float64(raw) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
         action = np.clip(h_act[:, -1] + delta, STEER_RANGE[0], STEER_RANGE[1])
 
-        h_act   = np.concatenate([h_act[:, 1:],   action[:, None]], axis=1)
-        h_lat   = np.concatenate([h_lat[:, 1:],   cla32[:, None]], axis=1)
-        h_innov = np.concatenate([h_innov[:, 1:], innov[:, None]], axis=1)
+        h_act = np.concatenate([h_act[:, 1:], action[:, None]], axis=1)
+        h_lat = np.concatenate([h_lat[:, 1:], cla32[:, None]], axis=1)
 
         if step_idx < COST_END_IDX:
             all_obs.append(obs.copy())
             all_raw.append(raw.copy())
             all_val.append(val.copy())
-
-        if step_idx < COST_END_IDX:
             tgt_hist.append(target.copy())
             cur_hist.append(current_la.copy())
 
@@ -597,8 +444,7 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
     if deterministic:
         return total_costs.tolist()
 
-    # Assemble per-episode training data
-    obs_arr = np.stack(all_obs, axis=1)  # (N, S, 360)
+    obs_arr = np.stack(all_obs, axis=1)
     raw_arr = np.stack(all_raw, axis=1)
     val_arr = np.stack(all_val, axis=1)
     tgt_arr = np.stack(tgt_hist, axis=1)
@@ -616,8 +462,6 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
     return results
 
 
-# ── Remote orchestration ─────────────────────────────────────
-
 SSH_SOCK   = '/tmp/_ppo_ssh_mux_%r@%h:%p'
 SSH_BASE   = ['-i', SSH_KEY, '-o', 'ConnectTimeout=5',
               '-o', f'ControlPath={SSH_SOCK}',
@@ -625,7 +469,6 @@ SSH_BASE   = ['-i', SSH_KEY, '-o', 'ConnectTimeout=5',
 
 
 def _sync_remote():
-    """Rsync train.py + remote_worker.py to spare Mac so code stays in sync."""
     src = str(EXP_DIR) + '/'
     dst = f'{REMOTE_HOST}:{REMOTE_DIR}/experiments/exp050_rich_ppo/'
     r = subprocess.run(
@@ -639,7 +482,6 @@ def _sync_remote():
 
 
 def _scp_to(local, remote):
-    """scp a file to REMOTE_HOST. Returns True on success."""
     r = subprocess.run(['scp'] + SSH_BASE + ['-q', str(local),
                         f'{REMOTE_HOST}:{remote}'],
                        capture_output=True, timeout=30)
@@ -647,7 +489,6 @@ def _scp_to(local, remote):
 
 
 def _scp_from(remote, local):
-    """scp a file from REMOTE_HOST. Returns True on success."""
     r = subprocess.run(['scp'] + SSH_BASE + ['-q',
                         f'{REMOTE_HOST}:{remote}', str(local)],
                        capture_output=True, timeout=60)
@@ -655,8 +496,6 @@ def _scp_from(remote, local):
 
 
 def _launch_remote(batch_csvs, ckpt_path, mode='train'):
-    """Send checkpoint + batch list to spare Mac, kick off remote_worker.py.
-    Returns a subprocess.Popen (non-blocking) or None on failure."""
     if not USE_REMOTE:
         return None
     try:
@@ -664,13 +503,10 @@ def _launch_remote(batch_csvs, ckpt_path, mode='train'):
         remote_batch = '/tmp/_remote_batch.json'
         remote_out   = '/tmp/_remote_results.npz'
 
-        # Write batch JSON locally
-        batch_json = tempfile.NamedTemporaryFile(
-            mode='w', suffix='.json', delete=False)
+        batch_json = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
         json.dump(batch_csvs, batch_json)
         batch_json.close()
 
-        # Upload checkpoint + batch in one scp call
         ok = subprocess.run(
             ['scp'] + SSH_BASE + ['-q', str(ckpt_path), batch_json.name,
              f'{REMOTE_HOST}:/tmp/'],
@@ -681,11 +517,8 @@ def _launch_remote(batch_csvs, ckpt_path, mode='train'):
             print("  [remote] scp upload failed — falling back to local")
             return None
 
-        # Move checkpoint to correct path on remote, rename batch file
         _pre = (f'mv /tmp/{Path(ckpt_path).name} {remote_ckpt}; '
                 f'mv /tmp/{Path(batch_json.name).name} {remote_batch}; ')
-
-        # Launch remote_worker.py via SSH (non-blocking)
         cmd = (_pre +
                f'cd {REMOTE_DIR} && {REMOTE_PY} '
                f'experiments/exp050_rich_ppo/remote_worker.py '
@@ -702,8 +535,6 @@ def _launch_remote(batch_csvs, ckpt_path, mode='train'):
 
 
 def _collect_remote(proc, mode='train'):
-    """Wait for remote worker to finish, fetch and parse results.
-    Returns (list_of_tuples, remote_tag) for train, or (costs_list,) for eval."""
     if proc is None:
         return [] if mode == 'train' else []
     try:
@@ -713,7 +544,6 @@ def _collect_remote(proc, mode='train'):
             print(f"  [remote] worker failed (rc={proc.returncode}): {err[:200]}")
             return []
 
-        # Fetch results
         local_npz = EXP_DIR / '.remote_results.npz'
         _scp_from('/tmp/_remote_results.npz', local_npz)
 
@@ -723,7 +553,6 @@ def _collect_remote(proc, mode='train'):
             local_npz.unlink(missing_ok=True)
             return costs
 
-        # Train mode: split concatenated arrays back into per-episode lists
         obs_all     = data['obs']
         raw_all     = data['raw']
         rew_all     = data['rew']
@@ -751,10 +580,7 @@ def _collect_remote(proc, mode='train'):
         return []
 
 
-# ── Behavioral cloning pretrain ──────────────────────────────
-
 def _bc_worker(csv_path):
-    """Extract (obs, raw_target) pairs from one CSV's warmup steer data."""
     df = pd.read_csv(csv_path)
     data = pd.DataFrame({
         'roll_lataccel': np.sin(df['roll'].values) * ACC_G,
@@ -766,8 +592,6 @@ def _bc_worker(csv_path):
     steer = data['steer_command'].values
     tgt   = data['target_lataccel'].values
     obs_list, raw_list = [], []
-
-    # Build history buffers from zero, same as DeltaController
     h_act  = [0.0] * HIST_LEN
     h_lat  = [0.0] * HIST_LEN
     h_v    = [0.0] * HIST_LEN
@@ -776,8 +600,7 @@ def _bc_worker(csv_path):
 
     for step_idx in range(CONTEXT_LENGTH, CONTROL_START_IDX):
         target_la = tgt[step_idx]
-        # In BC replay, current_lataccel ≈ target (expert tracking)
-        current_la = tgt[step_idx]
+        current_la = tgt[step_idx]  # BC assumes perfect tracking
 
         state = State(
             roll_lataccel=data['roll_lataccel'].values[step_idx],
@@ -797,8 +620,6 @@ def _bc_worker(csv_path):
         raw_target = np.clip(delta / DELTA_SCALE, -1.0, 1.0)  # Beta support
         obs_list.append(obs)
         raw_list.append(raw_target)
-
-        # Push this step's values into history
         h_act.append(steer[step_idx]);                         h_act.pop(0)
         h_lat.append(tgt[step_idx]);                           h_lat.pop(0)
         h_v.append(data['v_ego'].values[step_idx]);            h_v.pop(0)
@@ -810,7 +631,6 @@ def _bc_worker(csv_path):
 
 
 def pretrain_bc(ac, csv_files, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
-    """Behavioral cloning: pretrain actor on CSV warmup steer data."""
     print(f"BC pretrain: extracting from {len(csv_files)} CSVs ...")
     results = process_map(_bc_worker, [str(f) for f in csv_files],
                           max_workers=BC_WORKERS, chunksize=50, disable=False)
@@ -842,20 +662,16 @@ def pretrain_bc(ac, csv_files, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
     print("BC pretrain done.\n")
 
 
-# ── Pool workers ─────────────────────────────────────────────
-
-_W = {}   # per-process training-specific globals
+_W = {}   # per-process globals
 
 def _pool_init(mdl_path):
-    """Per-worker init: ONNX cache (via batched module) + training state."""
-    pool_init(mdl_path)                                 # cache ONNX session
+    pool_init(mdl_path)
     torch.set_num_threads(1)
     _W['mdl'] = TinyPhysicsModel(str(mdl_path), debug=False)  # for BATCHED=0
     _W['ckpt_mtime'] = None
     _W['ac'] = None
 
 def _load_ckpt(ckpt):
-    """Reload checkpoint (mtime-aware)."""
     mtime = os.path.getmtime(ckpt)
     if _W.get('ckpt_mtime') != mtime:
         data = torch.load(ckpt, weights_only=False, map_location='cpu')
@@ -900,8 +716,6 @@ def _seq_eval_worker(args):
     sim = TinyPhysicsSimulator(_W['mdl'], str(csv), controller=ctrl, debug=False)
     return sim.rollout()['total_cost']
 
-
-# ── Training ─────────────────────────────────────────────────
 
 class Ctx:
     def __init__(self):
@@ -993,10 +807,8 @@ def train():
         ctx.ac.load_state_dict(ckpt['ac'])
         print(f"Resumed from best_model.pt")
     else:
-        # Behavioral cloning warm-start: pretrain actor on CSV steer data
         all_csvs = sorted((ROOT / 'data').glob('*.csv'))
         pretrain_bc(ctx.ac, all_csvs)
-        # Beta concentrations learned during BC — no manual σ reset needed
 
     vm, vs = evaluate(ctx, ctx.va_f)
     ctx.best, ctx.best_ep = vm, 'init'
