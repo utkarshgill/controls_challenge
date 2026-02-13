@@ -43,12 +43,12 @@ A_LAYERS    = 4
 C_LAYERS    = 4
 FUTURE_K    = 50
 
-DELTA_SCALE = 0.25 # changing from 0.3 to 0.1 until you diagnose the Baseline 22273 is catastrophically blow up problem
+DELTA_SCALE = 0.25
 MAX_DELTA   = 0.5
 
 PI_LR       = 3e-4
 VF_LR       = 3e-4
-GAMMA       = 0.99
+GAMMA       = 0.95
 LAMDA       = 0.95
 K_EPOCHS    = 3
 EPS_CLIP    = 0.1
@@ -365,8 +365,6 @@ class PPO:
         self.ac = ac
         self.pi_opt = optim.Adam(ac.actor.parameters(), lr=PI_LR)
         self.vf_opt = optim.Adam(ac.critic.parameters(), lr=VF_LR)
-        self.pi_sched = optim.lr_scheduler.CosineAnnealingLR(self.pi_opt, T_max=MAX_EP)
-        self.vf_sched = optim.lr_scheduler.CosineAnnealingLR(self.vf_opt, T_max=MAX_EP)
 
     @staticmethod
     def gae(all_r, all_v, all_d):
@@ -437,9 +435,6 @@ class PPO:
                     nn.utils.clip_grad_norm_(self.ac.critic.parameters(), 0.5)
                     self.pi_opt.step(); self.vf_opt.step()
 
-        if not critic_only:
-            self.pi_sched.step()
-        self.vf_sched.step()
         pi_val = pi_loss.item() if not critic_only else 0.0
         ent_val = ent.item() if not critic_only else 0.0
         # Report mean σ of the Beta policy for diagnostics
@@ -448,7 +443,7 @@ class PPO:
             sigma = self._beta_sigma(a_d, b_d).mean().item()
         return dict(pi=pi_val, vf=vf_loss.item(),
                     ent=ent_val, σ=sigma,
-                    lr=self.pi_sched.get_last_lr()[0])
+                    lr=PI_LR)
 
 
 # ── Batched rollout via BatchedSimulator ──────────────────────
