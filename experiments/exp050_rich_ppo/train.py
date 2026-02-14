@@ -278,12 +278,13 @@ class PPO:
             a_old, b_old = self.ac.beta_params(obs_t)
             old_lp = torch.distributions.Beta(a_old, b_old).log_prob(x_t.squeeze(-1))
 
+        # Global advantage normalization (once, before update loop)
+        adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+
         N = len(obs_t)
         for _ in range(K_EPOCHS):
             for idx in torch.randperm(N).split(MINI_BS):
-                # Per-minibatch advantage normalization
                 mb_adv = adv_t[idx]
-                mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
                 val = self.ac.critic(obs_t[idx]).squeeze(-1)
                 vf_loss = F.huber_loss(val, ret_t[idx], delta=50.0)
