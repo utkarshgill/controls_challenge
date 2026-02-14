@@ -451,7 +451,7 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
             x   = torch.distributions.Beta(a_p, b_p).sample()
             raw = (2.0 * x - 1.0).numpy()
 
-        delta  = np.clip(np.float64(raw) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
+        delta  = np.clip(raw.astype(np.float64) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
         action = np.clip(h_act[:, -1] + delta, STEER_RANGE[0], STEER_RANGE[1])
 
         h_act = np.concatenate([h_act[:, 1:], action[:, None]], axis=1)
