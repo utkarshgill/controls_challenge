@@ -298,7 +298,7 @@ class PPO:
                     dist = torch.distributions.Beta(a_cur, b_cur)
                     lp   = dist.log_prob(x_t[idx].squeeze(-1))  # on (0,1)
 
-                    ratio = (lp - old_lp[idx]).exp()
+                    ratio = (lp - old_lp[idx]).clamp(-20.0, 20.0).exp()
                     pi_loss = -torch.min(
                         ratio * mb_adv,
                         ratio.clamp(1 - EPS_CLIP, 1 + EPS_CLIP) * mb_adv).mean()
