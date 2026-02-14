@@ -10,7 +10,8 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 from tinyphysics import (TinyPhysicsModel, TinyPhysicsSimulator, BaseController,
     CONTROL_START_IDX, COST_END_IDX, CONTEXT_LENGTH, FUTURE_PLAN_STEPS,
-    STEER_RANGE, DEL_T, LAT_ACCEL_COST_MULTIPLIER, ACC_G, State, FuturePlan)
+    STEER_RANGE, DEL_T, LAT_ACCEL_COST_MULTIPLIER, ACC_G, MAX_ACC_DELTA,
+    State, FuturePlan)
 from tinyphysics_batched import BatchedSimulator, pool_init, get_pool_cache, run_parallel_chunked
 
 torch.manual_seed(42); np.random.seed(42)
@@ -44,6 +45,12 @@ BC_WORKERS = int(os.getenv('BC_WORKERS', '10'))
 RESUME     = os.getenv('RESUME', '0') == '1'
 DECAY_LR   = os.getenv('DECAY_LR', '0') == '1'
 BATCHED    = os.getenv('BATCHED', '1') == '1'
+
+# Multi-step shooting (planning refinement via ONNX lookahead)
+SHOOT_H  = int(os.getenv('SHOOT_H', '0'))     # horizon (0=off, 5=recommended)
+SHOOT_P  = int(os.getenv('SHOOT_P', '16'))     # candidates per state
+SHOOT_S  = int(os.getenv('SHOOT_S', '5'))      # sampled timesteps per route
+SHOOT_BC = int(os.getenv('SHOOT_BC', '3'))     # BC gradient steps on targets
 
 # observation scaling
 S_LAT, S_STEER = 5.0, 2.0
@@ -350,6 +357,22 @@ class PPO:
                     ent=ent_val, σ=sigma,
                     lr=cur_lr)
 
+    def planning_update(self, plan_obs, plan_raw):
+        """BC distillation toward shooting-optimal actions."""
+        obs_t = torch.FloatTensor(plan_obs)
+        raw_t = torch.FloatTensor(plan_raw)
+        x_t = ((raw_t + 1.0) / 2.0).clamp(1e-6, 1 - 1e-6)
+        loss_val = 0.0
+        for _ in range(SHOOT_BC):
+            a_p, b_p = self.ac.beta_params(obs_t)
+            loss = -torch.distributions.Beta(a_p, b_p).log_prob(x_t).mean()
+            self.pi_opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.ac.actor.parameters(), 0.5)
+            self.pi_opt.step()
+            loss_val = loss.item()
+        return loss_val
+
 
 def build_obs_batch(target, current, roll_la, v_ego, a_ego,
                     h_act, h_lat, fplan_data, step_idx,
@@ -479,6 +502,9 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
     cur_arr = np.stack(cur_hist, axis=1)
     S = obs_arr.shape[1]
 
+    # Multi-step shooting (runs in-worker, fully parallel)
+    shoot = _shoot_targets(sim, ac, obs_arr) if SHOOT_H > 0 else None
+
     results = []
     for i in range(N):
         dones = np.concatenate([np.zeros(S-1, np.float32), [1.0]])
@@ -486,8 +512,114 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
         lat_r  = (tgt_ep - cur_ep)**2 * 100 * LAT_ACCEL_COST_MULTIPLIER
         jerk_r = np.diff(cur_ep, prepend=cur_ep[0]) / DEL_T
         rew    = (-(lat_r + jerk_r**2 * 100) / 500.0).astype(np.float32)
-        results.append((obs_arr[i], raw_arr[i], rew, val_arr[i], dones, float(total_costs[i])))
+        p_obs = shoot[0][i] if shoot else None
+        p_raw = shoot[1][i] if shoot else None
+        results.append((obs_arr[i], raw_arr[i], rew, val_arr[i], dones, float(total_costs[i]),
+                         p_obs, p_raw))
     return results
+
+
+def _shoot_targets(sim, ac, obs_arr):
+    """Multi-step shooting: find improved actions via ONNX lookahead.
+
+    For SHOOT_S random timesteps per route, generate SHOOT_P candidate actions,
+    simulate SHOOT_H steps through ONNX, score by true cost, return best.
+    Runs inside the worker process — fully parallel across all workers.
+
+    Returns (plan_obs, plan_raw):
+        plan_obs: (N, SHOOT_S, STATE_DIM)  observations at sampled steps
+        plan_raw: (N, SHOOT_S)             best raw actions from shooting
+    """
+    H, P, n_s = SHOOT_H, SHOOT_P, SHOOT_S
+    N = sim.N
+    CL = CONTEXT_LENGTH
+    tok = sim.sim_model.tokenizer
+    ort_sess = sim.sim_model.ort_session
+
+    t_min, t_max = CONTROL_START_IDX, COST_END_IDX - H
+    if t_max <= t_min or n_s <= 0:
+        return None
+    ts = np.sort(np.random.choice(np.arange(t_min, t_max),
+                                  size=min(n_s, t_max - t_min), replace=False))
+
+    plan_obs = np.empty((N, len(ts), obs_arr.shape[2]), np.float32)
+    plan_raw = np.empty((N, len(ts)), np.float32)
+
+    for si, t in enumerate(ts):
+        obs_idx = t - CONTROL_START_IDX
+        plan_obs[:, si, :] = obs_arr[:, obs_idx, :]
+
+        # Stochastic first-action: P samples from the policy's Beta
+        with torch.inference_mode():
+            obs_t = torch.from_numpy(plan_obs[:, si, :])
+            a_p, b_p = ac.beta_params(obs_t)                       # (N,)
+            pmean = (2.0 * a_p / (a_p + b_p) - 1.0).numpy()       # (N,) in [-1,1]
+            dist = torch.distributions.Beta(
+                a_p.unsqueeze(1).expand(-1, P),
+                b_p.unsqueeze(1).expand(-1, P))
+            samples = dist.sample()                                 # (N, P) in [0,1]
+            cands_raw = (2.0 * samples - 1.0).numpy()              # (N, P) in [-1,1]
+
+        # raw → delta → action
+        prev_act = sim.action_history[:, t - 1]                    # (N,)
+        cands_delta = np.clip(cands_raw * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
+        cands_act = np.clip(prev_act[:, None] + cands_delta,
+                            STEER_RANGE[0], STEER_RANGE[1])        # (N, P)
+
+        # Build ONNX context at step t
+        NP = N * P
+        ctx_s = np.repeat(sim.state_history[:, t-CL+1:t+1, :], P, axis=0)       # (NP, CL, 3)
+        ctx_a = np.repeat(sim.action_history[:, t-CL+1:t+1], P, axis=0).copy()  # (NP, CL)
+        ctx_p = np.repeat(sim.current_lataccel_history[:, t-CL:t], P, axis=0)    # (NP, CL)
+        ctx_a[:, -1] = cands_act.ravel()                            # inject candidate
+
+        # Targets & starting lat_accel for H-step horizon
+        tgt_h = np.repeat(sim.data['target_lataccel'][:, t:t+H], P, axis=0)
+        prev_la = np.repeat(sim.current_lataccel_history[:, t - 1], P)
+        cost = np.zeros(NP, np.float64)
+
+        for h in range(H):
+            # ONNX expected value (deterministic, no sampling)
+            tokenized = tok.encode(ctx_p)
+            states_in = np.concatenate([ctx_a[:, :, None], ctx_s], axis=-1)
+            logits = ort_sess.run(None, {
+                'states': states_in.astype(np.float32),
+                'tokens': tokenized.astype(np.int64),
+            })[0][:, -1, :] / 0.8
+            e_x = np.exp(logits - logits.max(axis=-1, keepdims=True))
+            probs = e_x / e_x.sum(axis=-1, keepdims=True)
+            pred_la = np.sum(probs * tok.bins[None, :], axis=-1)
+            pred_la = np.clip(pred_la, prev_la - MAX_ACC_DELTA, prev_la + MAX_ACC_DELTA)
+
+            # True cost for this step
+            cost += (tgt_h[:, h] - pred_la) ** 2 * 100 * LAT_ACCEL_COST_MULTIPLIER
+            cost += ((pred_la - prev_la) / DEL_T) ** 2 * 100
+            prev_la = pred_la
+
+            if h < H - 1:
+                ns = t + h + 1
+                if ns >= sim.T:
+                    break
+                # Shift context: drop oldest, append new
+                new_s = np.stack([
+                    np.repeat(sim.data['roll_lataccel'][:, ns], P),
+                    np.repeat(sim.data['v_ego'][:, ns], P),
+                    np.repeat(sim.data['a_ego'][:, ns], P),
+                ], axis=-1)[:, None, :]
+                # Deterministic policy rollout: apply policy mean via delta
+                mean_delta = np.clip(
+                    np.repeat(pmean, P) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
+                new_steer = np.clip(ctx_a[:, -1] + mean_delta,
+                                    STEER_RANGE[0], STEER_RANGE[1])
+                ctx_s = np.concatenate([ctx_s[:, 1:, :], new_s], axis=1)
+                ctx_a = np.concatenate([ctx_a[:, 1:], new_steer[:, None]], axis=1)
+                ctx_p = np.concatenate([ctx_p[:, 1:], pred_la[:, None]], axis=1)
+
+        # Best candidate per route
+        best_p = np.argmin(cost.reshape(N, P), axis=1)
+        plan_raw[:, si] = cands_raw[np.arange(N), best_p]
+
+    return plan_obs, plan_raw
 
 
 # ── persistent remote TCP clients (multi-remote) ────────────────────
@@ -852,11 +984,20 @@ def train_one_epoch(epoch, ctx, warmup_off=0):
         critic_only=co)
     tu = time.time() - t1
 
+    # Planning refinement via multi-step shooting (if enabled)
+    if SHOOT_H > 0 and not co:
+        p_obs = [r[6] for r in res if len(r) > 6 and r[6] is not None]
+        p_raw = [r[7] for r in res if len(r) > 7 and r[7] is not None]
+        if p_obs:
+            info['plan'] = ctx.ppo.planning_update(
+                np.concatenate(p_obs), np.concatenate(p_raw))
+
     costs = [r[5] for r in res]
     phase = "  [critic warmup]" if co else ""
+    plan_s = f"  P={info['plan']:.2f}" if 'plan' in info else ""
     line = (f"E{epoch:3d}  train={np.mean(costs):6.1f}  σ={info['σ']:.4f}"
             f"  π={info['pi']:+.4f}  vf={info['vf']:.1f}  H={info['ent']:.2f}"
-            f"  lr={info['lr']:.1e}  ⏱{tc:.0f}+{tu:.0f}s{phase}")
+            f"  lr={info['lr']:.1e}{plan_s}  ⏱{tc:.0f}+{tu:.0f}s{phase}")
 
     if epoch % EVAL_EVERY == 0:
         vm, vs = evaluate(ctx, ctx.va_f)
