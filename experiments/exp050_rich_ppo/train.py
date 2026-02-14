@@ -427,7 +427,7 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
             noise_state[:] = NOISE_RHO * noise_state + np.sqrt(1 - NOISE_RHO**2) * eps
             raw = np.clip(mean + noise_state, -1.0 + 1e-6, 1.0 - 1e-6)
 
-        delta  = np.clip(np.float64(raw) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
+        delta  = np.clip(raw.astype(np.float64) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
         action = np.clip(h_act[:, -1] + delta, STEER_RANGE[0], STEER_RANGE[1])
 
         h_act = np.concatenate([h_act[:, 1:], action[:, None]], axis=1)
