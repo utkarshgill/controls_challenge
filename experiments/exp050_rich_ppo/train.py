@@ -165,7 +165,7 @@ class ActorCritic(nn.Module):
         out = self.actor(obs_t)
         alpha = F.softplus(out[..., 0]) + 1.0
         beta  = F.softplus(out[..., 1]) + 1.0
-        return alpha, beta
+        return alpha.clamp(1.01, 1000.0), beta.clamp(1.01, 1000.0)
 
     @torch.inference_mode()
     def act(self, obs_np, deterministic=False):
@@ -298,7 +298,7 @@ class PPO:
                     dist = torch.distributions.Beta(a_cur, b_cur)
                     lp   = dist.log_prob(x_t[idx].squeeze(-1))  # on (0,1)
 
-                    ratio = (lp - old_lp[idx]).clamp(-20.0, 20.0).exp()
+                    ratio = (lp - old_lp[idx]).exp()
                     pi_loss = -torch.min(
                         ratio * mb_adv,
                         ratio.clamp(1 - EPS_CLIP, 1 + EPS_CLIP) * mb_adv).mean()
