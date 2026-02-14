@@ -70,7 +70,6 @@ class ActorCritic(nn.Module):
         self.critic = nn.Sequential(*c)
 
 
-
 class Controller(BaseController):
     def __init__(self, checkpoint_path=None):
         if checkpoint_path is None:

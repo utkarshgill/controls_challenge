@@ -23,12 +23,11 @@ DELTA_SCALE, MAX_DELTA = 0.25, 0.5
 
 # PPO
 PI_LR, VF_LR     = 3e-4, 3e-4
-GAMMA, LAMDA      = 0.95, 0.9
+GAMMA, LAMDA      = 0.99, 0.95
 K_EPOCHS, EPS_CLIP = 4, 0.2
 VF_COEF, ENT_COEF = 1.0, 0.003
 MINI_BS           = 20_000
-CRITIC_WARMUP     = 0   # critic pretrained during BC
-NOISE_RHO         = 0.5   # AR(1) colored noise correlation (0=white, 1=brown)
+CRITIC_WARMUP     = 3
 
 # BC
 BC_EPOCHS    = int(os.getenv('BC_EPOCHS', '40'))
@@ -165,7 +164,7 @@ class ActorCritic(nn.Module):
         out = self.actor(obs_t)
         alpha = F.softplus(out[..., 0]) + 1.0
         beta  = F.softplus(out[..., 1]) + 1.0
-        return alpha.clamp(1.01, 1000.0), beta.clamp(1.01, 1000.0)
+        return alpha, beta
 
     @torch.inference_mode()
     def act(self, obs_np, deterministic=False):
@@ -234,11 +233,31 @@ def compute_rewards(traj):
     return (-(lat + jerk**2 * 100) / 500.0).astype(np.float32)
 
 
+class RunningMeanStd:
+    """Welford's online algorithm for running variance (used for return normalization)."""
+    def __init__(self):
+        self.mean = 0.0; self.var = 1.0; self.count = 1e-4
+    def update(self, x):
+        x = np.asarray(x, np.float64).ravel()
+        batch_mean, batch_var, batch_count = x.mean(), x.var(), len(x)
+        delta = batch_mean - self.mean
+        tot = self.count + batch_count
+        self.mean += delta * batch_count / tot
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta**2 * self.count * batch_count / tot
+        self.var = m2 / tot
+        self.count = tot
+    @property
+    def std(self): return np.sqrt(self.var + 1e-8)
+
+
 class PPO:
     def __init__(self, ac):
         self.ac = ac
         self.pi_opt = optim.Adam(ac.actor.parameters(), lr=PI_LR, eps=1e-5)
         self.vf_opt = optim.Adam(ac.critic.parameters(), lr=VF_LR, eps=1e-5)
+        self._ret_rms = RunningMeanStd()  # for return normalization
 
     def set_lr(self, epoch, total):
         """Cosine annealing: lr = base * 0.5 * (1 + cos(pi * epoch / total))"""
@@ -248,6 +267,11 @@ class PPO:
         return PI_LR * frac
 
     def gae(self, all_r, all_v, all_d):
+        # Normalize rewards by running return std
+        self._ret_rms.update(np.concatenate(all_r))
+        rstd = self._ret_rms.std
+        all_r = [r / rstd for r in all_r]
+
         advs, rets = [], []
         for r, v, d in zip(all_r, all_v, all_d):
             T = len(r); adv = np.zeros(T, np.float32); g = 0.0
@@ -277,17 +301,21 @@ class PPO:
         with torch.no_grad():
             a_old, b_old = self.ac.beta_params(obs_t)
             old_lp = torch.distributions.Beta(a_old, b_old).log_prob(x_t.squeeze(-1))
-
-        # Global advantage normalization (once, before update loop)
-        adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+            old_val = self.ac.critic(obs_t).squeeze(-1)
 
         N = len(obs_t)
         for _ in range(K_EPOCHS):
             for idx in torch.randperm(N).split(MINI_BS):
+                # Per-minibatch advantage normalization
                 mb_adv = adv_t[idx]
+                mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
                 val = self.ac.critic(obs_t[idx]).squeeze(-1)
-                vf_loss = F.huber_loss(val, ret_t[idx], delta=50.0)
+                v_clipped = old_val[idx] + (val - old_val[idx]).clamp(-10.0, 10.0)
+                vf_loss = torch.max(
+                    F.huber_loss(val, ret_t[idx], delta=10.0, reduction='none'),
+                    F.huber_loss(v_clipped, ret_t[idx], delta=10.0, reduction='none'),
+                ).mean()
 
                 if critic_only:
                     self.vf_opt.zero_grad()
@@ -391,10 +419,9 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
 
     all_obs, all_raw, all_val = [], [], []
     tgt_hist, cur_hist = [], []
-    noise_state = np.zeros(N, np.float32)  # AR(1) colored noise state
 
     def controller_fn(step_idx, target, current_la, state_dict, future_plan):
-        nonlocal h_act, h_lat, h_error, noise_state
+        nonlocal h_act, h_lat, h_error
 
         roll_la = state_dict['roll_lataccel']
         v_ego   = state_dict['v_ego']
@@ -421,14 +448,10 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
         if deterministic:
             raw = (2.0 * a_p / (a_p + b_p) - 1.0).numpy()      # Beta mean
         else:
-            # AR(1) colored noise: temporally correlated exploration
-            mean = (2.0 * a_p / (a_p + b_p) - 1.0).numpy()
-            x_iid = torch.distributions.Beta(a_p, b_p).sample()
-            eps = (2.0 * x_iid - 1.0).numpy() - mean            # white noise innovation
-            noise_state[:] = NOISE_RHO * noise_state + np.sqrt(1 - NOISE_RHO**2) * eps
-            raw = np.clip(mean + noise_state, -1.0 + 1e-6, 1.0 - 1e-6)
+            x   = torch.distributions.Beta(a_p, b_p).sample()
+            raw = (2.0 * x - 1.0).numpy()
 
-        delta  = np.clip(raw.astype(np.float64) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
+        delta  = np.clip(np.float64(raw) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
         action = np.clip(h_act[:, -1] + delta, STEER_RANGE[0], STEER_RANGE[1])
 
         h_act = np.concatenate([h_act[:, 1:], action[:, None]], axis=1)
@@ -506,7 +529,7 @@ def _close_remote_sock(idx):
         try: s.close()
         except Exception: pass
 
-def _remote_request(idx, ckpt_path, csv_list, mode='train', _retries=3):
+def _remote_request(idx, ckpt_path, csv_list, mode='train', _retries=1):
     """Send ckpt + CSV list to remote server idx, receive NPZ results."""
     host = REMOTE_HOSTS[idx]
     try:
@@ -549,8 +572,8 @@ def _remote_request(idx, ckpt_path, csv_list, mode='train', _retries=3):
     except Exception as e:
         _close_remote_sock(idx)
         if _retries > 0:
-            print(f"  [remote-{idx}] {e}, reconnecting ({_retries} left)...")
-            time.sleep(2.0)
+            print(f"  [remote-{idx}] {e}, reconnecting...")
+            time.sleep(0.5)
             return _remote_request(idx, ckpt_path, csv_list, mode, _retries=_retries-1)
         print(f"  [remote-{idx}] request failed: {e}")
         return []
@@ -576,7 +599,7 @@ def _bc_worker(csv_path):
 
     for step_idx in range(CONTEXT_LENGTH, CONTROL_START_IDX):
         target_la = tgt[step_idx]
-        current_la = tgt[step_idx]  # perfect tracking for BC
+        current_la = tgt[step_idx]  # BC assumes perfect tracking
 
         state = State(
             roll_lataccel=data['roll_lataccel'].values[step_idx],
@@ -593,7 +616,7 @@ def _bc_worker(csv_path):
 
         prev_act = h_act[-1]
         delta = steer[step_idx] - prev_act
-        raw_target = np.clip(delta / DELTA_SCALE, -1.0, 1.0)
+        raw_target = np.clip(delta / DELTA_SCALE, -1.0, 1.0)  # Beta support
         obs_list.append(obs)
         raw_list.append(raw_target)
         h_act.append(steer[step_idx]);                         h_act.pop(0)
@@ -602,20 +625,8 @@ def _bc_worker(csv_path):
         h_a.append(data['a_ego'].values[step_idx]);            h_a.pop(0)
         h_roll.append(data['roll_lataccel'].values[step_idx]); h_roll.pop(0)
 
-    # Compute returns for critic pretraining (perfect tracking → jerk-only cost)
-    tgt_arr = np.array([tgt[s] for s in range(CONTEXT_LENGTH, CONTROL_START_IDX)], np.float32)
-    jerk_r = np.diff(tgt_arr, prepend=tgt_arr[0]) / DEL_T
-    rewards = (-(jerk_r**2 * 100) / 500.0).astype(np.float32)
-    T = len(rewards)
-    returns = np.zeros(T, np.float32)
-    G = 0.0
-    for t in range(T - 1, -1, -1):
-        G = rewards[t] + GAMMA * G
-        returns[t] = G
-
     return (np.array(obs_list, np.float32),
-            np.array(raw_list, np.float32),
-            returns)
+            np.array(raw_list, np.float32))
 
 
 def pretrain_bc(ac, csv_files, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
@@ -624,16 +635,13 @@ def pretrain_bc(ac, csv_files, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
                           max_workers=BC_WORKERS, chunksize=50, disable=False)
     all_obs = np.concatenate([r[0] for r in results])
     all_raw = np.concatenate([r[1] for r in results])
-    all_ret = np.concatenate([r[2] for r in results])
     N = len(all_obs)
     print(f"BC pretrain: {N} samples, {epochs} epochs")
 
     obs_t = torch.FloatTensor(all_obs)
     raw_t = torch.FloatTensor(all_raw)
-    ret_t = torch.FloatTensor(all_ret)
+    opt = optim.Adam(list(ac.actor.parameters()), lr=lr)
 
-    # ── Actor pretraining (behavioral cloning) ──
-    pi_opt = optim.Adam(ac.actor.parameters(), lr=lr, eps=1e-5)
     for ep in range(epochs):
         perm = torch.randperm(N)
         total_loss = 0.0
@@ -642,31 +650,13 @@ def pretrain_bc(ac, csv_files, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
             a_p, b_p = ac.beta_params(obs_t[idx])
             x_target = ((raw_t[idx] + 1.0) / 2.0).clamp(1e-6, 1 - 1e-6)
             loss = -torch.distributions.Beta(a_p, b_p).log_prob(x_target).mean()
-            pi_opt.zero_grad()
+            opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(ac.actor.parameters(), BC_GRAD_CLIP)
-            pi_opt.step()
+            opt.step()
             total_loss += loss.item()
             n_batches += 1
-        print(f"  BC actor  ep {ep}: loss={total_loss/n_batches:.6f}")
-
-    # ── Critic pretraining (value regression on BC returns) ──
-    vf_opt = optim.Adam(ac.critic.parameters(), lr=lr, eps=1e-5)
-    critic_epochs = max(epochs // 2, 10)
-    for ep in range(critic_epochs):
-        perm = torch.randperm(N)
-        total_loss = 0.0
-        n_batches = 0
-        for idx in perm.split(batch_size):
-            val = ac.critic(obs_t[idx]).squeeze(-1)
-            loss = F.mse_loss(val, ret_t[idx])
-            vf_opt.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(ac.critic.parameters(), 0.5)
-            vf_opt.step()
-            total_loss += loss.item()
-            n_batches += 1
-        print(f"  BC critic ep {ep}: vf_loss={total_loss/n_batches:.4f}")
+        print(f"  BC epoch {ep}: loss={total_loss/n_batches:.6f}")
 
     print("BC pretrain done.\n")
 
@@ -893,8 +883,7 @@ def train():
             # Re-apply eps=1e-5 (old checkpoints saved with 1e-8)
             for opt in (ctx.ppo.pi_opt, ctx.ppo.vf_opt):
                 for pg in opt.param_groups: pg['eps'] = 1e-5
-        if 'pi_opt' in ckpt:
-            print(f"Resumed from best_model.pt (with optimizer state, NO ret_rms)")
+            print(f"Resumed from best_model.pt (with optimizer state)")
         else:
             print(f"Resumed from best_model.pt (weights only)")
         resumed = True
