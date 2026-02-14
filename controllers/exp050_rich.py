@@ -32,9 +32,10 @@ S_AEGO  = 4.0
 S_ROLL  = 2.0
 S_CURV  = 0.02
 
-LPF_ALPHA  = float(os.getenv('LPF_ALPHA', '0.1'))  # low-pass: 0=off, 0.15=subtle
+MODEL      = os.getenv('MODEL', '')                 # path to controller weights (fallback: best_model.pt)
+LPF_ALPHA  = float(os.getenv('LPF_ALPHA', '0'))  # low-pass: 0=off, 0.15=subtle
 NEWTON     = int(os.getenv('NEWTON', '0'))          # 1-step predict-and-correct via ONNX
-NEWTON_K   = float(os.getenv('NEWTON_K', '0.2'))   # correction gain
+NEWTON_K   = float(os.getenv('NEWTON_K', '0.1'))   # correction gain
 NEWTON_MAX = float(os.getenv('NEWTON_MAX', '0.1'))  # max correction magnitude
 RATE_LIMIT = float(os.getenv('RATE_LIMIT', '0'))    # max |Δsteer|/step after all corrections (0=off)
 VNORM      = int(os.getenv('VNORM', '0'))           # speed-normalize steer: steer *= v/v_ref
@@ -72,12 +73,15 @@ class ActorCritic(nn.Module):
 
 class Controller(BaseController):
     def __init__(self, checkpoint_path=None):
+        if checkpoint_path is None and MODEL:
+            checkpoint_path = MODEL
         if checkpoint_path is None:
             exp = Path(__file__).parent.parent / 'experiments' / 'exp050_rich_ppo'
             for name in ('best_model.pt', 'final_model.pt'):
                 p = exp / name
                 if p.exists():
-                    checkpoint_path = str(p); break
+                    checkpoint_path = str(p)
+                    break
             if checkpoint_path is None:
                 raise FileNotFoundError(f"No checkpoint in {exp}")
 
@@ -100,49 +104,50 @@ class Controller(BaseController):
         self._sim_model = model
 
     def _push(self, action, current, state):
-        self._h_act.append(action);              self._h_act.pop(0)
-        self._h_lat.append(current);             self._h_lat.pop(0)
-        self._h_v.append(state.v_ego);           self._h_v.pop(0)
-        self._h_a.append(state.a_ego);           self._h_a.pop(0)
-        self._h_roll.append(state.roll_lataccel); self._h_roll.pop(0)
+        self._h_act = self._h_act[1:] + [action]
+        self._h_lat = self._h_lat[1:] + [current]
+        self._h_v = self._h_v[1:] + [state.v_ego]
+        self._h_a = self._h_a[1:] + [state.a_ego]
+        self._h_roll = self._h_roll[1:] + [state.roll_lataccel]
 
     def _build_obs(self, target_lataccel, current_lataccel, state, future_plan, error_integral, h_act, h_lat):
         """Build the 256-dim observation vector."""
         error = target_lataccel - current_lataccel
-        obs = np.empty(STATE_DIM, np.float32)
-        i = 0
-        obs[i] = target_lataccel / S_LAT;                          i += 1
-        obs[i] = current_lataccel / S_LAT;                         i += 1
-        obs[i] = error / S_LAT;                                    i += 1
         k_tgt = _curv(target_lataccel, state.roll_lataccel, state.v_ego)
         k_cur = _curv(current_lataccel, state.roll_lataccel, state.v_ego)
-        obs[i] = k_tgt / S_CURV;                                   i += 1
-        obs[i] = k_cur / S_CURV;                                   i += 1
-        obs[i] = (k_tgt - k_cur) / S_CURV;                         i += 1
-        obs[i] = state.v_ego / S_VEGO;                             i += 1
-        obs[i] = state.a_ego / S_AEGO;                             i += 1
-        obs[i] = state.roll_lataccel / S_ROLL;                     i += 1
-        obs[i] = h_act[-1] / S_STEER;                              i += 1
-        obs[i] = error_integral / S_LAT;                            i += 1
         _flat = getattr(future_plan, 'lataccel', None)
         fplan_lat0 = _flat[0] if (_flat and len(_flat) > 0) else target_lataccel
-        obs[i] = (fplan_lat0 - target_lataccel) / DEL_T / S_LAT;  i += 1
-        obs[i] = (current_lataccel - h_lat[-1]) / DEL_T / S_LAT;  i += 1
-        obs[i] = (h_act[-1] - h_act[-2]) / DEL_T / S_STEER;      i += 1
-        obs[i] = np.sqrt(current_lataccel**2 + state.a_ego**2) / 7.0; i += 1
-        obs[i] = max(0.0, 1.0 - np.sqrt(current_lataccel**2 + state.a_ego**2) / 7.0); i += 1
-        obs[i:i+HIST_LEN] = np.array(h_act, np.float32) / S_STEER;  i += HIST_LEN
-        obs[i:i+HIST_LEN] = np.array(h_lat, np.float32) / S_LAT;    i += HIST_LEN
-        f_lat  = _future_raw(future_plan, 'lataccel',      target_lataccel)
-        f_roll = _future_raw(future_plan, 'roll_lataccel',  state.roll_lataccel)
-        f_v    = _future_raw(future_plan, 'v_ego',          state.v_ego)
-        f_a    = _future_raw(future_plan, 'a_ego',          state.a_ego)
-        obs[i:i+FUTURE_K] = f_lat / S_LAT;   i += FUTURE_K
-        obs[i:i+FUTURE_K] = f_roll / S_ROLL;  i += FUTURE_K
-        obs[i:i+FUTURE_K] = f_v / S_VEGO;     i += FUTURE_K
-        obs[i:i+FUTURE_K] = f_a / S_AEGO;     i += FUTURE_K
-        np.clip(obs, -5.0, 5.0, out=obs)
-        return obs
+        fric = np.sqrt(current_lataccel**2 + state.a_ego**2) / 7.0
+
+        core = np.array([
+            target_lataccel / S_LAT,
+            current_lataccel / S_LAT,
+            error / S_LAT,
+            k_tgt / S_CURV,
+            k_cur / S_CURV,
+            (k_tgt - k_cur) / S_CURV,
+            state.v_ego / S_VEGO,
+            state.a_ego / S_AEGO,
+            state.roll_lataccel / S_ROLL,
+            h_act[-1] / S_STEER,
+            error_integral / S_LAT,
+            (fplan_lat0 - target_lataccel) / DEL_T / S_LAT,
+            (current_lataccel - h_lat[-1]) / DEL_T / S_LAT,
+            (h_act[-1] - h_act[-2]) / DEL_T / S_STEER,
+            fric,
+            max(0.0, 1.0 - fric),
+        ], dtype=np.float32)
+
+        obs = np.concatenate([
+            core,
+            np.array(h_act, np.float32) / S_STEER,
+            np.array(h_lat, np.float32) / S_LAT,
+            _future_raw(future_plan, 'lataccel', target_lataccel) / S_LAT,
+            _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel) / S_ROLL,
+            _future_raw(future_plan, 'v_ego', state.v_ego) / S_VEGO,
+            _future_raw(future_plan, 'a_ego', state.a_ego) / S_AEGO,
+        ])
+        return np.clip(obs, -5.0, 5.0)
 
     def _sample_action(self, obs):
         """Sample a stochastic delta from the Beta policy."""
@@ -207,7 +212,7 @@ class Controller(BaseController):
         self.n += 1
 
         error = target_lataccel - current_lataccel
-        self._h_error.append(error); self._h_error.pop(0)
+        self._h_error = self._h_error[1:] + [error]
         error_integral = float(np.mean(self._h_error)) * DEL_T
 
         if self.n <= WARMUP_N:

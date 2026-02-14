@@ -13,7 +13,8 @@ from tinyphysics import (TinyPhysicsModel, TinyPhysicsSimulator, BaseController,
     STEER_RANGE, DEL_T, LAT_ACCEL_COST_MULTIPLIER, ACC_G, State, FuturePlan)
 from tinyphysics_batched import BatchedSimulator, pool_init, get_pool_cache, run_parallel_chunked
 
-torch.manual_seed(42); np.random.seed(42)
+torch.manual_seed(42)
+np.random.seed(42)
 
 # architecture
 HIST_LEN, FUTURE_K   = 20, 50
@@ -24,16 +25,16 @@ DELTA_SCALE, MAX_DELTA = 0.25, 0.5
 # PPO
 PI_LR, VF_LR     = 3e-4, 3e-4
 GAMMA, LAMDA      = 0.95, 0.9
-K_EPOCHS, EPS_CLIP = 4, 0.2
+K_EPOCHS, EPS_CLIP = 4, 0.15
 VF_COEF, ENT_COEF = 1.0, 0.003
 MINI_BS           = 20_000
-CRITIC_WARMUP     = 3
+CRITIC_WARMUP     = 4
 
 # BC
-BC_EPOCHS    = int(os.getenv('BC_EPOCHS', '40'))
-BC_LR        = float(os.getenv('BC_LR', '3e-4'))
+BC_EPOCHS    = int(os.getenv('BC_EPOCHS', '20'))
+BC_LR        = float(os.getenv('BC_LR', '0.01'))
 BC_BS        = int(os.getenv('BC_BS', '8192'))
-BC_GRAD_CLIP = float(os.getenv('BC_GRAD_CLIP', '1.0'))
+BC_GRAD_CLIP = float(os.getenv('BC_GRAD_CLIP', '2.0'))
 
 # runtime
 CSVS_EPOCH = int(os.getenv('CSVS',    '500'))
@@ -90,47 +91,44 @@ def _future_raw(fplan, attr, fallback, k=FUTURE_K):
     return np.full(k, fallback, dtype=np.float32)
 
 def _curv(lat, roll, v): return (lat - roll) / max(v * v, 1.0)
-def _hist(buf, scale): return np.array(buf, np.float32) / scale
-
 def build_obs(target, current, state, fplan,
               hist_act, hist_lat, hist_v, hist_a, hist_roll,
               error_integral=0.0):
     error = target - current
-    k_target  = _curv(target, state.roll_lataccel, state.v_ego)
-    k_current = _curv(current, state.roll_lataccel, state.v_ego)
-
-    obs = np.empty(STATE_DIM, np.float32); i = 0
-    # core (16)
-    obs[i] = target / S_LAT;               i += 1
-    obs[i] = current / S_LAT;              i += 1
-    obs[i] = error / S_LAT;                i += 1
-    obs[i] = k_target / S_CURV;            i += 1
-    obs[i] = k_current / S_CURV;           i += 1
-    obs[i] = (k_target - k_current) / S_CURV; i += 1
-    obs[i] = state.v_ego / S_VEGO;         i += 1
-    obs[i] = state.a_ego / S_AEGO;         i += 1
-    obs[i] = state.roll_lataccel / S_ROLL; i += 1
-    obs[i] = hist_act[-1] / S_STEER;       i += 1   # prev_act
-    obs[i] = error_integral / S_LAT;       i += 1   # error integral (I-term)
+    k_tgt = _curv(target, state.roll_lataccel, state.v_ego)
+    k_cur = _curv(current, state.roll_lataccel, state.v_ego)
     _flat = getattr(fplan, 'lataccel', None)
     fplan_lat0 = _flat[0] if (_flat and len(_flat) > 0) else target
-    obs[i] = (fplan_lat0 - target) / DEL_T / S_LAT;              i += 1  # target_rate
-    obs[i] = (current - hist_lat[-1]) / DEL_T / S_LAT;           i += 1  # current_rate
-    obs[i] = (hist_act[-1] - hist_act[-2]) / DEL_T / S_STEER;   i += 1  # steer_rate
-    obs[i] = np.sqrt(current**2 + state.a_ego**2) / 7.0;        i += 1  # friction_circle
-    obs[i] = max(0.0, 1.0 - np.sqrt(current**2 + state.a_ego**2) / 7.0); i += 1  # grip_headroom
-    # history (40)
-    obs[i:i+HIST_LEN] = _hist(hist_act, S_STEER); i += HIST_LEN
-    obs[i:i+HIST_LEN] = _hist(hist_lat, S_LAT);   i += HIST_LEN
-    # future (200)
-    f_lat  = _future_raw(fplan, 'lataccel',      target)
-    f_roll = _future_raw(fplan, 'roll_lataccel',  state.roll_lataccel)
-    f_v    = _future_raw(fplan, 'v_ego',          state.v_ego)
-    f_a    = _future_raw(fplan, 'a_ego',          state.a_ego)
-    obs[i:i+FUTURE_K] = f_lat / S_LAT;   i += FUTURE_K
-    obs[i:i+FUTURE_K] = f_roll / S_ROLL;  i += FUTURE_K
-    obs[i:i+FUTURE_K] = f_v / S_VEGO;     i += FUTURE_K
-    obs[i:i+FUTURE_K] = f_a / S_AEGO;     i += FUTURE_K
+    fric = np.sqrt(current**2 + state.a_ego**2) / 7.0
+
+    core = np.array([
+        target / S_LAT,
+        current / S_LAT,
+        error / S_LAT,
+        k_tgt / S_CURV,
+        k_cur / S_CURV,
+        (k_tgt - k_cur) / S_CURV,
+        state.v_ego / S_VEGO,
+        state.a_ego / S_AEGO,
+        state.roll_lataccel / S_ROLL,
+        hist_act[-1] / S_STEER,
+        error_integral / S_LAT,
+        (fplan_lat0 - target) / DEL_T / S_LAT,
+        (current - hist_lat[-1]) / DEL_T / S_LAT,
+        (hist_act[-1] - hist_act[-2]) / DEL_T / S_STEER,
+        fric,
+        max(0.0, 1.0 - fric),
+    ], dtype=np.float32)
+
+    obs = np.concatenate([
+        core,
+        np.array(hist_act, np.float32) / S_STEER,
+        np.array(hist_lat, np.float32) / S_LAT,
+        _future_raw(fplan, 'lataccel', target) / S_LAT,
+        _future_raw(fplan, 'roll_lataccel', state.roll_lataccel) / S_ROLL,
+        _future_raw(fplan, 'v_ego', state.v_ego) / S_VEGO,
+        _future_raw(fplan, 'a_ego', state.a_ego) / S_AEGO,
+    ])
     return np.clip(obs, -5.0, 5.0)
 
 def _ortho_init(module, gain=np.sqrt(2)):
@@ -192,18 +190,18 @@ class DeltaController(BaseController):
         self.traj = []
 
     def _push(self, action, current, state):
-        self._h_act.append(action);                  self._h_act.pop(0)
-        self._h_lat.append(current);                  self._h_lat.pop(0)
-        self._h_v.append(state.v_ego);                self._h_v.pop(0)
-        self._h_a.append(state.a_ego);                self._h_a.pop(0)
-        self._h_roll.append(state.roll_lataccel);     self._h_roll.pop(0)
+        self._h_act = self._h_act[1:] + [action]
+        self._h_lat = self._h_lat[1:] + [current]
+        self._h_v = self._h_v[1:] + [state.v_ego]
+        self._h_a = self._h_a[1:] + [state.a_ego]
+        self._h_roll = self._h_roll[1:] + [state.roll_lataccel]
 
     def update(self, target_lataccel, current_lataccel, state, future_plan):
         self.n += 1
         step_idx = CONTEXT_LENGTH + self.n - 1
 
         error = target_lataccel - current_lataccel
-        self._h_error.append(error); self._h_error.pop(0)
+        self._h_error = self._h_error[1:] + [error]
         error_integral = float(np.mean(self._h_error)) * DEL_T
 
         if step_idx < CONTROL_START_IDX:
@@ -236,7 +234,9 @@ def compute_rewards(traj):
 class RunningMeanStd:
     """Welford's online algorithm for running variance (used for return normalization)."""
     def __init__(self):
-        self.mean = 0.0; self.var = 1.0; self.count = 1e-4
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = 1e-4
     def update(self, x):
         x = np.asarray(x, np.float64).ravel()
         batch_mean, batch_var, batch_count = x.mean(), x.var(), len(x)
@@ -274,13 +274,17 @@ class PPO:
 
         advs, rets = [], []
         for r, v, d in zip(all_r, all_v, all_d):
-            T = len(r); adv = np.zeros(T, np.float32); g = 0.0
+            T = len(r)
+            adv = np.zeros(T, np.float32)
+            g = 0.0
             for t in range(T-1, -1, -1):
                 nv = 0.0 if t == T-1 else v[t+1]
                 g = (r[t] + GAMMA*nv*(1-d[t]) - v[t]) + GAMMA*LAMDA*(1-d[t])*g
                 adv[t] = g
-            advs.append(adv); rets.append(adv + v)
-        a = np.concatenate(advs); r = np.concatenate(rets)
+            advs.append(adv)
+            rets.append(adv + v)
+        a = np.concatenate(advs)
+        r = np.concatenate(rets)
         return a, r  # advantage normalization moved to minibatch level
 
     @staticmethod
@@ -334,11 +338,13 @@ class PPO:
                     ent = dist.entropy().mean()   # +log2 is constant, drops out
 
                     loss = pi_loss + VF_COEF * vf_loss - ENT_COEF * ent
-                    self.pi_opt.zero_grad(); self.vf_opt.zero_grad()
+                    self.pi_opt.zero_grad()
+                    self.vf_opt.zero_grad()
                     loss.backward()
                     nn.utils.clip_grad_norm_(self.ac.actor.parameters(), 0.5)
                     nn.utils.clip_grad_norm_(self.ac.critic.parameters(), 0.5)
-                    self.pi_opt.step(); self.vf_opt.step()
+                    self.pi_opt.step()
+                    self.vf_opt.step()
 
         pi_val = pi_loss.item() if not critic_only else 0.0
         ent_val = ent.item() if not critic_only else 0.0
@@ -356,55 +362,54 @@ def build_obs_batch(target, current, roll_la, v_ego, a_ego,
                     error_integral=None):
     N = target.shape[0]
     T = fplan_data['target_lataccel'].shape[1]
-    obs = np.empty((N, STATE_DIM), np.float32)
 
     if error_integral is None:
         error_integral = np.zeros(N, np.float32)
 
     error = target - current
     v2 = np.maximum(v_ego * v_ego, 1.0)
-    k_target  = (target - roll_la) / v2
-    k_current = (current - roll_la) / v2
-
-    i = 0
-    obs[:, i] = target / S_LAT;                i += 1
-    obs[:, i] = current / S_LAT;               i += 1
-    obs[:, i] = error / S_LAT;                 i += 1
-    obs[:, i] = k_target / S_CURV;             i += 1
-    obs[:, i] = k_current / S_CURV;            i += 1
-    obs[:, i] = (k_target - k_current) / S_CURV; i += 1
-    obs[:, i] = v_ego / S_VEGO;                i += 1
-    obs[:, i] = a_ego / S_AEGO;                i += 1
-    obs[:, i] = roll_la / S_ROLL;              i += 1
+    k_tgt = (target - roll_la) / v2
+    k_cur = (current - roll_la) / v2
     h_act32 = h_act.astype(np.float32) if h_act.dtype != np.float32 else h_act
-    obs[:, i] = h_act32[:, -1] / S_STEER;       i += 1
-    obs[:, i] = error_integral / S_LAT;          i += 1   # error integral (I-term)
-    T_ = fplan_data['target_lataccel'].shape[1]
-    fplan_lat0 = fplan_data['target_lataccel'][:, min(step_idx + 1, T_ - 1)]
-    obs[:, i] = (fplan_lat0 - target) / DEL_T / S_LAT;           i += 1  # target_rate
-    obs[:, i] = (current - h_lat[:, -1]) / DEL_T / S_LAT;        i += 1  # current_rate
-    obs[:, i] = (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER; i += 1  # steer_rate
-    obs[:, i] = np.sqrt(current**2 + a_ego**2) / 7.0;            i += 1  # friction_circle
-    obs[:, i] = np.maximum(0.0, 1.0 - np.sqrt(current**2 + a_ego**2) / 7.0); i += 1  # grip_headroom
-    obs[:, i:i+HIST_LEN] = h_act32 / S_STEER;   i += HIST_LEN
-    obs[:, i:i+HIST_LEN] = h_lat / S_LAT;        i += HIST_LEN
+    fplan_lat0 = fplan_data['target_lataccel'][:, min(step_idx + 1, T - 1)]
+    fric = np.sqrt(current**2 + a_ego**2) / 7.0
+
+    core = np.column_stack([
+        target / S_LAT,
+        current / S_LAT,
+        error / S_LAT,
+        k_tgt / S_CURV,
+        k_cur / S_CURV,
+        (k_tgt - k_cur) / S_CURV,
+        v_ego / S_VEGO,
+        a_ego / S_AEGO,
+        roll_la / S_ROLL,
+        h_act32[:, -1] / S_STEER,
+        error_integral / S_LAT,
+        (fplan_lat0 - target) / DEL_T / S_LAT,
+        (current - h_lat[:, -1]) / DEL_T / S_LAT,
+        (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER,
+        fric,
+        np.maximum(0.0, 1.0 - fric),
+    ]).astype(np.float32)
 
     end = min(step_idx + FUTURE_PLAN_STEPS, T)
-    def _pad_future(arr_slice, k=FUTURE_K):
-        if arr_slice.shape[1] == 0: return None
-        if arr_slice.shape[1] < k:
-            return np.concatenate([arr_slice,
-                np.repeat(arr_slice[:, -1:], k - arr_slice.shape[1], axis=1)], 1)
-        return arr_slice
     fallback = {'target_lataccel': target, 'roll_lataccel': roll_la,
                 'v_ego': v_ego, 'a_ego': a_ego}
+    futures = []
     for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
                         ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
         slc = fplan_data[attr][:, step_idx+1:end]
-        padded = _pad_future(slc)
-        if padded is None:
+        if slc.shape[1] == 0:
             padded = np.repeat(fallback[attr][:, None], FUTURE_K, axis=1)
-        obs[:, i:i+FUTURE_K] = padded.astype(np.float32) / scale;  i += FUTURE_K
+        elif slc.shape[1] < FUTURE_K:
+            padded = np.concatenate([slc,
+                np.repeat(slc[:, -1:], FUTURE_K - slc.shape[1], axis=1)], 1)
+        else:
+            padded = slc
+        futures.append(padded.astype(np.float32) / scale)
+
+    obs = np.concatenate([core, h_act32 / S_STEER, h_lat / S_LAT] + futures, axis=1)
     return np.clip(obs, -5.0, 5.0)
 
 
@@ -619,11 +624,11 @@ def _bc_worker(csv_path):
         raw_target = np.clip(delta / DELTA_SCALE, -1.0, 1.0)  # Beta support
         obs_list.append(obs)
         raw_list.append(raw_target)
-        h_act.append(steer[step_idx]);                         h_act.pop(0)
-        h_lat.append(tgt[step_idx]);                           h_lat.pop(0)
-        h_v.append(data['v_ego'].values[step_idx]);            h_v.pop(0)
-        h_a.append(data['a_ego'].values[step_idx]);            h_a.pop(0)
-        h_roll.append(data['roll_lataccel'].values[step_idx]); h_roll.pop(0)
+        h_act = h_act[1:] + [steer[step_idx]]
+        h_lat = h_lat[1:] + [tgt[step_idx]]
+        h_v = h_v[1:] + [data['v_ego'].values[step_idx]]
+        h_a = h_a[1:] + [data['a_ego'].values[step_idx]]
+        h_roll = h_roll[1:] + [data['roll_lataccel'].values[step_idx]]
 
     return (np.array(obs_list, np.float32),
             np.array(raw_list, np.float32))
@@ -640,7 +645,8 @@ def pretrain_bc(ac, csv_files, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
 
     obs_t = torch.FloatTensor(all_obs)
     raw_t = torch.FloatTensor(all_raw)
-    opt = optim.Adam(list(ac.actor.parameters()), lr=lr)
+    opt = optim.AdamW(ac.actor.parameters(), lr=lr, weight_decay=1e-4)
+    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     for ep in range(epochs):
         perm = torch.randperm(N)
@@ -656,7 +662,8 @@ def pretrain_bc(ac, csv_files, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
             opt.step()
             total_loss += loss.item()
             n_batches += 1
-        print(f"  BC epoch {ep}: loss={total_loss/n_batches:.6f}")
+        sched.step()
+        print(f"  BC epoch {ep}: loss={total_loss/n_batches:.6f}  lr={opt.param_groups[0]['lr']:.1e}")
 
     print("BC pretrain done.\n")
 
@@ -736,9 +743,13 @@ class Ctx:
         torch.save({'ac': self.ac.state_dict()}, path)
 
     def save_best(self):
-        torch.save({'ac': self.ac.state_dict(),
-                     'pi_opt': self.ppo.pi_opt.state_dict(),
-                     'vf_opt': self.ppo.vf_opt.state_dict()}, BEST_PT)
+        rms = self.ppo._ret_rms
+        torch.save({
+            'ac': self.ac.state_dict(),
+            'pi_opt': self.ppo.pi_opt.state_dict(),
+            'vf_opt': self.ppo.vf_opt.state_dict(),
+            'ret_rms': {'mean': rms.mean, 'var': rms.var, 'count': rms.count},
+        }, BEST_PT)
 
 
 def _split_files(all_files):
@@ -841,7 +852,8 @@ def train_one_epoch(epoch, ctx, warmup_off=0):
     tc = time.time() - t0
 
     if not res:
-        print(f"E{epoch:3d}  NO DATA — skipping update"); return
+        print(f"E{epoch:3d}  NO DATA — skipping update")
+        return
 
     t1 = time.time()
     co = epoch < (CRITIC_WARMUP - warmup_off)
@@ -882,8 +894,16 @@ def train():
             ctx.ppo.vf_opt.load_state_dict(ckpt['vf_opt'])
             # Re-apply eps=1e-5 (old checkpoints saved with 1e-8)
             for opt in (ctx.ppo.pi_opt, ctx.ppo.vf_opt):
-                for pg in opt.param_groups: pg['eps'] = 1e-5
-            print(f"Resumed from best_model.pt (with optimizer state)")
+                for pg in opt.param_groups:
+                    pg['eps'] = 1e-5
+            if 'ret_rms' in ckpt:
+                r = ckpt['ret_rms']
+                ctx.ppo._ret_rms.mean = r['mean']
+                ctx.ppo._ret_rms.var = r['var']
+                ctx.ppo._ret_rms.count = r['count']
+                print(f"Resumed from best_model.pt (with optimizer + ret_rms state)")
+            else:
+                print(f"Resumed from best_model.pt (with optimizer state, ret_rms fresh)")
         else:
             print(f"Resumed from best_model.pt (weights only)")
         resumed = True
@@ -907,7 +927,8 @@ def train():
 
     print(f"\nDone. Best val: {ctx.best:.1f} (epoch {ctx.best_ep})")
     ctx.save_ckpt(EXP_DIR / 'final_model.pt')
-    ctx.pool.terminate(); ctx.pool.join()
+    ctx.pool.terminate()
+    ctx.pool.join()
     if TMP.exists(): TMP.unlink()
 
 
