@@ -223,30 +223,25 @@ class BatchedSimulator:
         CL = CONTEXT_LENGTH
 
         # Per-episode RNGs seeded identically to TinyPhysicsModel.__init__
-        # which does: np.random.seed(int(md5(data_path.encode()).hexdigest(), 16) % 10**10)
         self.rngs = []
         for f in self.csv_files:
             seed = int(md5(('data/' + Path(f).name).encode()).hexdigest(), 16) % 10**4
             self.rngs.append(np.random.RandomState(seed))
 
-        # action_history — float64 (matches original's Python-float list)
-        # tinyphysics: self.action_history = self.data['steer_command'][:step_idx]
-        self.action_history = self.data['steer_command'][:, :CL].copy()  # (N, CL)
+        # Pre-allocate full-size arrays; write by index instead of concat
+        self.action_history = np.zeros((N, T), np.float64)
+        self.action_history[:, :CL] = self.data['steer_command'][:, :CL]
 
-        # state_history — (N, CL, 3) [roll_lataccel, v_ego, a_ego]
-        # tinyphysics: self.state_history = [State(...) for i in range(step_idx)]
-        self.state_history = np.stack([
-            self.data['roll_lataccel'][:, :CL],
-            self.data['v_ego'][:, :CL],
-            self.data['a_ego'][:, :CL],
-        ], axis=-1)  # (N, CL, 3)
+        self.state_history = np.zeros((N, T, 3), np.float64)
+        self.state_history[:, :CL, 0] = self.data['roll_lataccel'][:, :CL]
+        self.state_history[:, :CL, 1] = self.data['v_ego'][:, :CL]
+        self.state_history[:, :CL, 2] = self.data['a_ego'][:, :CL]
 
-        # current_lataccel_history — float64
-        # tinyphysics: self.current_lataccel_history = [target_la for ...]
-        self.current_lataccel_history = self.data['target_lataccel'][:, :CL].copy()
+        self.current_lataccel_history = np.zeros((N, T), np.float64)
+        self.current_lataccel_history[:, :CL] = self.data['target_lataccel'][:, :CL]
 
-        # tinyphysics: self.current_lataccel = self.current_lataccel_history[-1]
-        self.current_lataccel = self.current_lataccel_history[:, -1].copy()  # (N,)
+        self.current_lataccel = self.current_lataccel_history[:, CL - 1].copy()
+        self._hist_len = CL  # tracks how many columns are filled
 
     # ── get_state_target_futureplan  (mirrors lines 154-165) ─
 
@@ -284,10 +279,11 @@ class BatchedSimulator:
         lataccel from the probability distribution in self.expected_lataccel.
         """
         CL = CONTEXT_LENGTH
+        h = self._hist_len
         result = self.sim_model.get_current_lataccel(
-            sim_states=self.state_history[:, -CL:, :],
-            actions=self.action_history[:, -CL:],
-            past_preds=self.current_lataccel_history[:, -CL:],
+            sim_states=self.state_history[:, h-CL:h, :],
+            actions=self.action_history[:, h-CL:h],
+            past_preds=self.current_lataccel_history[:, h-CL:h],
             rngs=self.rngs,
             return_expected=self.compute_expected,
         )
@@ -305,9 +301,8 @@ class BatchedSimulator:
         else:
             self.current_lataccel = self.data['target_lataccel'][:, step_idx].copy()
 
-        self.current_lataccel_history = np.concatenate(
-            [self.current_lataccel_history, self.current_lataccel[:, None]],
-            axis=1)
+        self.current_lataccel_history[:, self._hist_len] = self.current_lataccel
+        self._hist_len += 1
 
     # ── control_step  (mirrors lines 147-152) ────────────────
 
@@ -322,8 +317,7 @@ class BatchedSimulator:
         if step_idx < CONTROL_START_IDX:
             actions = self.data['steer_command'][:, step_idx].copy()
         actions = np.clip(actions, STEER_RANGE[0], STEER_RANGE[1])
-        self.action_history = np.concatenate(
-            [self.action_history, actions[:, None]], axis=1)
+        self.action_history[:, self._hist_len] = actions
 
     # ── step  (mirrors lines 167-174) ────────────────────────
 
@@ -340,10 +334,10 @@ class BatchedSimulator:
         roll_la, v_ego, a_ego, target, future_plan = \
             self.get_state_target_futureplan(step_idx)
 
-        # Append state to history (mirrors self.state_history.append(state))
-        new_state = np.stack([roll_la, v_ego, a_ego], axis=-1)[:, None, :]
-        self.state_history = np.concatenate(
-            [self.state_history, new_state], axis=1)
+        # Write state at current position (pre-allocated)
+        self.state_history[:, self._hist_len, 0] = roll_la
+        self.state_history[:, self._hist_len, 1] = v_ego
+        self.state_history[:, self._hist_len, 2] = a_ego
 
         self.control_step(step_idx, actions)
         self.sim_step(step_idx)
