@@ -445,13 +445,14 @@ def batched_eval(files, model_path, checkpoint_path, device):
     cost_dict = sim.rollout(controller_fn)
     elapsed = time.time() - t0
     print(f"Batched rollout: {elapsed:.1f}s ({elapsed/N*1000:.1f}ms per episode)")
-    return cost_dict
+    return cost_dict, ort_session
 
 
-def batched_pid(files, model_path, device):
+def batched_pid(files, model_path, device, ort_session=None):
     """Run PID baseline through BatchedSimulator. Returns cost dict with (N,) arrays."""
     csv_list = [str(f) for f in files]
-    ort_session = make_ort_session(str(model_path))
+    if ort_session is None:
+        ort_session = make_ort_session(str(model_path))
     sim = BatchedSimulator(str(model_path), csv_list, ort_session=ort_session)
     N = sim.N
 
@@ -537,10 +538,10 @@ def main():
     device = torch.device('cuda' if use_cuda and torch.cuda.is_available() else 'cpu')
 
     # Test controller: batched GPU
-    test_costs = batched_eval(files, args.model_path, args.checkpoint, device)
+    test_costs, ort_sess = batched_eval(files, args.model_path, args.checkpoint, device)
 
-    # Baseline PID: batched on same device
-    baseline_costs = batched_pid(files, args.model_path, device)
+    # Baseline PID: batched on same device, reuse ORT session
+    baseline_costs = batched_pid(files, args.model_path, device, ort_session=ort_sess)
 
     # Sample rollouts for report plots (sequential, only n_sample files)
     sample_rollouts = []
@@ -623,7 +624,7 @@ def _verify(files, args):
     # Batched costs
     use_cuda = os.getenv('CUDA', '0') == '1'
     device = torch.device('cuda' if use_cuda and torch.cuda.is_available() else 'cpu')
-    batch_cost_dict = batched_eval(files, args.model_path, args.checkpoint, device)
+    batch_cost_dict, _ = batched_eval(files, args.model_path, args.checkpoint, device)
     batch_costs = batch_cost_dict['total_cost']
 
     max_diff = 0.0
