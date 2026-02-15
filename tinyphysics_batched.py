@@ -157,21 +157,31 @@ class BatchedPhysicsModel:
             torch = self._torch
             self._out_gpu = torch.empty((N, CL, VOCAB_SIZE),
                                         dtype=torch.float32, device='cuda')
+            self._states_gpu = torch.empty((N, CL, 4),
+                                           dtype=torch.float32, device='cuda')
+            self._tokens_gpu = torch.empty((N, CL),
+                                           dtype=torch.int64, device='cuda')
             self._cached_N = N
 
     def _predict_gpu(self, input_data, temperature, rng_u):
-        """IOBinding with reused buffers.  Inputs copy to GPU once,
-        output stays in pre-allocated GPU tensor.  Softmax + sampling on GPU.
-        Only N ints come back to CPU."""
+        """All-GPU IOBinding: inputs copied into pre-allocated GPU tensors,
+        output stays in pre-allocated GPU tensor.  Zero CPU→GPU per-step
+        overhead beyond the numpy→torch copy."""
         torch = self._torch
         N, CL = input_data['states'].shape[:2]
         self._ensure_gpu_bufs(N, CL)
 
+        # Copy numpy → pre-allocated GPU tensors (async, pinned would be faster)
+        self._states_gpu.copy_(torch.from_numpy(input_data['states']))
+        self._tokens_gpu.copy_(torch.from_numpy(input_data['tokens']))
+
         io = self._io
         io.clear_binding_inputs()
         io.clear_binding_outputs()
-        io.bind_cpu_input('states', input_data['states'])  # already contiguous
-        io.bind_cpu_input('tokens', input_data['tokens'])
+        io.bind_input('states', 'cuda', 0, np.float32,
+                      list(self._states_gpu.shape), self._states_gpu.data_ptr())
+        io.bind_input('tokens', 'cuda', 0, np.int64,
+                      list(self._tokens_gpu.shape), self._tokens_gpu.data_ptr())
         io.bind_output(self._out_name, 'cuda', 0, np.float32,
                        list(self._out_gpu.shape), self._out_gpu.data_ptr())
 
