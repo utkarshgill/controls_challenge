@@ -1,5 +1,5 @@
 """exp050: Physics-Aligned PPO controller (256-dim, Beta, ReLU, 4+4 layers, deterministic)
-With optional Newton 1-step predict-and-correct via ONNX physics model.
+With optional N-step MPC correction via ONNX physics model + future_plan lookahead.
 """
 
 import os
@@ -11,7 +11,8 @@ from pathlib import Path
 from . import BaseController
 from tinyphysics import (CONTROL_START_IDX, CONTEXT_LENGTH, STEER_RANGE, DEL_T,
                           MAX_ACC_DELTA, LATACCEL_RANGE, VOCAB_SIZE,
-                          LAT_ACCEL_COST_MULTIPLIER, LataccelTokenizer, State)
+                          LAT_ACCEL_COST_MULTIPLIER, LataccelTokenizer,
+                          State, FuturePlan)
 
 torch.set_num_threads(1)
 
@@ -32,13 +33,17 @@ S_AEGO  = 4.0
 S_ROLL  = 2.0
 S_CURV  = 0.02
 
-MODEL      = os.getenv('MODEL', '')                 # path to controller weights (fallback: best_model.pt)
-LPF_ALPHA  = float(os.getenv('LPF_ALPHA', '0'))  # low-pass: 0=off, 0.15=subtle
-NEWTON     = int(os.getenv('NEWTON', '0'))          # 1-step predict-and-correct via ONNX
-NEWTON_K   = float(os.getenv('NEWTON_K', '0.1'))   # correction gain
-NEWTON_MAX = float(os.getenv('NEWTON_MAX', '0.1'))  # max correction magnitude
-RATE_LIMIT = float(os.getenv('RATE_LIMIT', '0'))    # max |Δsteer|/step after all corrections (0=off)
-VNORM      = int(os.getenv('VNORM', '0'))           # speed-normalize steer: steer *= v/v_ref
+MODEL      = os.getenv('MODEL', '')                   # path to controller weights (fallback: best_model.pt)
+LPF_ALPHA  = float(os.getenv('LPF_ALPHA', '0'))      # low-pass: 0=off, 0.15=subtle
+MPC        = int(os.getenv('MPC', '0'))               # predict-and-correct via ONNX
+MPC_K      = float(os.getenv('MPC_K', '0.2'))         # correction gain
+MPC_MAX    = float(os.getenv('MPC_MAX', '0.1'))       # max correction magnitude
+MPC_H      = int(os.getenv('MPC_H', '1'))             # lookahead horizon (1=single, 2-5=multi-step)
+MPC_ROLL   = int(os.getenv('MPC_ROLL', '0'))          # 1=policy-rolled unrolls, 0=zero-order hold
+MPC_N      = int(os.getenv('MPC_N', '0'))             # shooting candidates (0=off, 16=recommended)
+RATE_LIMIT = float(os.getenv('RATE_LIMIT', '0'))      # max |Δsteer|/step after all corrections (0=off)
+VNORM      = int(os.getenv('VNORM', '0'))             # speed-normalize steer: steer *= v/v_ref
+
 
 
 def _future_raw(fplan, attr, fallback, k=FUTURE_K):
@@ -149,49 +154,262 @@ class Controller(BaseController):
         ])
         return np.clip(obs, -5.0, 5.0)
 
-    def _sample_action(self, obs):
-        """Sample a stochastic delta from the Beta policy."""
+    def _build_obs_batch(self, target, cur_la, state, future_plan, ei, h_act, h_lat):
+        """Vectorised obs for N candidates. cur_la/ei: (N,), h_act/h_lat: (N,20). Returns (N,256)."""
+        N = len(cur_la)
+        k_tgt = _curv(target, state.roll_lataccel, state.v_ego)
+        _flat = getattr(future_plan, 'lataccel', None)
+        fplan_lat0 = _flat[0] if (_flat and len(_flat) > 0) else target
+        v2 = max(state.v_ego ** 2, 1.0)
+        error = target - cur_la
+        k_cur = (cur_la - state.roll_lataccel) / v2
+        fric = np.sqrt(cur_la ** 2 + state.a_ego ** 2) / 7.0
+
+        core = np.column_stack([
+            np.full(N, target / S_LAT, np.float32),
+            cur_la / S_LAT,
+            error / S_LAT,
+            np.full(N, k_tgt / S_CURV, np.float32),
+            k_cur / S_CURV,
+            (k_tgt - k_cur) / S_CURV,
+            np.full(N, state.v_ego / S_VEGO, np.float32),
+            np.full(N, state.a_ego / S_AEGO, np.float32),
+            np.full(N, state.roll_lataccel / S_ROLL, np.float32),
+            h_act[:, -1] / S_STEER,
+            ei / S_LAT,
+            np.full(N, (fplan_lat0 - target) / DEL_T / S_LAT, np.float32),
+            (cur_la - h_lat[:, -1]) / DEL_T / S_LAT,
+            (h_act[:, -1] - h_act[:, -2]) / DEL_T / S_STEER,
+            fric,
+            np.maximum(0.0, 1.0 - fric),
+        ]).astype(np.float32)
+
+        fp = np.concatenate([
+            _future_raw(future_plan, 'lataccel', target) / S_LAT,
+            _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel) / S_ROLL,
+            _future_raw(future_plan, 'v_ego', state.v_ego) / S_VEGO,
+            _future_raw(future_plan, 'a_ego', state.a_ego) / S_AEGO,
+        ])  # (200,) — shared, tile once
+        return np.clip(np.concatenate([
+            core,
+            h_act.astype(np.float32) / S_STEER,
+            h_lat.astype(np.float32) / S_LAT,
+            np.tile(fp, (N, 1)),
+        ], axis=1), -5.0, 5.0)
+
+    def _beta_params(self, obs):
+        """Get Beta distribution parameters from the actor."""
         with torch.no_grad():
             out = self.ac.actor(torch.from_numpy(obs).unsqueeze(0))
-            a_p = F.softplus(out[..., 0]) + 1.0
-            b_p = F.softplus(out[..., 1]) + 1.0
-            x = torch.distributions.Beta(a_p, b_p).sample()
-            raw = (2.0 * x - 1.0).item()
-        return raw
+            a_p = F.softplus(out[..., 0]).item() + 1.0
+            b_p = F.softplus(out[..., 1]).item() + 1.0
+        return a_p, b_p
 
     def _mean_action(self, obs):
         """Deterministic (mean) delta from the Beta policy."""
-        with torch.no_grad():
-            out = self.ac.actor(torch.from_numpy(obs).unsqueeze(0))
-            a_p = F.softplus(out[..., 0]) + 1.0
-            b_p = F.softplus(out[..., 1]) + 1.0
-            raw = (2.0 * a_p / (a_p + b_p) - 1.0).item()
-        return raw
+        a_p, b_p = self._beta_params(obs)
+        return 2.0 * a_p / (a_p + b_p) - 1.0
 
-    # ── Newton: 1-step predict-and-correct via ONNX ──
-    def _newton_correct(self, action, target_next, current_lataccel, state):
-        """Predict what `action` will produce, nudge to reduce overshoot."""
+    # ── MPC: predict-and-correct via ONNX with multi-step lookahead ──
+    def _mpc_correct(self, action, current_lataccel, state, future_plan):
+        """Newton correction validated by N-step ONNX lookahead using future_plan."""
         CL = CONTEXT_LENGTH
-        K = NEWTON_K
+        H = MPC_H
 
-        # Build ONNX input matching sim's exact context (include current step)
+        # Shared ONNX context
         h_preds = np.array(self._h_lat + [current_lataccel], np.float64)[-CL:]
         h_states = np.array(
             list(zip(self._h_roll, self._h_v, self._h_a))
             + [(state.roll_lataccel, state.v_ego, state.a_ego)],
-            np.float64)[-CL:]                                       # (CL, 3)
+            np.float64)[-CL:]
         h_actions = np.array(self._h_act, np.float64)[-CL:]
-        a = np.concatenate([h_actions[1:], [action]])
 
-        # One ONNX call — predict next lataccel with this action
-        pred = self._onnx_expected(
-            a[None], h_states[None], h_preds[None])[0]              # scalar
+        # Future targets + states from future_plan
+        fp_lat = getattr(future_plan, 'lataccel', []) or []
+        fp_roll = getattr(future_plan, 'roll_lataccel', []) or []
+        fp_v = getattr(future_plan, 'v_ego', []) or []
+        fp_a = getattr(future_plan, 'a_ego', []) or []
 
-        # Cost-optimal 1-step target: y* = (target + 2*current) / 3
-        optimal_next = (target_next + 2.0 * current_lataccel) / 3.0
-        overshoot = pred - optimal_next
-        correction = np.clip(K * overshoot, -NEWTON_MAX, NEWTON_MAX)
-        return float(np.clip(action - correction, *STEER_RANGE))
+        # 1-step Newton correction
+        a_seq = np.concatenate([h_actions[1:], [action]])
+        pred_1 = self._onnx_expected(a_seq[None], h_states[None], h_preds[None])[0]
+        target_0 = fp_lat[0] if len(fp_lat) > 0 else current_lataccel
+        x_star = (target_0 + 2.0 * current_lataccel) / 3.0
+        da = np.clip(MPC_K * (pred_1 - x_star), -MPC_MAX, MPC_MAX)
+        corrected = float(np.clip(action - da, STEER_RANGE[0], STEER_RANGE[1]))
+
+        if H <= 1:
+            return corrected
+
+        # Multi-step validation: unroll H steps, compare original vs corrected
+        cost_orig = self._unroll_cost(action, h_preds, h_states, h_actions,
+                                      current_lataccel, fp_lat, fp_roll, fp_v, fp_a, H)
+        cost_corr = self._unroll_cost(corrected, h_preds, h_states, h_actions,
+                                      current_lataccel, fp_lat, fp_roll, fp_v, fp_a, H)
+        return corrected if cost_corr < cost_orig else float(action)
+
+    def _unroll_cost(self, a_start, h_preds, h_states, h_actions,
+                     current_la, fp_lat, fp_roll, fp_v, fp_a, horizon):
+        """Unroll ONNX model for `horizon` steps, return total cost.
+        MPC_ROLL=1: run policy at steps 1+ for realistic future actions.
+        MPC_ROLL=0: hold a_start constant (zero-order hold).
+        """
+        preds = h_preds.copy()
+        sts = h_states.copy()
+        acts = h_actions.copy()
+        prev_la = current_la
+        cost = 0.0
+        action = a_start
+
+        # Rolling histories for policy rollout
+        if MPC_ROLL:
+            r_act = list(self._h_act)
+            r_lat = list(self._h_lat)
+            r_err = list(self._h_error)
+
+        for step in range(horizon):
+            a_seq = np.concatenate([acts[1:], [action]])
+            pred_la = self._onnx_expected(a_seq[None], sts[None], preds[None])[0]
+
+            tgt = fp_lat[step] if step < len(fp_lat) else prev_la
+            cost += (tgt - pred_la)**2 * 100 * LAT_ACCEL_COST_MULTIPLIER
+            cost += ((pred_la - prev_la) / DEL_T)**2 * 100
+
+            # Shift ONNX context
+            preds = np.concatenate([preds[1:], [pred_la]])
+            acts = np.concatenate([acts[1:], [action]])
+            if step < horizon - 1:
+                ns = np.array([
+                    fp_roll[step] if step < len(fp_roll) else sts[-1, 0],
+                    fp_v[step] if step < len(fp_v) else sts[-1, 1],
+                    fp_a[step] if step < len(fp_a) else sts[-1, 2],
+                ], np.float64)
+                sts = np.concatenate([sts[1:], ns[None]], axis=0)
+
+            # Update rolling histories & compute next action via policy
+            if MPC_ROLL:
+                r_act = r_act[1:] + [action]
+                r_lat = r_lat[1:] + [float(pred_la)]
+                r_err = r_err[1:] + [float(tgt - pred_la)]
+
+            prev_la = pred_la
+
+            if MPC_ROLL and step < horizon - 1:
+                off = step + 1
+                p_tgt = fp_lat[off - 1] if off - 1 < len(fp_lat) else tgt
+                p_state = State(
+                    roll_lataccel=fp_roll[step] if step < len(fp_roll) else float(sts[-1, 0]),
+                    v_ego=fp_v[step] if step < len(fp_v) else float(sts[-1, 1]),
+                    a_ego=fp_a[step] if step < len(fp_a) else float(sts[-1, 2]),
+                )
+                shifted_fp = FuturePlan(
+                    lataccel=list(fp_lat[off:]) if off < len(fp_lat) else [],
+                    roll_lataccel=list(fp_roll[off:]) if off < len(fp_roll) else [],
+                    v_ego=list(fp_v[off:]) if off < len(fp_v) else [],
+                    a_ego=list(fp_a[off:]) if off < len(fp_a) else [],
+                )
+                ei = float(np.mean(r_err)) * DEL_T
+                obs = self._build_obs(p_tgt, float(pred_la), p_state,
+                                      shifted_fp, ei, r_act, r_lat)
+                raw = self._mean_action(obs)
+                delta = float(np.clip(raw * DELTA_SCALE, -MAX_DELTA, MAX_DELTA))
+                action = float(np.clip(r_act[-1] + delta, *STEER_RANGE))
+
+        return cost
+
+    # ── Shooting MPC: sample N trajectories from policy, score via ONNX ──
+    def _mpc_shoot(self, obs, current_lataccel, state, future_plan):
+        """Sample N action sequences from policy, unroll H steps via ONNX, pick best."""
+        N, H, CL = MPC_N, MPC_H, CONTEXT_LENGTH
+
+        # Step-0 candidates: sample N deltas from policy Beta
+        a_p, b_p = self._beta_params(obs)
+        samp = np.random.beta(a_p, b_p, size=N)
+        samp[0] = a_p / (a_p + b_p)                              # slot 0 = mean (no-regression)
+        deltas = np.clip((2.0 * samp - 1.0) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
+        prev_steer = self._h_act[-1]
+        actions_0 = np.clip(prev_steer + deltas, STEER_RANGE[0], STEER_RANGE[1])
+
+        # ONNX context tiled for N candidates
+        h_pr = np.array(self._h_lat + [current_lataccel], np.float64)[-CL:]
+        h_st = np.array(
+            list(zip(self._h_roll, self._h_v, self._h_a))
+            + [(state.roll_lataccel, state.v_ego, state.a_ego)], np.float64)[-CL:]
+        h_ac = np.array(self._h_act, np.float64)[-CL:]
+        all_pr = np.tile(h_pr, (N, 1))                           # (N, CL)
+        all_st = np.tile(h_st, (N, 1, 1))                        # (N, CL, 3)
+        all_ac = np.tile(h_ac, (N, 1))                            # (N, CL)
+
+        # Future-plan arrays
+        fp_lat = np.array(getattr(future_plan, 'lataccel', []) or [], np.float64)
+        fp_roll = np.array(getattr(future_plan, 'roll_lataccel', []) or [], np.float64)
+        fp_v = np.array(getattr(future_plan, 'v_ego', []) or [], np.float64)
+        fp_a = np.array(getattr(future_plan, 'a_ego', []) or [], np.float64)
+
+        # Per-candidate rolling histories as (N, 20) arrays
+        r_act = np.tile(self._h_act, (N, 1))        # (N, 20)
+        r_lat = np.tile(self._h_lat, (N, 1))        # (N, 20)
+        r_err = np.tile(self._h_error, (N, 1))      # (N, 20)
+
+        costs = np.zeros(N, np.float64)
+        prev_la = np.full(N, current_lataccel, np.float64)
+        cur = actions_0.copy()
+
+        for step in range(H):
+            # Batched ONNX call (batch=N)
+            a_seqs = np.concatenate([all_ac[:, 1:], cur[:, None]], axis=1)
+            pred_la = self._onnx_expected(a_seqs, all_st, all_pr)  # (N,)
+
+            # Real cost function
+            tgt = fp_lat[step] if step < len(fp_lat) else (
+                fp_lat[-1] if len(fp_lat) > 0 else current_lataccel)
+            costs += (tgt - pred_la)**2 * 100 * LAT_ACCEL_COST_MULTIPLIER
+            costs += ((pred_la - prev_la) / DEL_T)**2 * 100
+
+            # Shift ONNX context
+            all_pr = np.concatenate([all_pr[:, 1:], pred_la[:, None]], axis=1)
+            all_ac = np.concatenate([all_ac[:, 1:], cur[:, None]], axis=1)
+            if step < H - 1:
+                r = fp_roll[step] if step < len(fp_roll) else float(all_st[0, -1, 0])
+                v = fp_v[step] if step < len(fp_v) else float(all_st[0, -1, 1])
+                a = fp_a[step] if step < len(fp_a) else float(all_st[0, -1, 2])
+                ns = np.full((N, 1, 3), [r, v, a], np.float64)
+                all_st = np.concatenate([all_st[:, 1:, :], ns], axis=1)
+
+            # Vectorised history shift
+            r_act = np.concatenate([r_act[:, 1:], cur[:, None]], axis=1)
+            r_lat = np.concatenate([r_lat[:, 1:], pred_la[:, None]], axis=1)
+            r_err = np.concatenate([r_err[:, 1:], (tgt - pred_la)[:, None]], axis=1)
+            prev_la = pred_la.copy()
+
+            # Policy-rolled next actions for steps 1+
+            if step < H - 1:
+                off = step + 1
+                p_tgt = float(fp_lat[step]) if step < len(fp_lat) else float(tgt)
+                p_st = State(
+                    roll_lataccel=float(fp_roll[step]) if step < len(fp_roll) else float(all_st[0, -1, 0]),
+                    v_ego=float(fp_v[step]) if step < len(fp_v) else float(all_st[0, -1, 1]),
+                    a_ego=float(fp_a[step]) if step < len(fp_a) else float(all_st[0, -1, 2]))
+                sfp = FuturePlan(
+                    lataccel=list(fp_lat[off:]),
+                    roll_lataccel=list(fp_roll[off:]),
+                    v_ego=list(fp_v[off:]),
+                    a_ego=list(fp_a[off:]))
+
+                # Batched obs + batched actor forward pass
+                ei_batch = np.mean(r_err, axis=1).astype(np.float32) * DEL_T
+                obs_batch = self._build_obs_batch(
+                    p_tgt, pred_la.astype(np.float32), p_st, sfp,
+                    ei_batch, r_act.astype(np.float32), r_lat.astype(np.float32))
+                with torch.no_grad():
+                    out = self.ac.actor(torch.from_numpy(obs_batch))
+                    a_ps = (F.softplus(out[..., 0]) + 1.0).numpy()
+                    b_ps = (F.softplus(out[..., 1]) + 1.0).numpy()
+                s = np.random.beta(a_ps, b_ps)
+                d = np.clip((2.0 * s - 1.0) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
+                cur = np.clip(r_act[:, -1] + d, STEER_RANGE[0], STEER_RANGE[1])
+
+        return float(actions_0[np.argmin(costs)])
 
     def _onnx_expected(self, p_actions, p_states, p_preds):
         """Single batched ONNX call → E[next_lataccel] for each of P proposals."""
@@ -221,15 +439,15 @@ class Controller(BaseController):
 
         obs = self._build_obs(target_lataccel, current_lataccel, state, future_plan,
                               error_integral, list(self._h_act), list(self._h_lat))
-        raw = self._mean_action(obs)
-        delta  = float(np.clip(raw * DELTA_SCALE, -MAX_DELTA, MAX_DELTA))
-        action = float(np.clip(self._h_act[-1] + delta, *STEER_RANGE))
 
-        # ── Newton: 1-step predict-and-correct ──
-        if NEWTON and self._sim_model is not None:
-            _flat = getattr(future_plan, 'lataccel', None)
-            target_next = _flat[0] if (_flat and len(_flat) > 0) else target_lataccel
-            action = self._newton_correct(action, target_next, current_lataccel, state)
+        if MPC_N > 0 and self._sim_model is not None:
+            action = self._mpc_shoot(obs, current_lataccel, state, future_plan)
+        else:
+            raw = self._mean_action(obs)
+            delta = float(np.clip(raw * DELTA_SCALE, -MAX_DELTA, MAX_DELTA))
+            action = float(np.clip(self._h_act[-1] + delta, *STEER_RANGE))
+            if MPC and self._sim_model is not None:
+                action = self._mpc_correct(action, current_lataccel, state, future_plan)
 
         # ── Subtle low-pass: blend towards previous action ──
         if LPF_ALPHA > 0:
