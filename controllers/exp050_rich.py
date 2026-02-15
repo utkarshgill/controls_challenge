@@ -1,9 +1,11 @@
 """exp050: Physics-Aligned PPO controller (256-dim, Beta, ReLU, 4+4 layers, deterministic)
 With optional N-step MPC correction via ONNX physics model + future_plan lookahead.
+CUDA=1 enables GPU-accelerated MPC (actor + ONNX on GPU, all tensors GPU-resident).
 """
 
 import os
 import numpy as np
+import onnxruntime as ort
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,7 +16,10 @@ from tinyphysics import (CONTROL_START_IDX, CONTEXT_LENGTH, STEER_RANGE, DEL_T,
                           LAT_ACCEL_COST_MULTIPLIER, LataccelTokenizer,
                           State, FuturePlan)
 
-torch.set_num_threads(1)
+USE_CUDA = os.getenv('CUDA', '0') == '1'
+DEV = torch.device('cuda' if USE_CUDA and torch.cuda.is_available() else 'cpu')
+if not USE_CUDA:
+    torch.set_num_threads(1)
 
 HIST_LEN    = 20
 STATE_DIM   = 256
@@ -91,9 +96,9 @@ class Controller(BaseController):
                 raise FileNotFoundError(f"No checkpoint in {exp}")
 
         self.ac = ActorCritic()
-        data = torch.load(checkpoint_path, weights_only=False, map_location='cpu')
+        data = torch.load(checkpoint_path, weights_only=False, map_location=DEV)
         self.ac.load_state_dict(data['ac'])
-        self.ac.eval()
+        self.ac.to(DEV).eval()
         self.n = 0
         self._h_act   = [0.0] * HIST_LEN
         self._h_lat   = [0.0] * HIST_LEN
@@ -103,10 +108,36 @@ class Controller(BaseController):
         self._h_error = [0.0] * HIST_LEN
         self._sim_model = None    # set via set_model() hook
         self._tokenizer = LataccelTokenizer()
+        self._gpu = USE_CUDA and DEV.type == 'cuda'
+        self._gpu_ort = None      # GPU ONNX session for MPC (created in set_model)
+        self._gpu_bins = None     # tokenizer bins as GPU tensor
+        self._gpu_io_cache = {}   # pre-allocated IOBinding buffers
 
     # ── hook called by TinyPhysicsSimulator.__init__ ──
     def set_model(self, model):
         self._sim_model = model
+        if self._gpu and model is not None:
+            self._init_gpu_ort(model)
+
+    def _init_gpu_ort(self, model):
+        """Create a dedicated GPU ONNX session for MPC and pre-allocate buffers."""
+        model_path = os.getenv('ONNX_MODEL', './models/tinyphysics.onnx')
+        if not os.path.exists(model_path):
+            print(f"[GPU-MPC] ONNX model not found at {model_path}, falling back to CPU")
+            self._gpu = False
+            return
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.log_severity_level = 3
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        with open(str(model_path), 'rb') as f:
+            self._gpu_ort = ort.InferenceSession(f.read(), opts, providers)
+        actual = self._gpu_ort.get_providers()
+        print(f"[GPU-MPC] providers={actual}")
+        self._gpu_out_name = self._gpu_ort.get_outputs()[0].name
+        self._gpu_bins = torch.from_numpy(self._tokenizer.bins).to(DEV)  # float64
+        self._gpu_bins_f32 = self._gpu_bins.float()
 
     def _push(self, action, current, state):
         self._h_act = self._h_act[1:] + [action]
@@ -200,7 +231,8 @@ class Controller(BaseController):
     def _beta_params(self, obs):
         """Get Beta distribution parameters from the actor."""
         with torch.no_grad():
-            out = self.ac.actor(torch.from_numpy(obs).unsqueeze(0))
+            t = torch.from_numpy(obs).unsqueeze(0).to(DEV)
+            out = self.ac.actor(t)
             a_p = F.softplus(out[..., 0]).item() + 1.0
             b_p = F.softplus(out[..., 1]).item() + 1.0
         return a_p, b_p
@@ -319,7 +351,151 @@ class Controller(BaseController):
 
     # ── Shooting MPC: sample N trajectories from policy, score via ONNX ──
     def _mpc_shoot(self, obs, current_lataccel, state, future_plan):
-        """Sample N action sequences from policy, unroll H steps via ONNX, pick best."""
+        if self._gpu and self._gpu_ort is not None:
+            return self._mpc_shoot_gpu(obs, current_lataccel, state, future_plan)
+        return self._mpc_shoot_cpu(obs, current_lataccel, state, future_plan)
+
+    def _mpc_shoot_gpu(self, obs, current_lataccel, state, future_plan):
+        """GPU-accelerated shooting MPC. All arrays as CUDA tensors."""
+        N, H, CL = MPC_N, MPC_H, CONTEXT_LENGTH
+
+        # Step-0 candidates: sample N deltas from policy Beta (CPU — tiny N)
+        a_p, b_p = self._beta_params(obs)
+        samp = np.random.beta(a_p, b_p, size=N)
+        samp[0] = a_p / (a_p + b_p)
+        deltas = np.clip((2.0 * samp - 1.0) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
+        prev_steer = self._h_act[-1]
+        actions_0 = torch.from_numpy(
+            np.clip(prev_steer + deltas, STEER_RANGE[0], STEER_RANGE[1])
+        ).to(DEV, dtype=torch.float64)
+
+        # ONNX context → GPU tensors
+        h_pr = torch.tensor(self._h_lat + [current_lataccel], dtype=torch.float64, device=DEV)[-CL:]
+        h_st = torch.tensor(
+            list(zip(self._h_roll, self._h_v, self._h_a))
+            + [(state.roll_lataccel, state.v_ego, state.a_ego)],
+            dtype=torch.float64, device=DEV)[-CL:]
+        h_ac = torch.tensor(self._h_act, dtype=torch.float64, device=DEV)[-CL:]
+        all_pr = h_pr.unsqueeze(0).expand(N, -1).contiguous()       # (N, CL)
+        all_st = h_st.unsqueeze(0).expand(N, -1, -1).contiguous()   # (N, CL, 3)
+        all_ac = h_ac.unsqueeze(0).expand(N, -1).contiguous()       # (N, CL)
+
+        # Future-plan arrays → GPU
+        fp_lat = torch.tensor(getattr(future_plan, 'lataccel', []) or [], dtype=torch.float64, device=DEV)
+        fp_roll = torch.tensor(getattr(future_plan, 'roll_lataccel', []) or [], dtype=torch.float64, device=DEV)
+        fp_v = torch.tensor(getattr(future_plan, 'v_ego', []) or [], dtype=torch.float64, device=DEV)
+        fp_a = torch.tensor(getattr(future_plan, 'a_ego', []) or [], dtype=torch.float64, device=DEV)
+
+        # Rolling histories → GPU (N, 20)
+        r_act = torch.tensor(self._h_act, dtype=torch.float64, device=DEV).unsqueeze(0).expand(N, -1).contiguous()
+        r_lat = torch.tensor(self._h_lat, dtype=torch.float64, device=DEV).unsqueeze(0).expand(N, -1).contiguous()
+        r_err = torch.tensor(self._h_error, dtype=torch.float64, device=DEV).unsqueeze(0).expand(N, -1).contiguous()
+
+        costs = torch.zeros(N, dtype=torch.float64, device=DEV)
+        prev_la = torch.full((N,), current_lataccel, dtype=torch.float64, device=DEV)
+        cur = actions_0.clone()
+
+        for step in range(H):
+            a_seqs = torch.cat([all_ac[:, 1:], cur.unsqueeze(1)], dim=1)
+            pred_la = self._onnx_expected_gpu(a_seqs, all_st, all_pr)  # (N,) float32
+
+            # Cost
+            tgt_val = fp_lat[step].item() if step < len(fp_lat) else (
+                fp_lat[-1].item() if len(fp_lat) > 0 else current_lataccel)
+            costs += (tgt_val - pred_la.double()) ** 2 * 100 * LAT_ACCEL_COST_MULTIPLIER
+            costs += ((pred_la.double() - prev_la) / DEL_T) ** 2 * 100
+
+            # Shift ONNX context
+            all_pr = torch.cat([all_pr[:, 1:], pred_la.double().unsqueeze(1)], dim=1)
+            all_ac = torch.cat([all_ac[:, 1:], cur.unsqueeze(1)], dim=1)
+            if step < H - 1:
+                r = fp_roll[step].item() if step < len(fp_roll) else all_st[0, -1, 0].item()
+                v = fp_v[step].item() if step < len(fp_v) else all_st[0, -1, 1].item()
+                a = fp_a[step].item() if step < len(fp_a) else all_st[0, -1, 2].item()
+                ns = torch.tensor([[r, v, a]], dtype=torch.float64, device=DEV).expand(N, 1, 3)
+                all_st = torch.cat([all_st[:, 1:, :], ns], dim=1)
+
+            # History shift
+            r_act = torch.cat([r_act[:, 1:], cur.unsqueeze(1)], dim=1)
+            r_lat = torch.cat([r_lat[:, 1:], pred_la.double().unsqueeze(1)], dim=1)
+            r_err = torch.cat([r_err[:, 1:], (tgt_val - pred_la.double()).unsqueeze(1)], dim=1)
+            prev_la = pred_la.double()
+
+            # Policy-rolled next actions for steps 1+
+            if step < H - 1:
+                off = step + 1
+                p_tgt = fp_lat[step].item() if step < len(fp_lat) else tgt_val
+                p_st = State(
+                    roll_lataccel=fp_roll[step].item() if step < len(fp_roll) else all_st[0, -1, 0].item(),
+                    v_ego=fp_v[step].item() if step < len(fp_v) else all_st[0, -1, 1].item(),
+                    a_ego=fp_a[step].item() if step < len(fp_a) else all_st[0, -1, 2].item())
+                sfp = FuturePlan(
+                    lataccel=fp_lat[off:].tolist(),
+                    roll_lataccel=fp_roll[off:].tolist(),
+                    v_ego=fp_v[off:].tolist(),
+                    a_ego=fp_a[off:].tolist())
+
+                # Batched obs + actor on GPU
+                ei_batch = r_err.mean(dim=1).float() * DEL_T
+                obs_batch = self._build_obs_batch_gpu(
+                    p_tgt, pred_la.float(), p_st, sfp,
+                    ei_batch, r_act.float(), r_lat.float())
+                with torch.no_grad():
+                    out = self.ac.actor(obs_batch)
+                    a_ps = (F.softplus(out[..., 0]) + 1.0)
+                    b_ps = (F.softplus(out[..., 1]) + 1.0)
+                # Sample on CPU (Beta dist, tiny N)
+                s = np.random.beta(a_ps.cpu().numpy(), b_ps.cpu().numpy())
+                d = np.clip((2.0 * s - 1.0) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
+                cur = torch.from_numpy(
+                    np.clip(r_act[:, -1].cpu().numpy() + d, STEER_RANGE[0], STEER_RANGE[1])
+                ).to(DEV, dtype=torch.float64)
+
+        return float(actions_0[costs.argmin()].item())
+
+    def _build_obs_batch_gpu(self, target, cur_la, state, future_plan, ei, h_act, h_lat):
+        """GPU vectorised obs for N candidates. cur_la/ei: (N,) GPU, h_act/h_lat: (N,20) GPU.
+        Returns (N, 256) float32 GPU tensor."""
+        N = cur_la.shape[0]
+        k_tgt = _curv(target, state.roll_lataccel, state.v_ego)
+        _flat = getattr(future_plan, 'lataccel', None)
+        fplan_lat0 = _flat[0] if (_flat and len(_flat) > 0) else target
+        v2 = max(state.v_ego ** 2, 1.0)
+        error = target - cur_la
+        k_cur = (cur_la - state.roll_lataccel) / v2
+        fric = torch.sqrt(cur_la ** 2 + state.a_ego ** 2) / 7.0
+
+        core = torch.stack([
+            torch.full((N,), target / S_LAT, dtype=torch.float32, device=DEV),
+            cur_la / S_LAT,
+            error / S_LAT,
+            torch.full((N,), k_tgt / S_CURV, dtype=torch.float32, device=DEV),
+            k_cur / S_CURV,
+            (k_tgt - k_cur) / S_CURV,
+            torch.full((N,), state.v_ego / S_VEGO, dtype=torch.float32, device=DEV),
+            torch.full((N,), state.a_ego / S_AEGO, dtype=torch.float32, device=DEV),
+            torch.full((N,), state.roll_lataccel / S_ROLL, dtype=torch.float32, device=DEV),
+            h_act[:, -1] / S_STEER,
+            ei / S_LAT,
+            torch.full((N,), (fplan_lat0 - target) / DEL_T / S_LAT, dtype=torch.float32, device=DEV),
+            (cur_la - h_lat[:, -1]) / DEL_T / S_LAT,
+            (h_act[:, -1] - h_act[:, -2]) / DEL_T / S_STEER,
+            fric,
+            torch.clamp(1.0 - fric, min=0.0),
+        ], dim=1)  # (N, 16)
+
+        fp = torch.tensor(np.concatenate([
+            _future_raw(future_plan, 'lataccel', target) / S_LAT,
+            _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel) / S_ROLL,
+            _future_raw(future_plan, 'v_ego', state.v_ego) / S_VEGO,
+            _future_raw(future_plan, 'a_ego', state.a_ego) / S_AEGO,
+        ]), dtype=torch.float32, device=DEV).unsqueeze(0).expand(N, -1)  # (N, 200)
+
+        obs = torch.cat([core, h_act / S_STEER, h_lat / S_LAT, fp], dim=1)
+        return obs.clamp(-5.0, 5.0)
+
+    def _mpc_shoot_cpu(self, obs, current_lataccel, state, future_plan):
+        """Original CPU shooting MPC."""
         N, H, CL = MPC_N, MPC_H, CONTEXT_LENGTH
 
         # Step-0 candidates: sample N deltas from policy Beta
@@ -402,14 +578,44 @@ class Controller(BaseController):
                     p_tgt, pred_la.astype(np.float32), p_st, sfp,
                     ei_batch, r_act.astype(np.float32), r_lat.astype(np.float32))
                 with torch.no_grad():
-                    out = self.ac.actor(torch.from_numpy(obs_batch))
-                    a_ps = (F.softplus(out[..., 0]) + 1.0).numpy()
-                    b_ps = (F.softplus(out[..., 1]) + 1.0).numpy()
+                    out = self.ac.actor(torch.from_numpy(obs_batch).to(DEV))
+                    a_ps = (F.softplus(out[..., 0]) + 1.0).cpu().numpy()
+                    b_ps = (F.softplus(out[..., 1]) + 1.0).cpu().numpy()
                 s = np.random.beta(a_ps, b_ps)
                 d = np.clip((2.0 * s - 1.0) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
                 cur = np.clip(r_act[:, -1] + d, STEER_RANGE[0], STEER_RANGE[1])
 
         return float(actions_0[np.argmin(costs)])
+
+    def _onnx_expected_gpu(self, p_actions, p_states, p_preds):
+        """GPU-accelerated batched ONNX call → E[next_lataccel] as GPU tensor.
+        Inputs are torch GPU tensors: p_actions (P, CL), p_states (P, CL, 3), p_preds (P, CL)."""
+        P, CL = p_actions.shape
+        # Tokenize on GPU: clamp + bucketize
+        clamped = p_preds.float().clamp(LATACCEL_RANGE[0], LATACCEL_RANGE[1])
+        tokens = torch.bucketize(clamped, self._gpu_bins_f32, right=False).long()  # (P, CL)
+
+        # Build states: (P, CL, 4) = [actions, roll, v, a]
+        states_in = torch.cat([p_actions.unsqueeze(-1).float(), p_states.float()], dim=-1)
+
+        # ONNX via IOBinding
+        io = self._gpu_ort.io_binding()
+        io.bind_input('states', 'cuda', 0, np.float32, list(states_in.shape),
+                       states_in.data_ptr())
+        io.bind_input('tokens', 'cuda', 0, np.int64, list(tokens.shape),
+                       tokens.data_ptr())
+        # Allocate output on GPU
+        out_shape = [P, CL, VOCAB_SIZE]
+        if not hasattr(self, '_gpu_out') or self._gpu_out.shape[0] < P:
+            self._gpu_out = torch.empty(out_shape, dtype=torch.float32, device=DEV)
+        out_buf = self._gpu_out[:P]
+        io.bind_output(self._gpu_out_name, 'cuda', 0, np.float32, out_shape, out_buf.data_ptr())
+        self._gpu_ort.run_with_iobinding(io)
+
+        # Softmax + expected value on GPU
+        logits = out_buf[:, -1, :] / 0.8
+        probs = torch.softmax(logits, dim=-1)                   # (P, VOCAB)
+        return (probs * self._gpu_bins_f32.unsqueeze(0)).sum(dim=-1)  # (P,) E[la]
 
     def _onnx_expected(self, p_actions, p_states, p_preds):
         """Single batched ONNX call → E[next_lataccel] for each of P proposals."""

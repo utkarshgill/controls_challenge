@@ -2,11 +2,11 @@
 
 ## Introduction
 
-The comma.ai controls challenge asks you to write a controller that steers a car to follow a target lateral acceleration profile. Your controller is evaluated inside `tinyphysics.py` — a simulator that calls an ONNX transformer model 500 times per episode, autoregressively predicting physics one timestep at a time.
+The comma.ai controls challenge asks you to write a controller that steers a car to follow a target lateral acceleration profile. Your controller is evaluated inside `tinyphysics.py` — a simulator that calls an ONNX transformer model 580 times per episode, autoregressively predicting physics one timestep at a time.
 
-The baseline: one episode takes ~0.5 seconds. Evaluating 5,000 episodes takes ~40 minutes. Training a reinforcement learning policy over thousands of epochs at this speed is not feasible.
+The baseline: one episode takes ~0.6 seconds. Evaluating 5,000 episodes takes ~50 minutes. Training a reinforcement learning policy over thousands of epochs at this speed is not feasible.
 
-This is the story of how we took that 40-minute evaluation down to ~12 seconds — a **200x speedup** — through a sequence of compounding optimizations, each one unlocking the next.
+This is the story of how we took that 50-minute evaluation down to 8 seconds — a **375x speedup** — through a sequence of compounding optimizations, each one unlocking the next.
 
 The path was not linear. There were wrong turns, subtle bugs, precision traps, and moments where "obvious" optimizations did nothing. Every layer taught us something about where the real bottlenecks hide.
 
@@ -19,7 +19,7 @@ The path was not linear. There were wrong turns, subtle bugs, precision traps, a
 The simulator has a simple loop:
 
 ```
-for step in range(CONTEXT_LENGTH, 500):
+for step in range(CONTEXT_LENGTH, len(data)):   # 580 steps (20 to 600)
     state, target = get_state_from_csv(step)
     action = controller.update(target, current_lataccel, state)  # your policy
     pred = onnx_model.predict(last_20_states, last_20_actions, last_20_preds)  # physics
@@ -34,12 +34,17 @@ Each `predict` call:
 
 This is autoregressive — step N's prediction feeds into step N+1's input. You cannot parallelize across timesteps. But you *can* parallelize across episodes.
 
-### The Cost Breakdown
+### The Cost Breakdown (measured on M4 Pro MacBook)
 
-For a single episode (~500 steps):
-- **480 ONNX calls** at ~1ms each = ~0.5s
-- Controller logic, numpy slicing, history management = ~0.1s
-- Total: **~0.6s per episode**
+For a single episode (580 steps):
+- **580 ONNX calls** at ~0.5ms each = ~0.3s (81% of episode time)
+- Tokenize + input building = ~10ms
+- Softmax + sampling = ~36ms
+- State lookups (pandas `.iloc`, slicing) = ~11ms
+- Controller logic (PID baseline) = ~2ms
+- Total with PID: **~0.33s per episode**
+
+But we're not running PID — we're training an RL policy. A neural-network controller adds ~0.3s per episode (forward pass through a 256-dim, 4-layer actor per step). Total with RL controller: **~0.6s per episode**.
 
 For 5,000 episodes sequentially: **~50 minutes.**
 
@@ -55,15 +60,15 @@ We built `tinyphysics_batched.py` — a drop-in replacement that runs N episodes
 
 ```
 for episode in 5000_episodes:
-    for step in 500_steps:
-        predict(1, 20, 4)  →  5000 × 500 = 2,500,000 ONNX calls
+    for step in 580_steps:
+        predict(1, 20, 4)  →  5000 × 580 = 2,900,000 ONNX calls
 ```
 
 We do:
 
 ```
-for step in 500_steps:
-    predict(5000, 20, 4)  →  500 ONNX calls
+for step in 580_steps:
+    predict(5000, 20, 4)  →  580 ONNX calls
 ```
 
 Same total compute, but 5000x fewer kernel launches. The ONNX model's transformer naturally handles the batch dimension — no architecture changes needed.
@@ -88,7 +93,87 @@ Getting exact numerical parity took multiple iterations. A float32 vs float64 mi
 
 ---
 
-## Part 3: Moving to GPU (40s → 20s per epoch)
+## Part 2.5: The MacBook Cluster — Scaling Out Before Scaling Up
+
+### The Desperation
+
+Training a PPO policy requires thousands of epochs. Each epoch rolls out 1000+ episodes through the ONNX simulator, collects trajectories, and runs a gradient update. On a single MacBook Pro (M4 Pro, 12 cores), one epoch with 1000 CSVs took **~90 seconds** — 82s for rollouts, 8s for the PPO update. At that rate, 1000 epochs would take over 24 hours. And we needed more data per epoch, not less.
+
+
+
+Then I looked at the spare MacBook Air sitting on my desk.
+
+### The USB-C Cluster
+
+Two MacBooks connected via a Thunderbolt USB-C cable. No WiFi, no router — a raw 10 Gbps point-to-point link over Thunderbolt Bridge networking. Each Mac auto-assigned a `169.254.x.x` link-local IP on the bridge interface.
+
+The first approach was SSH-based: each epoch, `scp` the checkpoint to the spare Mac, `ssh` to run a `remote_worker.py` script, `scp` the results back. It worked, but the SSH handshake overhead added up — ~2-3 seconds per epoch in connection setup alone.
+
+We replaced it with a **persistent TCP server**. The spare Mac ran `remote_server.py` — a long-lived process listening on port 5555. The training script kept a persistent socket open and, each epoch, sent a pickle blob containing the checkpoint bytes and CSV file list. The server ran rollouts locally and streamed back a compressed NPZ with all trajectory data. Zero handshake overhead after the first connection.
+
+### The Load Balancing Problem
+
+The naive 50/50 split (500 CSVs each) revealed a painful truth: **the M4 Air is slow**. No fan. Passive cooling. And 6 of its 10 cores are efficiency cores — ~40% the speed of the performance cores. The main Mac would finish its 500 CSVs in 40s and then sit idle waiting for the Air to finish in 60s.
+
+```
+[split] local=500csvs 42s | r0=500csvs 58s   ← main Mac waiting 16s
+```
+
+The fix: weighted splitting via a `FRAC` environment variable.
+
+```bash
+REMOTE_HOSTS=169.254.159.243 FRAC=1.4:1 CSVS=1000 WORKERS=10 python train.py
+```
+
+`FRAC=1.4:1` means the local Mac gets 58% of CSVs, the remote gets 42%. Both finish around the same time. No idle waiting.
+
+### The Real Insight: More Data, Not Faster Epochs
+
+The distributed setup didn't make 1000 CSVs twice as fast — the Air was too slow for that. But it unlocked something better: **double the data in the same wall time**. With `CSVS=2000`, the main Mac processes ~1200 CSVs while the Air handles ~800. Total wall time: roughly what the main Mac alone needed for 1000. Twice the training data per PPO update. Better gradient estimates. Faster convergence.
+
+### Three Macs, One Training Loop
+
+Then came the question: *can I daisy-chain three MacBooks?*
+
+The multi-remote code already supported it. Extended `REMOTE_HOSTS` to take comma-separated IPs, each running its own `remote_server.py` TCP server:
+
+```bash
+REMOTE_HOSTS=169.254.159.243,192.168.1.42 FRAC=3.5:3.5:3 CSVS=3000 python train.py
+```
+
+Three MacBooks. One main (M4 Pro), two remotes (M4 Air + a friend's machine). 3000 CSVs split proportionally across all three. The training loop sends checkpoint bytes to both remotes in parallel, kicks off local rollouts simultaneously, and merges all results when the slowest machine finishes.
+
+```
+[split] local=1050csvs 43s | r0=1050csvs 41s | r1=900csvs 44s
+```
+
+**3000 CSVs in ~45 seconds.** The same amount of data that would have taken 270 seconds on a single Mac.
+
+### The Thermal Wall
+
+The MacBook cluster had a shelf life. After 30+ minutes of sustained 100% CPU load, the fanless Air started thermal throttling — epoch times crept from 45s to 55s to 65s. Even the Pro throttled slightly. Pointing a desk fan at the Air helped (seriously). But this was a band-aid.
+
+```
+E 0   ⏱45s     ← cold
+E 25  ⏱55s     ← warm
+E 50  ⏱65s     ← throttled
+```
+
+The cluster got us through the early training phase — from random policy to a val cost of ~55. But to push further, we needed real compute. That meant the cloud.
+
+### The Cloud Migration
+
+First stop: **Google Cloud** — a 48-core CPU instance. 5000 CSVs in 6 seconds. The MacBook cluster was immediately obsolete.
+
+But the CPU bottleneck was fundamental. ONNX inference is sequential per episode (autoregressive), and each worker occupies an entire core for ~0.5s. Cores scale linearly; GPUs scale with parallelism.
+
+Second stop: **Vast.ai** — a rented RTX 5060 Ti. This is where the real story begins. The batched simulator rewrite (Part 3 onward) made the entire multi-machine approach irrelevant. Instead of distributing 5000 episodes across dozens of CPU cores, we run them all in a single GPU batch. One ONNX call. One kernel launch. The "cluster" became a single GPU tensor.
+
+But the MacBook cluster phase taught us something important: **the first 80% of scaling is just about showing up with more hardware**. The last 20% — the GPU rewrite, IOBinding, TensorRT — that's where the engineering lives. The three-MacBook cluster was beautifully scrappy, held together by USB-C cables and pickle sockets, and it got us from a random policy to a competitive one. Not every optimization needs to be elegant.
+
+---
+
+## Part 3: Moving to GPU (40s → 20s rollout)
 
 ### The Motivation
 
@@ -107,7 +192,7 @@ Single process. One ONNX session on GPU. 5,000 episodes batched. No multiprocess
 
 ### IOBinding: Eliminating the Bounce
 
-The default ONNX GPU path: numpy array → CPU staging buffer → GPU → inference → GPU → CPU staging → numpy array. Every step. 500 times.
+The default ONNX GPU path: numpy array → CPU staging buffer → GPU → inference → GPU → CPU staging → numpy array. Every step. 580 times.
 
 IOBinding lets you bind pre-allocated GPU tensors directly:
 
@@ -147,7 +232,7 @@ sim time: **17s → 10s.** Total epoch: ~33s.
 
 ---
 
-## Part 4: The CSV Trap (33s → 12s per epoch)
+## Part 4: The CSV Trap (33s → 20s per epoch)
 
 ### Where Did 13 Seconds Go?
 
@@ -189,13 +274,11 @@ Now `dg['target_lataccel'][:, step_idx]` is a GPU tensor slice. No CPU involveme
 
 ### Result
 
-Epoch time: 33s → **12s** (rollout) + 20s (PPO) = 32s total.
-
-The rollout itself: **~12s.**
+The 13s of hidden overhead collapsed to <1s. Epoch time: **33s → ~20s** (the rollout itself was still ~20s — ctrl + sim hadn't changed yet). But the epoch no longer wasted half its time on data plumbing.
 
 ---
 
-## Part 5: All-GPU Controller (20s rollout → 12s rollout)
+## Part 5: All-GPU Controller (20s → 12s rollout)
 
 ### The Last CPU Bottleneck
 
@@ -218,7 +301,7 @@ action = np.clip(...)                                # CPU
 return action  # will be sent back to GPU for sim
 ```
 
-Three CPU↔GPU round-trips per step. 500 steps. For 5,000 episodes. All because the observation building was in numpy.
+Three CPU↔GPU round-trips per step. 580 steps. For 5,000 episodes. All because the observation building was in numpy.
 
 ### The Full GPU Controller
 
@@ -293,6 +376,7 @@ Here's how each optimization layer built on the previous:
 |---|---|---|---|---|
 | Baseline | Sequential single-episode | ~50 min | N/A | 1x |
 | Batched CPU | N episodes in lockstep, multiprocessing | ~40s | ~60s | 75x |
+| MacBook Cluster | 3 Macs, persistent TCP, weighted splits | ~45s (3000 CSVs) | ~55s | 3x data/time |
 | GPU ONNX | CUDAExecutionProvider, single process | ~25s | ~45s | 120x |
 | IOBinding + GPU tokenize | Zero-copy ONNX I/O, torch.bucketize | ~20s | ~40s | 150x |
 | GPU-resident histories | Histories as CUDA tensors | ~20s | ~33s | 150x |
@@ -301,7 +385,7 @@ Here's how each optimization layer built on the previous:
 | TensorRT FP16 | Fused kernels, engine caching | ~8s | ~8s + 3s PPO | 375x |
 | Final shave-offs | GPU randperm, GPU cost, GPU stats, 100K mini-batch | ~8s | ~8s + 3s PPO | ~375x |
 
-The physics sim went from 50 minutes to 12 seconds. Each layer was necessary — you couldn't skip to the end. GPU-resident histories are pointless without IOBinding. The GPU controller is pointless without `data_gpu`. CSVCache is invisible in the rollout timer but halves the epoch time.
+The physics sim went from 50 minutes to 8 seconds. Each layer was necessary — you couldn't skip to the end. GPU-resident histories are pointless without IOBinding. The GPU controller is pointless without `data_gpu`. CSVCache is invisible in the rollout timer but halves the epoch time.
 
 ---
 
@@ -347,7 +431,7 @@ While trying to install TensorRT on a rented GPU instance, we deleted `/venv` to
 
 ### The Opportunity
 
-The sim phase — 500 sequential ONNX forward passes — was 10s and appeared to be the irreducible floor. But the ONNX model was running through the default CUDA Execution Provider, which executes each op as a separate CUDA kernel. TensorRT fuses layers, auto-tunes kernels for the specific GPU, and can run in FP16 where safe.
+The sim phase — 580 sequential ONNX forward passes — was 10s and appeared to be the irreducible floor. But the ONNX model was running through the default CUDA Execution Provider, which executes each op as a separate CUDA kernel. TensorRT fuses layers, auto-tunes kernels for the specific GPU, and can run in FP16 where safe.
 
 ### Wiring It In
 
@@ -389,7 +473,7 @@ With TRT handling the sim floor, we audited every remaining CPU↔GPU transfer i
 
 | Transfer | Location | Size | Direction |
 |---|---|---|---|
-| `torch.randperm(N)` | PPO update mini-batch loop | 1.6M int64 | CPU→GPU (64x per update) |
+| `torch.randperm(N)` | PPO update mini-batch loop | 1.6M int64 | CPU→GPU (hundreds per update) |
 | `pred.cpu().numpy()` | `compute_cost()` | (N, 400) float | GPU→CPU |
 | `rew_2d.cpu().numpy()` | `gae_gpu` ret_rms update | (N, S) float | GPU→CPU |
 
@@ -403,7 +487,7 @@ for idx in torch.randperm(N).split(MINI_BS):
 for idx in torch.randperm(N, device=obs_t.device).split(MINI_BS):
 ```
 
-With N=2M, K=4 epochs, MINI_BS=100K, this eliminated ~64 implicit CPU→GPU index transfers per update.
+With ~1.6M transitions and K=4 PPO epochs, that's hundreds of implicit CPU→GPU index transfers per update, all eliminated.
 
 ### Fix 2: GPU compute_cost
 
@@ -457,15 +541,15 @@ Epoch: ~8s rollout + ~3s PPO update = ~11s  (N=5000)
 ```
 
 The rollout breaks down as:
-- **sim = 5-6s**: 500 sequential TensorRT forward passes. This is the hard floor — autoregressive inference cannot be parallelized across timesteps.
-- **ctrl = 1.2s**: All-GPU observation building + policy inference. 500 steps × 2.4ms each, dominated by kernel launch overhead for many small ops.
+- **sim = 5-6s**: 580 sequential TensorRT forward passes. This is the hard floor — autoregressive inference cannot be parallelized across timesteps.
+- **ctrl = 1.2s**: All-GPU observation building + policy inference. 580 steps × 2.1ms each, dominated by kernel launch overhead for many small ops.
 - **overhead < 0.5s**: GPU data slicing from cache, history init, cost computation.
 
 The PPO update (3s) processes ~2.5M datapoints through 4 epochs of mini-batch SGD with 100K batch size. GPU randperm, GPU GAE, and `set_to_none=True` zeroing keep everything on-device.
 
 ---
 
-## Part 9: Lessons
+## Part 11: Lessons
 
 **1. Measure before you optimize.** We spent time on IOBinding reuse and pre-allocated GPU buffers that saved ~0.5s. Meanwhile, CSV re-parsing was silently burning 6s per epoch. The timing prints inside the rollout loop were misleading because they didn't capture the setup cost outside the loop.
 
@@ -481,20 +565,21 @@ The PPO update (3s) processes ~2.5M datapoints through 4 epochs of mini-batch SG
 
 ## Conclusion
 
-The journey from `tinyphysics.py` to the GPU-fused batched pipeline wasn't about one clever trick. It was 9 compounding layers of optimization:
+The journey from `tinyphysics.py` to the GPU-fused batched pipeline wasn't about one clever trick. It was a scrappy, compounding sequence of optimizations — some elegant, some held together with USB-C cables and desk fans:
 
 1. **Batch** episodes into one ONNX call (75x)
-2. **Move to GPU** with CUDAExecutionProvider (1.6x)
-3. **IOBind** inputs and outputs to GPU memory (1.25x)
-4. **GPU-resident histories** to eliminate per-step transfers (1.0x — but enabled everything after)
-5. **Cache CSVs** to eliminate per-epoch I/O (1.7x on epoch time)
-6. **GPU controller** to eliminate all CPU numpy ops (7x on ctrl time)
-7. **GPU training data** to eliminate post-rollout transpose and CPU→GPU copy (1.5x on PPO time)
-8. **TensorRT** FP16 inference with engine caching (2x on sim time)
-9. **Final shave-offs** — GPU randperm, GPU cost computation, GPU running stats, larger mini-batches (1.1x)
+2. **MacBook cluster** — 3 Macs over Thunderbolt, persistent TCP, weighted splits (3x data throughput)
+3. **Move to GPU** with CUDAExecutionProvider (1.6x)
+4. **IOBind** inputs and outputs to GPU memory (1.25x)
+5. **GPU-resident histories** to eliminate per-step transfers (1.0x — but enabled everything after)
+6. **Cache CSVs** to eliminate per-epoch I/O (1.7x on epoch time)
+7. **GPU controller** to eliminate all CPU numpy ops (7x on ctrl time)
+8. **GPU training data** to eliminate post-rollout transpose and CPU→GPU copy (1.5x on PPO time)
+9. **TensorRT** FP16 inference with engine caching (2x on sim time)
+10. **Final shave-offs** — GPU randperm, GPU cost computation, GPU running stats, larger mini-batches (1.1x)
 
-Compound effect: **~300x on rollout, ~150x on wall-clock epoch time.**
+Compound effect: **~375x on rollout** (50 min → 8s for 5000 episodes).
 
-The simulator that took 50 minutes to evaluate 5,000 episodes now does it in 8 seconds. A training run that would have taken a week finishes in hours. And the path to get here was paved with off-by-one RNG bugs, inverted boolean flags, and a deleted system Python installation.
+The simulator that took 50 minutes to evaluate 5,000 episodes now does it in 8 seconds. A training run that would have taken a week finishes in hours. And the path to get here was paved with off-by-one RNG bugs, inverted boolean flags, a deleted system Python installation, thermal-throttled MacBook Airs, and pickle blobs flying over Thunderbolt cables.
 
-Performance engineering is not about writing fast code. It's about understanding where time actually goes, and then systematically removing every unnecessary operation between where data is and where it needs to be.
+Performance engineering is not about writing fast code. It's about understanding where time actually goes, and then systematically removing every unnecessary operation between where data is and where it needs to be. Sometimes that means fusing GPU kernels. Sometimes it means plugging a USB-C cable into your friend's laptop.
