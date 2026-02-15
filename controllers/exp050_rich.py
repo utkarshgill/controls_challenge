@@ -65,6 +65,9 @@ def _curv(lat, roll, v):
     return (lat - roll) / max(v * v, 1.0)
 
 
+_GPU_ORT_CACHE = None  # module-level singleton: reuse GPU ONNX session across Controller instances
+
+
 class ActorCritic(nn.Module):
     def __init__(self):
         super().__init__()
@@ -121,6 +124,13 @@ class Controller(BaseController):
 
     def _init_gpu_ort(self, model):
         """Create a dedicated GPU ONNX session for MPC and pre-allocate buffers."""
+        global _GPU_ORT_CACHE
+        if _GPU_ORT_CACHE is not None:
+            self._gpu_ort = _GPU_ORT_CACHE
+            self._gpu_out_name = self._gpu_ort.get_outputs()[0].name
+            self._gpu_bins = torch.from_numpy(self._tokenizer.bins).to(DEV)
+            self._gpu_bins_f32 = self._gpu_bins.float()
+            return
         model_path = os.getenv('ONNX_MODEL', './models/tinyphysics.onnx')
         if not os.path.exists(model_path):
             print(f"[GPU-MPC] ONNX model not found at {model_path}, falling back to CPU")
@@ -133,6 +143,7 @@ class Controller(BaseController):
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         with open(str(model_path), 'rb') as f:
             self._gpu_ort = ort.InferenceSession(f.read(), opts, providers)
+        _GPU_ORT_CACHE = self._gpu_ort
         actual = self._gpu_ort.get_providers()
         print(f"[GPU-MPC] providers={actual}")
         self._gpu_out_name = self._gpu_ort.get_outputs()[0].name
