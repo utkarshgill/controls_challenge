@@ -114,13 +114,31 @@ def batched_eval(files, model_path, checkpoint_path, device):
     h_error = torch.zeros((N, HIST_LEN), dtype=torch.float32, device=device)
     obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device=device)
 
-    def _build_obs(step_idx, sim_ref):
-        """Build obs for all N episodes on GPU."""
-        target     = dg['target_lataccel'][:, step_idx]
-        current_la = sim_ref.current_lataccel
-        roll_la    = dg['roll_lataccel'][:, step_idx]
-        v_ego      = dg['v_ego'][:, step_idx]
-        a_ego      = dg['a_ego'][:, step_idx]
+    # Keep a reference to sim's numpy data for CPU path
+    sim_data_np = sim.data
+
+    def _build_obs(step_idx, sim_ref=None, *,
+                   cpu_target=None, cpu_cur_la=None, cpu_state=None, cpu_fplan=None):
+        """Build obs for all N episodes. Works on both GPU and CPU paths."""
+        if sim_ref is not None:
+            # GPU path — read from data_gpu tensors
+            target     = dg['target_lataccel'][:, step_idx]
+            current_la = sim_ref.current_lataccel
+            roll_la    = dg['roll_lataccel'][:, step_idx]
+            v_ego      = dg['v_ego'][:, step_idx]
+            a_ego      = dg['a_ego'][:, step_idx]
+            fplan_lat0 = dg['target_lataccel'][:, min(step_idx + 1, T - 1)]
+            data_src = dg
+        else:
+            # CPU path — convert numpy args to tensors
+            target     = torch.from_numpy(np.asarray(cpu_target, dtype=np.float64)).to(device)
+            current_la = torch.from_numpy(np.asarray(cpu_cur_la, dtype=np.float64)).to(device)
+            roll_la    = torch.from_numpy(np.asarray(cpu_state['roll_lataccel'], dtype=np.float64)).to(device)
+            v_ego      = torch.from_numpy(np.asarray(cpu_state['v_ego'], dtype=np.float64)).to(device)
+            a_ego      = torch.from_numpy(np.asarray(cpu_state['a_ego'], dtype=np.float64)).to(device)
+            fplan_lat0_np = sim_data_np['target_lataccel'][:, min(step_idx + 1, T - 1)]
+            fplan_lat0 = torch.from_numpy(np.asarray(fplan_lat0_np, dtype=np.float64)).to(device)
+            data_src = None
 
         cla32 = current_la.float()
         error = (target - current_la).float()
@@ -132,7 +150,6 @@ def batched_eval(files, model_path, checkpoint_path, device):
         v2 = torch.clamp(v_ego * v_ego, min=1.0)
         k_tgt = (target - roll_la) / v2
         k_cur = (current_la - roll_la) / v2
-        fplan_lat0 = dg['target_lataccel'][:, min(step_idx + 1, T - 1)]
         fric = torch.sqrt(current_la**2 + a_ego**2) / 7.0
 
         c = 0
@@ -159,16 +176,29 @@ def batched_eval(files, model_path, checkpoint_path, device):
         end = min(step_idx + FUTURE_PLAN_STEPS, T)
         for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
                             ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
-            slc = dg[attr][:, step_idx+1:end]
-            w = slc.shape[1]
-            if w == 0:
-                fb = dg[attr][:, step_idx]
-                obs_buf[:, c:c+FUTURE_K] = (fb / scale).float().unsqueeze(1)
-            elif w < FUTURE_K:
-                obs_buf[:, c:c+w] = slc.float() / scale
-                obs_buf[:, c+w:c+FUTURE_K] = (slc[:, -1:].float() / scale)
+            if data_src is not None:
+                slc = data_src[attr][:, step_idx+1:end]
+                w = slc.shape[1]
+                if w == 0:
+                    fb = data_src[attr][:, step_idx]
+                    obs_buf[:, c:c+FUTURE_K] = (fb / scale).float().unsqueeze(1)
+                elif w < FUTURE_K:
+                    obs_buf[:, c:c+w] = slc.float() / scale
+                    obs_buf[:, c+w:c+FUTURE_K] = (slc[:, -1:].float() / scale)
+                else:
+                    obs_buf[:, c:c+FUTURE_K] = slc[:, :FUTURE_K].float() / scale
             else:
-                obs_buf[:, c:c+FUTURE_K] = slc[:, :FUTURE_K].float() / scale
+                slc_np = sim_data_np[attr][:, step_idx+1:end].astype(np.float32)
+                slc_t = torch.from_numpy(slc_np).to(device)
+                w = slc_t.shape[1]
+                if w == 0:
+                    fb_np = sim_data_np[attr][:, step_idx].astype(np.float32)
+                    obs_buf[:, c:c+FUTURE_K] = torch.from_numpy(fb_np).to(device).unsqueeze(1) / scale
+                elif w < FUTURE_K:
+                    obs_buf[:, c:c+w] = slc_t / scale
+                    obs_buf[:, c+w:c+FUTURE_K] = slc_t[:, -1:] / scale
+                else:
+                    obs_buf[:, c:c+FUTURE_K] = slc_t[:, :FUTURE_K] / scale
             c += FUTURE_K
 
         obs_buf.clamp_(-5.0, 5.0)
@@ -367,9 +397,17 @@ def batched_eval(files, model_path, checkpoint_path, device):
         best_actions = actions_0[torch.arange(N, device=device), best_idx]  # (N,)
         return best_actions
 
-    def controller_fn(step_idx, sim_ref):
-        """Batched controller for all N episodes."""
-        cla32 = _build_obs(step_idx, sim_ref)
+    def controller_fn(step_idx, *args):
+        """Batched controller for all N episodes (GPU: 1 extra arg, CPU: 4 extra args)."""
+        if len(args) == 1:
+            # GPU path: controller_fn(step_idx, sim_ref)
+            cla32 = _build_obs(step_idx, sim_ref=args[0])
+        else:
+            # CPU path: controller_fn(step_idx, target, cur_la, state_dict, future_plan)
+            cla32 = _build_obs(step_idx, cpu_target=args[0], cpu_cur_la=args[1],
+                               cpu_state=args[2], cpu_fplan=args[3])
+
+        is_cpu_path = len(args) != 1
 
         if step_idx < CONTROL_START_IDX:
             h_act[:, :-1] = h_act[:, 1:].clone()
@@ -378,10 +416,11 @@ def batched_eval(files, model_path, checkpoint_path, device):
             h_act32[:, -1] = 0.0
             h_lat[:, :-1] = h_lat[:, 1:].clone()
             h_lat[:, -1] = cla32
-            return torch.zeros(N, dtype=torch.float64, device=device)
+            zeros = torch.zeros(N, dtype=torch.float64, device=device)
+            return zeros.numpy() if is_cpu_path else zeros
 
         if do_mpc:
-            action = _mpc_shoot(step_idx, sim_ref)
+            action = _mpc_shoot(step_idx, args[0] if not is_cpu_path else None)
         else:
             with torch.inference_mode():
                 out = actor(obs_buf)
@@ -399,7 +438,7 @@ def batched_eval(files, model_path, checkpoint_path, device):
         h_lat[:, :-1] = h_lat[:, 1:].clone()
         h_lat[:, -1] = cla32
 
-        return action
+        return action.numpy() if is_cpu_path else action
 
     print(f"Running batched rollout: N={N}, MPC_N={MPC_N}, MPC_H={MPC_H}, device={device}")
     t0 = time.time()
