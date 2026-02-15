@@ -448,6 +448,52 @@ def batched_eval(files, model_path, checkpoint_path, device):
     return cost_dict
 
 
+def batched_pid(files, model_path, device):
+    """Run PID baseline through BatchedSimulator. Returns cost dict with (N,) arrays."""
+    csv_list = [str(f) for f in files]
+    ort_session = make_ort_session(str(model_path))
+    sim = BatchedSimulator(str(model_path), csv_list, ort_session=ort_session)
+    N = sim.N
+
+    PID_P, PID_I, PID_D = 0.195, 0.100, -0.053
+    err_integral = torch.zeros(N, dtype=torch.float64, device=device)
+    prev_err     = torch.zeros(N, dtype=torch.float64, device=device)
+
+    use_gpu = device.type == 'cuda'
+    dg = sim.data_gpu if use_gpu else None
+    sim_data_np = sim.data
+
+    def pid_fn(step_idx, *args):
+        nonlocal err_integral, prev_err
+        if len(args) == 1:
+            sim_ref = args[0]
+            target = dg['target_lataccel'][:, step_idx]
+            current = sim_ref.current_lataccel
+        else:
+            target = torch.from_numpy(np.asarray(args[0], dtype=np.float64)).to(device)
+            current = torch.from_numpy(np.asarray(args[1], dtype=np.float64)).to(device)
+
+        if step_idx < CONTROL_START_IDX:
+            err_integral.zero_()
+            prev_err.zero_()
+            z = torch.zeros(N, dtype=torch.float64, device=device)
+            return z.numpy() if len(args) != 1 else z
+
+        err = target - current
+        err_integral += err
+        err_diff = err - prev_err
+        prev_err = err.clone()
+        action = PID_P * err + PID_I * err_integral + PID_D * err_diff
+        return action.numpy() if len(args) != 1 else action
+
+    print(f"Running batched PID: N={N}, device={device}")
+    t0 = time.time()
+    cost_dict = sim.rollout(pid_fn)
+    elapsed = time.time() - t0
+    print(f"Batched PID: {elapsed:.1f}s ({elapsed/N*1000:.1f}ms per episode)")
+    return cost_dict
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fast GPU-batched eval")
     parser.add_argument("--model_path", type=str, default="./models/tinyphysics.onnx")
@@ -493,27 +539,24 @@ def main():
     # Test controller: batched GPU
     test_costs = batched_eval(files, args.model_path, args.checkpoint, device)
 
-    # Baseline controller: sequential (pid is cheap)
-    print(f"\nRunning baseline ({args.baseline_controller}) sequentially...")
-    baseline_costs = []
+    # Baseline PID: batched on same device
+    baseline_costs = batched_pid(files, args.model_path, device)
+
+    # Sample rollouts for report plots (sequential, only n_sample files)
     sample_rollouts = []
     n_sample = min(SAMPLE_ROLLOUTS, len(files))
-
-    for i, f in enumerate(tqdm(files)):
-        base_cost, base_tgt, base_cur = run_rollout(f, args.baseline_controller, args.model_path)
-        baseline_costs.append(base_cost)
-        if i < n_sample:
-            # For sample rollouts, also get test controller trajectory
-            # (re-run single episode to get full trajectory for plots)
-            test_cost_single, test_tgt, test_cur = run_rollout(f, args.test_controller, args.model_path)
-            sample_rollouts.append({
-                'seg': f.stem,
-                'test_controller': args.test_controller,
-                'baseline_controller': args.baseline_controller,
-                'desired_lataccel': test_tgt,
-                'test_controller_lataccel': test_cur,
-                'baseline_controller_lataccel': base_cur,
-            })
+    for i in range(n_sample):
+        f = files[i]
+        _, test_tgt, test_cur = run_rollout(f, args.test_controller, args.model_path)
+        _, base_tgt, base_cur = run_rollout(f, args.baseline_controller, args.model_path)
+        sample_rollouts.append({
+            'seg': f.stem,
+            'test_controller': args.test_controller,
+            'baseline_controller': args.baseline_controller,
+            'desired_lataccel': test_tgt,
+            'test_controller_lataccel': test_cur,
+            'baseline_controller_lataccel': base_cur,
+        })
 
     # Combine costs
     costs = []
@@ -522,10 +565,13 @@ def main():
                       'lataccel_cost': float(test_costs['lataccel_cost'][i]),
                       'jerk_cost': float(test_costs['jerk_cost'][i]),
                       'total_cost': float(test_costs['total_cost'][i])})
-        costs.append({'controller': 'baseline', **baseline_costs[i]})
+        costs.append({'controller': 'baseline',
+                      'lataccel_cost': float(baseline_costs['lataccel_cost'][i]),
+                      'jerk_cost': float(baseline_costs['jerk_cost'][i]),
+                      'total_cost': float(baseline_costs['total_cost'][i])})
 
     test_mean = np.mean(test_costs['total_cost'])
-    base_mean = np.mean([c['total_cost'] for c in baseline_costs])
+    base_mean = np.mean(baseline_costs['total_cost'])
     print(f"\nTest:     {test_mean:.2f}")
     print(f"Baseline: {base_mean:.2f}")
 

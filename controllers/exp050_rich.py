@@ -134,7 +134,8 @@ class Controller(BaseController):
         with open(str(model_path), 'rb') as f:
             self._gpu_ort = ort.InferenceSession(f.read(), opts, providers)
         actual = self._gpu_ort.get_providers()
-        print(f"[GPU-MPC] providers={actual}")
+        if int(os.getenv('DEBUG', '0')) >= 1:
+            print(f"[GPU-MPC] providers={actual}")
         self._gpu_out_name = self._gpu_ort.get_outputs()[0].name
         self._gpu_bins = torch.from_numpy(self._tokenizer.bins).to(DEV)  # float64
         self._gpu_bins_f32 = self._gpu_bins.float()
