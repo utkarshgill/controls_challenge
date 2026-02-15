@@ -39,7 +39,7 @@ def make_ort_session(model_path):
     options.inter_op_num_threads = ORT_THREADS
     options.log_severity_level = 3
     with open(str(model_path), 'rb') as f:
-        return ort.InferenceSession(f.read(), options, ['CPUExecutionProvider'])
+        return ort.InferenceSession(f.read(), options, ['CUDAExecutionProvider'])
 
 
 def pool_init(model_path):
