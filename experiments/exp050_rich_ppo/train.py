@@ -45,6 +45,8 @@ BC_WORKERS = int(os.getenv('BC_WORKERS', '10'))
 RESUME     = os.getenv('RESUME', '0') == '1'
 DECAY_LR   = os.getenv('DECAY_LR', '0') == '1'
 BATCHED    = os.getenv('BATCHED', '1') == '1'
+USE_CUDA   = os.getenv('CUDA', '0') == '1'
+DEV        = torch.device('cuda' if USE_CUDA and torch.cuda.is_available() else 'cpu')
 
 # observation scaling
 S_LAT, S_STEER = 5.0, 2.0
@@ -293,12 +295,11 @@ class PPO:
 
     def update(self, all_obs, all_raw, all_rew, all_val, all_done,
                critic_only=False):
-        obs_t = torch.FloatTensor(np.concatenate(all_obs))
-        raw_t = torch.FloatTensor(np.concatenate(all_raw)).unsqueeze(-1)
+        obs_t = torch.FloatTensor(np.concatenate(all_obs)).to(DEV)
+        raw_t = torch.FloatTensor(np.concatenate(all_raw)).unsqueeze(-1).to(DEV)
         adv, ret = self.gae(all_rew, all_val, all_done)
-        adv_t = torch.FloatTensor(adv)
-
-        ret_t = torch.FloatTensor(ret)
+        adv_t = torch.FloatTensor(adv).to(DEV)
+        ret_t = torch.FloatTensor(ret).to(DEV)
 
         x_t = ((raw_t + 1.0) / 2.0).clamp(1e-6, 1 - 1e-6)  # raw → Beta support (0,1)
 
@@ -643,8 +644,8 @@ def pretrain_bc(ac, csv_files, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
     N = len(all_obs)
     print(f"BC pretrain: {N} samples, {epochs} epochs")
 
-    obs_t = torch.FloatTensor(all_obs)
-    raw_t = torch.FloatTensor(all_raw)
+    obs_t = torch.FloatTensor(all_obs).to(DEV)
+    raw_t = torch.FloatTensor(all_raw).to(DEV)
     opt = optim.AdamW(ac.actor.parameters(), lr=lr, weight_decay=1e-4)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
@@ -725,7 +726,7 @@ def _seq_eval_worker(args):
 
 class Ctx:
     def __init__(self):
-        self.ac  = ActorCritic()
+        self.ac  = ActorCritic().to(DEV)
         self.ppo = PPO(self.ac)
         self.mdl_path = ROOT / 'models' / 'tinyphysics.onnx'
         all_f = sorted((ROOT / 'data').glob('*.csv'))
@@ -887,7 +888,7 @@ def train():
 
     resumed = False
     if RESUME and (EXP_DIR / 'best_model.pt').exists():
-        ckpt = torch.load(EXP_DIR / 'best_model.pt', weights_only=False, map_location='cpu')
+        ckpt = torch.load(EXP_DIR / 'best_model.pt', weights_only=False, map_location=DEV)
         ctx.ac.load_state_dict(ckpt['ac'])
         if 'pi_opt' in ckpt:
             ctx.ppo.pi_opt.load_state_dict(ckpt['pi_opt'])
@@ -916,7 +917,7 @@ def train():
     print(f"Baseline: {vm:.1f} ± {vs:.1f}")
     ctx.save_best()
 
-    print(f"\nPPO  csvs={CSVS_EPOCH}  epochs={MAX_EP}  workers={WORKERS}  (batched chunks)")
+    print(f"\nPPO  csvs={CSVS_EPOCH}  epochs={MAX_EP}  workers={WORKERS}  dev={DEV}  (batched chunks)")
     print(f"  π_lr={PI_LR}  vf_lr={VF_LR}  ent={ENT_COEF}"
           f"  dist=Beta  Δscale={DELTA_SCALE}"
           f"  layers={A_LAYERS}+{C_LAYERS}  K={K_EPOCHS}  dim={STATE_DIM}\n")
