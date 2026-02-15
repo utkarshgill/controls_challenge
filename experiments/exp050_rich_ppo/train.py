@@ -46,6 +46,7 @@ RESUME     = os.getenv('RESUME', '0') == '1'
 DECAY_LR   = os.getenv('DECAY_LR', '0') == '1'
 BATCHED    = os.getenv('BATCHED', '1') == '1'
 USE_CUDA   = os.getenv('CUDA', '0') == '1'
+DEBUG      = int(os.getenv('DEBUG', '0'))
 DEV        = torch.device('cuda' if USE_CUDA and torch.cuda.is_available() else 'cpu')
 
 # observation scaling
@@ -1152,7 +1153,8 @@ def train_one_epoch(epoch, ctx, warmup_off=0):
             f"  π={info['pi']:+.4f}  vf={info['vf']:.1f}  H={info['ent']:.2f}"
             f"  lr={info['lr']:.1e}  ⏱{tc:.0f}+{tu:.0f}s{phase}")
 
-    if epoch % EVAL_EVERY == 0:
+    is_val = epoch % EVAL_EVERY == 0
+    if is_val:
         vm, vs = evaluate(ctx, ctx.va_f)
         mk = ""
         if vm < ctx.best:
@@ -1161,7 +1163,8 @@ def train_one_epoch(epoch, ctx, warmup_off=0):
             mk = " ★"
         line += f"  val={vm:6.1f}±{vs:4.1f}{mk}"
 
-    print(line)
+    if is_val or DEBUG >= 1:
+        print(line)
 
 
 def train():

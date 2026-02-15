@@ -639,7 +639,8 @@ class BatchedSimulator:
                 self.sim_step(step_idx)
                 t_sim += _time.perf_counter() - _t0
 
-        print(f"  [rollout N={self.N}] ctrl={t_ctrl:.1f}s  sim={t_sim:.1f}s  total={t_ctrl+t_sim:.1f}s", flush=True)
+        if int(os.environ.get('DEBUG', '0')) >= 2:
+            print(f"  [rollout N={self.N}] ctrl={t_ctrl:.1f}s  sim={t_sim:.1f}s  total={t_ctrl+t_sim:.1f}s", flush=True)
         return self.compute_cost()
 
     # ── compute_cost  (mirrors lines 186-193) ────────────────

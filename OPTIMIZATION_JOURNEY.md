@@ -298,6 +298,8 @@ Here's how each optimization layer built on the previous:
 | GPU-resident histories | Histories as CUDA tensors | ~20s | ~33s | 150x |
 | CSVCache | Parse once at startup | ~20s | ~20s | 150x (epoch: 150x) |
 | GPU controller + data_gpu | All obs/ctrl/data on GPU | ~12s | ~12s + 19s PPO | 250x |
+| TensorRT FP16 | Fused kernels, engine caching | ~8s | ~8s + 3s PPO | 375x |
+| Final shave-offs | GPU randperm, GPU cost, GPU stats, 100K mini-batch | ~8s | ~8s + 3s PPO | ~375x |
 
 The physics sim went from 50 minutes to 12 seconds. Each layer was necessary — you couldn't skip to the end. GPU-resident histories are pointless without IOBinding. The GPU controller is pointless without `data_gpu`. CSVCache is invisible in the rollout timer but halves the epoch time.
 
@@ -341,18 +343,125 @@ While trying to install TensorRT on a rented GPU instance, we deleted `/venv` to
 
 ---
 
-## Part 8: Where the Time Goes Now
+## Part 8: TensorRT — Halving the Sim Floor (10s → 5s)
+
+### The Opportunity
+
+The sim phase — 500 sequential ONNX forward passes — was 10s and appeared to be the irreducible floor. But the ONNX model was running through the default CUDA Execution Provider, which executes each op as a separate CUDA kernel. TensorRT fuses layers, auto-tunes kernels for the specific GPU, and can run in FP16 where safe.
+
+### Wiring It In
+
+ONNX Runtime supports TensorRT as an execution provider. The integration was straightforward:
+
+```python
+providers = []
+if os.environ.get('TRT') == '1':
+    providers.append(('TensorrtExecutionProvider', {
+        'trt_fp16_enable': True,
+        'trt_engine_cache_enable': True,
+        'trt_engine_cache_path': '/tmp/trt_cache',
+        'trt_max_workspace_size': str(2 << 30),  # 2GB
+    }))
+providers.append(('CUDAExecutionProvider', {...}))
+```
+
+First epoch pays a ~30s TRT engine compilation cost. After that, the cached engine loads in <1s.
+
+### FP16 LayerNorm Safety
+
+TensorRT warned about FP16 overflow in layernorm nodes after self-attention. It automatically forced those specific Reduce/Pow layers back to FP32 — handling mixed precision at the op level. No accuracy loss, no manual intervention needed.
+
+### Result
 
 ```
-Epoch: 12s rollout + 19s PPO update = 31s
+sim = 10.1s  →  5.1s  (TRT, after engine cache warm)
+```
+
+The sim floor nearly halved. For N=5000, total rollout dropped from ~12s to ~8s.
+
+---
+
+## Part 9: Final Shave-offs — Eliminating the Last CPU↔GPU Transfers
+
+### The Audit
+
+With TRT handling the sim floor, we audited every remaining CPU↔GPU transfer in the pipeline:
+
+| Transfer | Location | Size | Direction |
+|---|---|---|---|
+| `torch.randperm(N)` | PPO update mini-batch loop | 1.6M int64 | CPU→GPU (64x per update) |
+| `pred.cpu().numpy()` | `compute_cost()` | (N, 400) float | GPU→CPU |
+| `rew_2d.cpu().numpy()` | `gae_gpu` ret_rms update | (N, S) float | GPU→CPU |
+
+### Fix 1: GPU randperm
+
+```python
+# Before — creates permutation on CPU, implicit transfer every mini-batch:
+for idx in torch.randperm(N).split(MINI_BS):
+
+# After — permutation lives on GPU, indexing stays on-device:
+for idx in torch.randperm(N, device=obs_t.device).split(MINI_BS):
+```
+
+With N=2M, K=4 epochs, MINI_BS=100K, this eliminated ~64 implicit CPU→GPU index transfers per update.
+
+### Fix 2: GPU compute_cost
+
+```python
+# Before — pull full prediction history to CPU, compute in numpy:
+pred = pred.cpu().numpy()
+lat_cost = np.mean((target - pred)**2, axis=1) * 100
+
+# After — compute entirely on GPU, transfer only final (N,) results:
+lat_cost = (target_gpu - pred_gpu).pow(2).mean(dim=1) * 100
+jerk = torch.diff(pred_gpu, dim=1) / DEL_T
+jerk_cost = jerk.pow(2).mean(dim=1) * 100
+total = lat_cost * LAT_ACCEL_COST_MULTIPLIER + jerk_cost
+return {'total_cost': total.cpu().numpy()}  # (N,) not (N, 400)
+```
+
+Transfers 3 vectors of size N instead of an (N, 400) matrix.
+
+### Fix 3: GPU running stats
+
+The return normalization (RunningMeanStd) was pulling the entire (N, S) reward tensor to CPU just to compute mean and variance:
+
+```python
+# Before — 6.4MB GPU→CPU transfer:
+self._ret_rms.update(rew_2d.detach().cpu().numpy().ravel())
+
+# After — compute moments on GPU, transfer 2 scalars:
+flat = rew_2d.reshape(-1)
+self._ret_rms.update_from_moments(flat.mean().item(), flat.var().item(), flat.numel())
+```
+
+### Fix 4: Larger Mini-batches + Faster Zeroing
+
+Increased `MINI_BS` from 20K to 100K to reduce kernel launch overhead per mini-batch, and used `optimizer.zero_grad(set_to_none=True)` to skip memset.
+
+### Result
+
+```
+Before:  ⏱6+3s  (N=4000)   per-csv: 2.25ms
+After:   ⏱8+3s  (N=5000)   per-csv: 2.20ms
+```
+
+Modest per-sample improvement. The gains are small because the pipeline was already well-optimized — the 5s TRT sim floor dominates.
+
+---
+
+## Part 10: Where the Time Goes Now
+
+```
+Epoch: ~8s rollout + ~3s PPO update = ~11s  (N=5000)
 ```
 
 The rollout breaks down as:
-- **sim = 10s**: 500 sequential ONNX forward passes on GPU. This is the model's inference time — the irreducible floor for this architecture. Only TensorRT (2-4x faster inference) could cut this further.
-- **ctrl = 1.3s**: All-GPU observation building + policy inference. Already fast.
-- **overhead = 0.7s**: Data slicing from cache, GPU history init, reward computation.
+- **sim = 5-6s**: 500 sequential TensorRT forward passes. This is the hard floor — autoregressive inference cannot be parallelized across timesteps.
+- **ctrl = 1.2s**: All-GPU observation building + policy inference. 500 steps × 2.4ms each, dominated by kernel launch overhead for many small ops.
+- **overhead < 0.5s**: GPU data slicing from cache, history init, cost computation.
 
-The PPO update (19s) is gradient computation — 4 epochs × minibatch SGD over 2.4M datapoints on GPU. This is standard deep learning training time.
+The PPO update (3s) processes ~2.5M datapoints through 4 epochs of mini-batch SGD with 100K batch size. GPU randperm, GPU GAE, and `set_to_none=True` zeroing keep everything on-device.
 
 ---
 
@@ -372,7 +481,7 @@ The PPO update (19s) is gradient computation — 4 epochs × minibatch SGD over 
 
 ## Conclusion
 
-The journey from `tinyphysics.py` to the GPU-fused batched pipeline wasn't about one clever trick. It was 7 compounding layers of optimization:
+The journey from `tinyphysics.py` to the GPU-fused batched pipeline wasn't about one clever trick. It was 9 compounding layers of optimization:
 
 1. **Batch** episodes into one ONNX call (75x)
 2. **Move to GPU** with CUDAExecutionProvider (1.6x)
@@ -381,9 +490,11 @@ The journey from `tinyphysics.py` to the GPU-fused batched pipeline wasn't about
 5. **Cache CSVs** to eliminate per-epoch I/O (1.7x on epoch time)
 6. **GPU controller** to eliminate all CPU numpy ops (7x on ctrl time)
 7. **GPU training data** to eliminate post-rollout transpose and CPU→GPU copy (1.5x on PPO time)
+8. **TensorRT** FP16 inference with engine caching (2x on sim time)
+9. **Final shave-offs** — GPU randperm, GPU cost computation, GPU running stats, larger mini-batches (1.1x)
 
-Compound effect: **~250x on rollout, ~100x on wall-clock epoch time.**
+Compound effect: **~300x on rollout, ~150x on wall-clock epoch time.**
 
-The simulator that took 50 minutes to evaluate 5,000 episodes now does it in 12 seconds. A training run that would have taken a week finishes in hours. And the path to get here was paved with off-by-one RNG bugs, inverted boolean flags, and a deleted system Python installation.
+The simulator that took 50 minutes to evaluate 5,000 episodes now does it in 8 seconds. A training run that would have taken a week finishes in hours. And the path to get here was paved with off-by-one RNG bugs, inverted boolean flags, and a deleted system Python installation.
 
 Performance engineering is not about writing fast code. It's about understanding where time actually goes, and then systematically removing every unnecessary operation between where data is and where it needs to be.
