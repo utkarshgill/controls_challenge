@@ -116,6 +116,40 @@ def preload_csvs(csv_files):
                 target_lataccel=tgt_la, steer_command=steer, N=N, T=T)
 
 
+class CSVCache:
+    """Load all CSVs once, store per-file (1, T) rows.  Slice by index per epoch."""
+
+    def __init__(self, csv_files):
+        import time as _t
+        t0 = _t.time()
+        self._files = list(csv_files)
+        self._file_to_idx = {str(f): i for i, f in enumerate(self._files)}
+        self._master = preload_csvs(self._files)  # (N_all, T)
+        self.T = self._master['T']
+        # Pre-compute per-file RNG seed + random values (deterministic)
+        CL = CONTEXT_LENGTH
+        n_steps = self.T - CL
+        N_all = len(self._files)
+        self._rng_all = np.empty((N_all, n_steps), dtype=np.float32)
+        for i, f in enumerate(self._files):
+            seed = int(md5(('data/' + Path(f).name).encode()).hexdigest(), 16) % 10**4
+            rng = np.random.RandomState(seed)
+            self._rng_all[i, :] = rng.rand(n_steps).astype(np.float32)
+        print(f"  [CSVCache] {N_all} files, T={self.T}, "
+              f"loaded in {_t.time()-t0:.1f}s", flush=True)
+
+    def slice(self, csv_files):
+        """Return (data_dict, rng_rows) for a subset of files."""
+        idxs = np.array([self._file_to_idx[str(f)] for f in csv_files])
+        N = len(idxs)
+        data = {}
+        for k in ('roll_lataccel', 'v_ego', 'a_ego', 'target_lataccel', 'steer_command'):
+            data[k] = self._master[k][idxs]
+        data['N'] = N
+        data['T'] = self.T
+        return data, self._rng_all[idxs]  # rng shape (N, n_steps)
+
+
 # ── Batched physics model (mirrors TinyPhysicsModel) ──────────
 
 class BatchedPhysicsModel:
@@ -300,15 +334,32 @@ class BatchedSimulator:
     compute_cost structure but operates on (N, ...) arrays.
     """
 
-    def __init__(self, model_path: str, csv_files: list,
-                 ort_session=None) -> None:
+    def __init__(self, model_path: str, csv_files: list = None,
+                 ort_session=None, cached_data=None, cached_rng=None) -> None:
         self.sim_model = BatchedPhysicsModel(model_path, ort_session=ort_session)
-        self.csv_files = csv_files
-        self.data = preload_csvs(csv_files)
+        self.csv_files = csv_files or []
+        if cached_data is not None:
+            self.data = cached_data
+            self._cached_rng = cached_rng        # (N, n_steps) from CSVCache
+        else:
+            self.data = preload_csvs(csv_files)
+            self._cached_rng = None
         self.N = self.data['N']
         self.T = self.data['T']
-        self.compute_expected = False   # set True to piggyback E[lataccel]
-        self.expected_lataccel = None   # (N,) after sim_step if compute_expected
+        self.compute_expected = False
+        self.expected_lataccel = None
+        self._gpu = os.getenv('CUDA', '0') == '1'
+        if self._gpu:
+            import torch as _torch
+            self._torch = _torch
+            # Move data dict to GPU once (read-only, reused every step)
+            self.data_gpu = {}
+            for k in ('roll_lataccel', 'v_ego', 'a_ego', 'target_lataccel', 'steer_command'):
+                arr = np.ascontiguousarray(self.data[k], dtype=np.float64)
+                self.data_gpu[k] = _torch.from_numpy(arr).cuda()
+        else:
+            self._torch = None
+            self.data_gpu = None
         self.reset()
 
     # ── reset  (mirrors tinyphysics.py lines 110-120) ────────
@@ -317,49 +368,43 @@ class BatchedSimulator:
         N, T = self.N, self.T
         CL = CONTEXT_LENGTH
 
-        # Per-episode RNGs seeded identically to TinyPhysicsModel.__init__
-        self.rngs = []
-        for f in self.csv_files:
-            seed = int(md5(('data/' + Path(f).name).encode()).hexdigest(), 16) % 10**4
-            self.rngs.append(np.random.RandomState(seed))
+        self._hist_len = CL
 
-        # Pre-allocate full-size arrays; write by index instead of concat
-        self.action_history = np.zeros((N, T), np.float64)
-        self.action_history[:, :CL] = self.data['steer_command'][:, :CL]
-
-        self.state_history = np.zeros((N, T, 3), np.float64)
-        self.state_history[:, :CL, 0] = self.data['roll_lataccel'][:, :CL]
-        self.state_history[:, :CL, 1] = self.data['v_ego'][:, :CL]
-        self.state_history[:, :CL, 2] = self.data['a_ego'][:, :CL]
-
-        self.current_lataccel_history = np.zeros((N, T), np.float64)
-        self.current_lataccel_history[:, :CL] = self.data['target_lataccel'][:, :CL]
-
-        self._hist_len = CL  # tracks how many columns are filled
-
-        # Pre-generate random values: only T-CL steps (matching reference which
-        # seeds RNG then immediately enters the loop at CONTEXT_LENGTH).
-        # Vectorized: one rng.rand(T-CL) call per episode instead of T*N scalar calls.
+        # RNG: use cached values if available, else generate
         n_steps = T - CL
-        self._rng_all = np.empty((n_steps, N), dtype=np.float32)
-        for i, rng in enumerate(self.rngs):
-            self._rng_all[:, i] = rng.rand(n_steps).astype(np.float32)
+        if self._cached_rng is not None:
+            # cached_rng is (N, n_steps), we need (n_steps, N)
+            self._rng_all = self._cached_rng.T.copy()
+        else:
+            self.rngs = []
+            for f in getattr(self, 'csv_files', []):
+                seed = int(md5(('data/' + Path(f).name).encode()).hexdigest(), 16) % 10**4
+                self.rngs.append(np.random.RandomState(seed))
+            self._rng_all = np.empty((n_steps, N), dtype=np.float32)
+            for i, rng in enumerate(self.rngs):
+                self._rng_all[:, i] = rng.rand(n_steps).astype(np.float32)
 
-        # GPU-resident mode: move histories + rng to GPU
-        self._gpu = os.getenv('CUDA', '0') == '1'
         if self._gpu:
-            import torch as _torch
-            self._torch = _torch
-            self.action_history = _torch.from_numpy(self.action_history).cuda()
-            self.state_history = _torch.from_numpy(self.state_history).cuda()
-            self.current_lataccel_history = _torch.from_numpy(
-                self.current_lataccel_history).cuda()
+            _torch = self._torch
+            self.action_history = _torch.zeros((N, T), dtype=_torch.float64, device='cuda')
+            self.action_history[:, :CL] = self.data_gpu['steer_command'][:, :CL]
+            self.state_history = _torch.zeros((N, T, 3), dtype=_torch.float64, device='cuda')
+            self.state_history[:, :CL, 0] = self.data_gpu['roll_lataccel'][:, :CL]
+            self.state_history[:, :CL, 1] = self.data_gpu['v_ego'][:, :CL]
+            self.state_history[:, :CL, 2] = self.data_gpu['a_ego'][:, :CL]
+            self.current_lataccel_history = _torch.zeros((N, T), dtype=_torch.float64, device='cuda')
+            self.current_lataccel_history[:, :CL] = self.data_gpu['target_lataccel'][:, :CL]
             self.current_lataccel = self.current_lataccel_history[:, CL - 1].clone()
             self._rng_all_gpu = _torch.from_numpy(self._rng_all).cuda()
-            # Cache numpy view of data for controller (read-only, stays on CPU)
-            self._target_lataccel_cpu = self.data['target_lataccel']
-            self._steer_command_cpu = self.data['steer_command']
         else:
+            self.action_history = np.zeros((N, T), np.float64)
+            self.action_history[:, :CL] = self.data['steer_command'][:, :CL]
+            self.state_history = np.zeros((N, T, 3), np.float64)
+            self.state_history[:, :CL, 0] = self.data['roll_lataccel'][:, :CL]
+            self.state_history[:, :CL, 1] = self.data['v_ego'][:, :CL]
+            self.state_history[:, :CL, 2] = self.data['a_ego'][:, :CL]
+            self.current_lataccel_history = np.zeros((N, T), np.float64)
+            self.current_lataccel_history[:, :CL] = self.data['target_lataccel'][:, :CL]
             self.current_lataccel = self.current_lataccel_history[:, CL - 1].copy()
             self._rng_all_gpu = None
 
@@ -424,8 +469,7 @@ class BatchedSimulator:
             if step_idx >= CONTROL_START_IDX:
                 self.current_lataccel = pred
             else:
-                self.current_lataccel = self.current_lataccel_history.new_tensor(
-                    self._target_lataccel_cpu[:, step_idx])
+                self.current_lataccel = self.data_gpu['target_lataccel'][:, step_idx].clone()
 
             self.current_lataccel_history[:, h] = self.current_lataccel
             self._hist_len += 1
@@ -467,8 +511,7 @@ class BatchedSimulator:
         if self._gpu:
             torch = self._torch
             if step_idx < CONTROL_START_IDX:
-                actions = self.action_history.new_tensor(
-                    self._steer_command_cpu[:, step_idx])
+                actions = self.data_gpu['steer_command'][:, step_idx]
             elif not isinstance(actions, torch.Tensor):
                 actions = self.action_history.new_tensor(actions)
             actions = torch.clamp(actions, STEER_RANGE[0], STEER_RANGE[1])
@@ -523,48 +566,59 @@ class BatchedSimulator:
     def rollout(self, controller_fn: Callable) -> Dict[str, np.ndarray]:
         """Run full rollout.
 
-        controller_fn(step_idx, target, current_lataccel, state_dict, future_plan)
-            → actions (N,)
+        GPU path: controller_fn(step_idx, sim) → GPU tensor actions (N,)
+          where sim has .data_gpu, .current_lataccel (GPU tensors)
+        CPU path: controller_fn(step_idx, target, current_lataccel, state_dict, future_plan)
+            → numpy actions (N,)
 
-        Returns dict with 'total_cost', 'lataccel_cost', 'jerk_cost' as (N,) arrays,
-        plus 'controller_info' = list of dicts returned by controller_fn (if any).
+        Returns dict with 'total_cost', 'lataccel_cost', 'jerk_cost' as (N,) arrays.
         """
         import time as _time
-        t_ctrl, t_sim, t_state = 0.0, 0.0, 0.0
-        for step_idx in range(CONTEXT_LENGTH, self.T):
-            _t0 = _time.perf_counter()
-            roll_la, v_ego, a_ego, target, future_plan = \
-                self.get_state_target_futureplan(step_idx)
-            state_dict = dict(roll_lataccel=roll_la, v_ego=v_ego, a_ego=a_ego)
-            t_state += _time.perf_counter() - _t0
+        t_ctrl, t_sim = 0.0, 0.0
+        CL = CONTEXT_LENGTH
 
-            _t0 = _time.perf_counter()
-            if self._gpu:
-                cur_la_np = self.current_lataccel.cpu().numpy()
-            else:
+        if self._gpu:
+            _torch = self._torch
+            dg = self.data_gpu
+            for step_idx in range(CL, self.T):
+                _t0 = _time.perf_counter()
+                # Controller receives step_idx + sim reference (all GPU)
+                actions = controller_fn(step_idx, self)
+                t_ctrl += _time.perf_counter() - _t0
+
+                _t0 = _time.perf_counter()
+                h = self._hist_len
+                # Write state from GPU data dict (zero CPU transfer)
+                self.state_history[:, h, 0] = dg['roll_lataccel'][:, step_idx]
+                self.state_history[:, h, 1] = dg['v_ego'][:, step_idx]
+                self.state_history[:, h, 2] = dg['a_ego'][:, step_idx]
+
+                self.control_step(step_idx, actions)
+                self.sim_step(step_idx)
+                t_sim += _time.perf_counter() - _t0
+        else:
+            for step_idx in range(CL, self.T):
+                roll_la, v_ego, a_ego, target, future_plan = \
+                    self.get_state_target_futureplan(step_idx)
+                state_dict = dict(roll_lataccel=roll_la, v_ego=v_ego, a_ego=a_ego)
+
                 cur_la_np = self.current_lataccel.copy()
-            actions = controller_fn(
-                step_idx, target, cur_la_np,
-                state_dict, future_plan)
-            t_ctrl += _time.perf_counter() - _t0
+                _t0 = _time.perf_counter()
+                actions = controller_fn(
+                    step_idx, target, cur_la_np,
+                    state_dict, future_plan)
+                t_ctrl += _time.perf_counter() - _t0
 
-            _t0 = _time.perf_counter()
-            # Write state to GPU history
-            h = self._hist_len
-            if self._gpu:
-                state_np = np.stack([roll_la, v_ego, a_ego], axis=-1)
-                self.state_history[:, h, :] = self._torch.from_numpy(
-                    np.ascontiguousarray(state_np)).cuda()
-            else:
+                _t0 = _time.perf_counter()
+                h = self._hist_len
                 self.state_history[:, h, 0] = roll_la
                 self.state_history[:, h, 1] = v_ego
                 self.state_history[:, h, 2] = a_ego
+                self.control_step(step_idx, actions)
+                self.sim_step(step_idx)
+                t_sim += _time.perf_counter() - _t0
 
-            self.control_step(step_idx, actions)
-            self.sim_step(step_idx)
-            t_sim += _time.perf_counter() - _t0
-
-        print(f"  [rollout N={self.N}] ctrl={t_ctrl:.1f}s  sim={t_sim:.1f}s  state={t_state:.1f}s  total={t_ctrl+t_sim+t_state:.1f}s", flush=True)
+        print(f"  [rollout N={self.N}] ctrl={t_ctrl:.1f}s  sim={t_sim:.1f}s  total={t_ctrl+t_sim:.1f}s", flush=True)
         return self.compute_cost()
 
     # ── compute_cost  (mirrors lines 186-193) ────────────────

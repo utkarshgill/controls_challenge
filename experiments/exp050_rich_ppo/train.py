@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT))
 from tinyphysics import (TinyPhysicsModel, TinyPhysicsSimulator, BaseController,
     CONTROL_START_IDX, COST_END_IDX, CONTEXT_LENGTH, FUTURE_PLAN_STEPS,
     STEER_RANGE, DEL_T, LAT_ACCEL_COST_MULTIPLIER, ACC_G, State, FuturePlan)
-from tinyphysics_batched import BatchedSimulator, pool_init, get_pool_cache, run_parallel_chunked
+from tinyphysics_batched import BatchedSimulator, CSVCache, pool_init, get_pool_cache, run_parallel_chunked
 
 torch.manual_seed(42)
 np.random.seed(42)
@@ -295,9 +295,19 @@ class PPO:
 
     def update(self, all_obs, all_raw, all_rew, all_val, all_done,
                critic_only=False):
-        obs_t = torch.FloatTensor(np.concatenate(all_obs)).to(DEV)
-        raw_t = torch.FloatTensor(np.concatenate(all_raw)).unsqueeze(-1).to(DEV)
-        adv, ret = self.gae(all_rew, all_val, all_done)
+        # Accept either numpy or GPU tensors
+        if isinstance(all_obs[0], torch.Tensor):
+            obs_t = torch.cat(all_obs, dim=0).to(DEV)
+            raw_t = torch.cat(all_raw, dim=0).unsqueeze(-1).to(DEV)
+            # GAE needs numpy — convert once
+            rew_np = [r.cpu().numpy() for r in all_rew]
+            val_np = [v.cpu().numpy() for v in all_val]
+            don_np = [d.cpu().numpy() for d in all_done]
+        else:
+            obs_t = torch.FloatTensor(np.concatenate(all_obs)).to(DEV)
+            raw_t = torch.FloatTensor(np.concatenate(all_raw)).unsqueeze(-1).to(DEV)
+            rew_np, val_np, don_np = all_rew, all_val, all_done
+        adv, ret = self.gae(rew_np, val_np, don_np)
         adv_t = torch.FloatTensor(adv).to(DEV)
         ret_t = torch.FloatTensor(ret).to(DEV)
 
@@ -414,48 +424,63 @@ def build_obs_batch(target, current, roll_la, v_ego, a_ego,
     return np.clip(obs, -5.0, 5.0)
 
 
-def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=None):
-    sim = BatchedSimulator(str(mdl_path), csv_files, ort_session=ort_session)
+def batched_rollout(csv_files, ac, mdl_path, deterministic=False,
+                    ort_session=None, csv_cache=None):
+    # Build simulator: use cached data if available
+    if csv_cache is not None:
+        data, rng_rows = csv_cache.slice(csv_files)
+        sim = BatchedSimulator(str(mdl_path), ort_session=ort_session,
+                               cached_data=data, cached_rng=rng_rows)
+    else:
+        sim = BatchedSimulator(str(mdl_path), csv_files, ort_session=ort_session)
     N = sim.N
     T = sim.T
-    _dev = next(ac.parameters()).device
 
-    # Pre-allocate ring buffers (index writes, no concat)
-    h_act   = np.zeros((N, HIST_LEN), np.float64)
-    h_act32 = np.zeros((N, HIST_LEN), np.float32)   # persistent float32 mirror
-    h_lat   = np.zeros((N, HIST_LEN), np.float32)
-    h_error = np.zeros((N, HIST_LEN), np.float32)
+    if USE_CUDA:
+        return _batched_rollout_gpu(sim, ac, N, T, deterministic)
+    else:
+        return _batched_rollout_cpu(sim, ac, N, T, deterministic)
 
-    # Pre-allocate obs output buffer
-    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 4  # core + h_act + h_lat + futures
-    obs_buf = np.empty((N, OBS_DIM), np.float32)
 
-    # Pre-allocate training data arrays (avoid 500 list appends + copies + np.stack)
+def _batched_rollout_gpu(sim, ac, N, T, deterministic):
+    """All-GPU rollout: controller builds obs on GPU, no CPU<->GPU per step."""
+    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 4
     max_steps = COST_END_IDX - CONTROL_START_IDX
-    all_obs = np.empty((max_steps, N, OBS_DIM), np.float32)
-    all_raw = np.empty((max_steps, N), np.float32)
-    all_val = np.empty((max_steps, N), np.float32)
-    tgt_hist = np.empty((max_steps, N), np.float64)
-    cur_hist = np.empty((max_steps, N), np.float64)
+    dg = sim.data_gpu  # GPU tensors: {roll_lataccel, v_ego, a_ego, target_lataccel, steer_command}
+
+    # GPU ring buffers
+    h_act   = torch.zeros((N, HIST_LEN), dtype=torch.float64, device='cuda')
+    h_act32 = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
+    h_lat   = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
+    h_error = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
+
+    # GPU obs buffer
+    obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device='cuda')
+
+    # GPU training data collection
+    if not deterministic:
+        all_obs = torch.empty((max_steps, N, OBS_DIM), dtype=torch.float32, device='cuda')
+        all_raw = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
+        all_val = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
+        tgt_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
+        cur_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
     step_ctr = 0
 
-    # Pre-compute future plan slices (avoid per-step dict/slice overhead)
-    fdata = sim.data
+    def controller_fn(step_idx, sim_ref):
+        nonlocal step_ctr
 
-    def controller_fn(step_idx, target, current_la, state_dict, future_plan):
-        nonlocal h_act, h_act32, h_lat, h_error, step_ctr
+        target     = dg['target_lataccel'][:, step_idx]
+        current_la = sim_ref.current_lataccel
+        roll_la    = dg['roll_lataccel'][:, step_idx]
+        v_ego      = dg['v_ego'][:, step_idx]
+        a_ego      = dg['a_ego'][:, step_idx]
 
-        roll_la = state_dict['roll_lataccel']
-        v_ego   = state_dict['v_ego']
-        a_ego   = state_dict['a_ego']
+        cla32 = current_la.float()
+        error = (target - current_la).float()
 
-        cla32  = current_la.astype(np.float32)
-        error  = (target - current_la).astype(np.float32)
-
-        # Shift left by 1 and write new value (no allocation)
         h_error[:, :-1] = h_error[:, 1:]
         h_error[:, -1] = error
-        error_integral = h_error.mean(axis=1) * DEL_T
+        error_integral = h_error.mean(dim=1) * DEL_T
 
         if step_idx < CONTROL_START_IDX:
             h_act[:, :-1] = h_act[:, 1:]
@@ -464,14 +489,14 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
             h_act32[:, -1] = 0.0
             h_lat[:, :-1] = h_lat[:, 1:]
             h_lat[:, -1] = cla32
-            return np.zeros(N)
+            return torch.zeros(N, dtype=torch.float64, device='cuda')
 
-        # === Inline obs building ===
-        v2 = np.maximum(v_ego * v_ego, 1.0)
+        # === Obs building on GPU ===
+        v2 = torch.clamp(v_ego * v_ego, min=1.0)
         k_tgt = (target - roll_la) / v2
         k_cur = (current_la - roll_la) / v2
-        fplan_lat0 = fdata['target_lataccel'][:, min(step_idx + 1, T - 1)]
-        fric = np.sqrt(current_la**2 + a_ego**2) / 7.0
+        fplan_lat0 = dg['target_lataccel'][:, min(step_idx + 1, T - 1)]
+        fric = torch.sqrt(current_la**2 + a_ego**2) / 7.0
 
         c = 0
         obs_buf[:, c] = target / S_LAT;                    c += 1
@@ -489,11 +514,146 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
         obs_buf[:, c] = (current_la - h_lat[:, -1]) / DEL_T / S_LAT; c += 1
         obs_buf[:, c] = (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER; c += 1
         obs_buf[:, c] = fric;                               c += 1
-        obs_buf[:, c] = np.maximum(0.0, 1.0 - fric);       c += 1
+        obs_buf[:, c] = torch.clamp(1.0 - fric, min=0.0);  c += 1
 
         obs_buf[:, c:c+HIST_LEN] = h_act32 / S_STEER;     c += HIST_LEN
         obs_buf[:, c:c+HIST_LEN] = h_lat / S_LAT;          c += HIST_LEN
 
+        end = min(step_idx + FUTURE_PLAN_STEPS, T)
+        for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
+                            ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
+            slc = dg[attr][:, step_idx+1:end]
+            w = slc.shape[1]
+            if w == 0:
+                fb = dg[attr][:, step_idx]
+                obs_buf[:, c:c+FUTURE_K] = (fb / scale).float().unsqueeze(1)
+            elif w < FUTURE_K:
+                obs_buf[:, c:c+w] = slc.float() / scale
+                obs_buf[:, c+w:c+FUTURE_K] = (slc[:, -1:].float() / scale)
+            else:
+                obs_buf[:, c:c+FUTURE_K] = slc[:, :FUTURE_K].float() / scale
+            c += FUTURE_K
+
+        obs_buf.clamp_(-5.0, 5.0)
+
+        with torch.inference_mode():
+            a_p, b_p = ac.beta_params(obs_buf)
+            val = ac.critic(obs_buf).squeeze(-1)
+
+        if deterministic:
+            raw = 2.0 * a_p / (a_p + b_p) - 1.0
+        else:
+            x = torch.distributions.Beta(a_p, b_p).sample()
+            raw = 2.0 * x - 1.0
+
+        delta  = (raw.double() * DELTA_SCALE).clamp(-MAX_DELTA, MAX_DELTA)
+        action = (h_act[:, -1] + delta).clamp(STEER_RANGE[0], STEER_RANGE[1])
+
+        # Shift and write
+        h_act[:, :-1] = h_act[:, 1:]
+        h_act[:, -1] = action
+        h_act32[:, :-1] = h_act32[:, 1:]
+        h_act32[:, -1] = action.float()
+        h_lat[:, :-1] = h_lat[:, 1:]
+        h_lat[:, -1] = cla32
+
+        if not deterministic and step_idx < COST_END_IDX:
+            all_obs[step_ctr] = obs_buf
+            all_raw[step_ctr] = raw
+            all_val[step_ctr] = val
+            tgt_hist[step_ctr] = target
+            cur_hist[step_ctr] = current_la
+            step_ctr += 1
+
+        return action
+
+    cost_dict = sim.rollout(controller_fn)
+    total_costs = cost_dict['total_cost']  # numpy (N,)
+
+    if deterministic:
+        return total_costs.tolist()
+
+    # Training data is already on GPU — compute rewards on GPU
+    S = step_ctr
+    tgt_arr = tgt_hist[:S].T                                   # (N, S)
+    cur_arr = cur_hist[:S].T
+    lat_r = (tgt_arr - cur_arr)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
+    jerk_r = torch.diff(cur_arr, dim=1, prepend=cur_arr[:, :1]) / DEL_T
+    rew = (-(lat_r + jerk_r**2 * 100) / 500.0).float()        # (N, S)
+    dones = torch.zeros((N, S), dtype=torch.float32, device='cuda')
+    dones[:, -1] = 1.0
+
+    # Return GPU tensors + float costs. PPO.update will consume directly.
+    obs_g = all_obs[:S].permute(1, 0, 2)                       # (N, S, OBS)
+    raw_g = all_raw[:S].T                                       # (N, S)
+    val_g = all_val[:S].T                                       # (N, S)
+
+    results = []
+    for i in range(N):
+        results.append((obs_g[i], raw_g[i], rew[i], val_g[i], dones[i], float(total_costs[i])))
+    return results
+
+
+def _batched_rollout_cpu(sim, ac, N, T, deterministic):
+    """Original CPU path (unchanged logic, numpy-based)."""
+    _dev = next(ac.parameters()).device
+    h_act   = np.zeros((N, HIST_LEN), np.float64)
+    h_act32 = np.zeros((N, HIST_LEN), np.float32)
+    h_lat   = np.zeros((N, HIST_LEN), np.float32)
+    h_error = np.zeros((N, HIST_LEN), np.float32)
+    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 4
+    obs_buf = np.empty((N, OBS_DIM), np.float32)
+    max_steps = COST_END_IDX - CONTROL_START_IDX
+    all_obs = np.empty((max_steps, N, OBS_DIM), np.float32)
+    all_raw = np.empty((max_steps, N), np.float32)
+    all_val = np.empty((max_steps, N), np.float32)
+    tgt_hist = np.empty((max_steps, N), np.float64)
+    cur_hist = np.empty((max_steps, N), np.float64)
+    step_ctr = 0
+    fdata = sim.data
+
+    def controller_fn(step_idx, target, current_la, state_dict, future_plan):
+        nonlocal h_act, h_act32, h_lat, h_error, step_ctr
+        roll_la = state_dict['roll_lataccel']
+        v_ego   = state_dict['v_ego']
+        a_ego   = state_dict['a_ego']
+        cla32  = current_la.astype(np.float32)
+        error  = (target - current_la).astype(np.float32)
+        h_error[:, :-1] = h_error[:, 1:]
+        h_error[:, -1] = error
+        error_integral = h_error.mean(axis=1) * DEL_T
+        if step_idx < CONTROL_START_IDX:
+            h_act[:, :-1] = h_act[:, 1:]
+            h_act[:, -1] = 0.0
+            h_act32[:, :-1] = h_act32[:, 1:]
+            h_act32[:, -1] = 0.0
+            h_lat[:, :-1] = h_lat[:, 1:]
+            h_lat[:, -1] = cla32
+            return np.zeros(N)
+        v2 = np.maximum(v_ego * v_ego, 1.0)
+        k_tgt = (target - roll_la) / v2
+        k_cur = (current_la - roll_la) / v2
+        fplan_lat0 = fdata['target_lataccel'][:, min(step_idx + 1, T - 1)]
+        fric = np.sqrt(current_la**2 + a_ego**2) / 7.0
+        c = 0
+        obs_buf[:, c] = target / S_LAT;                    c += 1
+        obs_buf[:, c] = current_la / S_LAT;                c += 1
+        obs_buf[:, c] = (target - current_la) / S_LAT;     c += 1
+        obs_buf[:, c] = k_tgt / S_CURV;                    c += 1
+        obs_buf[:, c] = k_cur / S_CURV;                    c += 1
+        obs_buf[:, c] = (k_tgt - k_cur) / S_CURV;          c += 1
+        obs_buf[:, c] = v_ego / S_VEGO;                    c += 1
+        obs_buf[:, c] = a_ego / S_AEGO;                    c += 1
+        obs_buf[:, c] = roll_la / S_ROLL;                  c += 1
+        obs_buf[:, c] = h_act32[:, -1] / S_STEER;          c += 1
+        obs_buf[:, c] = error_integral / S_LAT;            c += 1
+        obs_buf[:, c] = (fplan_lat0 - target) / DEL_T / S_LAT; c += 1
+        obs_buf[:, c] = (current_la - h_lat[:, -1]) / DEL_T / S_LAT; c += 1
+        obs_buf[:, c] = (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER; c += 1
+        obs_buf[:, c] = fric;                               c += 1
+        obs_buf[:, c] = np.maximum(0.0, 1.0 - fric);       c += 1
+        obs_buf[:, c:c+HIST_LEN] = h_act32 / S_STEER;     c += HIST_LEN
+        obs_buf[:, c:c+HIST_LEN] = h_lat / S_LAT;          c += HIST_LEN
         end = min(step_idx + FUTURE_PLAN_STEPS, T)
         for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
                             ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
@@ -509,64 +669,48 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
             else:
                 obs_buf[:, c:c+FUTURE_K] = slc[:, :FUTURE_K].astype(np.float32) / scale
             c += FUTURE_K
-
         np.clip(obs_buf, -5.0, 5.0, out=obs_buf)
-
         obs_t = torch.from_numpy(obs_buf).to(_dev)
         with torch.inference_mode():
             a_p, b_p = ac.beta_params(obs_t)
             val = ac.critic(obs_t).squeeze(-1).cpu().numpy()
-
         if deterministic:
             raw = (2.0 * a_p / (a_p + b_p) - 1.0).cpu().numpy()
         else:
             x   = torch.distributions.Beta(a_p, b_p).sample()
             raw = (2.0 * x - 1.0).cpu().numpy()
-
         delta  = np.clip(raw.astype(np.float64) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
         action = np.clip(h_act[:, -1] + delta, STEER_RANGE[0], STEER_RANGE[1])
-
-        # Shift and write (no allocation); keep h_act32 in sync
         h_act[:, :-1] = h_act[:, 1:]
         h_act[:, -1] = action
         h_act32[:, :-1] = h_act32[:, 1:]
-        h_act32[:, -1] = action  # numpy auto-casts f64→f32
+        h_act32[:, -1] = action
         h_lat[:, :-1] = h_lat[:, 1:]
         h_lat[:, -1] = cla32
-
         if step_idx < COST_END_IDX:
-            # Write directly into pre-allocated arrays (no .copy() needed —
-            # obs_buf is overwritten next step, so the data persists here)
             all_obs[step_ctr] = obs_buf
             all_raw[step_ctr] = raw
             all_val[step_ctr] = val
             tgt_hist[step_ctr] = target
             cur_hist[step_ctr] = current_la
             step_ctr += 1
-
         return action
 
     cost_dict = sim.rollout(controller_fn)
-    total_costs = cost_dict['total_cost']  # (N,)
-
+    total_costs = cost_dict['total_cost']
     if deterministic:
         return total_costs.tolist()
-
-    # Trim to actual steps collected, transpose to (N, S, ...)
     S = step_ctr
-    obs_arr = np.ascontiguousarray(all_obs[:S].transpose(1, 0, 2))  # (N, S, OBS)
-    raw_arr = np.ascontiguousarray(all_raw[:S].T)                    # (N, S)
-    val_arr = np.ascontiguousarray(all_val[:S].T)                    # (N, S)
-    tgt_arr = tgt_hist[:S].T                                         # (N, S)
-    cur_arr = cur_hist[:S].T                                         # (N, S)
-
-    # Vectorized reward computation (no per-episode loop)
+    obs_arr = np.ascontiguousarray(all_obs[:S].transpose(1, 0, 2))
+    raw_arr = np.ascontiguousarray(all_raw[:S].T)
+    val_arr = np.ascontiguousarray(all_val[:S].T)
+    tgt_arr = tgt_hist[:S].T
+    cur_arr = cur_hist[:S].T
     lat_r = (tgt_arr - cur_arr)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
     jerk_r = np.diff(cur_arr, axis=1, prepend=cur_arr[:, :1]) / DEL_T
-    rew = (-(lat_r + jerk_r**2 * 100) / 500.0).astype(np.float32)  # (N, S)
+    rew = (-(lat_r + jerk_r**2 * 100) / 500.0).astype(np.float32)
     dones = np.zeros((N, S), np.float32)
     dones[:, -1] = 1.0
-
     results = []
     for i in range(N):
         results.append((obs_arr[i], raw_arr[i], rew[i], val_arr[i], dones[i], float(total_costs[i])))
@@ -818,8 +962,12 @@ class Ctx:
             from tinyphysics_batched import make_ort_session
             self.ort_session = make_ort_session(self.mdl_path)
             self.pool = None
+            # Pre-load all CSVs once (training + eval)
+            all_csv = list(set([str(f) for f in self.tr_f + self.va_f]))
+            self.csv_cache = CSVCache(all_csv)
         else:
             self.ort_session = None
+            self.csv_cache = None
             self.pool = multiprocessing.Pool(
                 WORKERS, initializer=_pool_init, initargs=(self.mdl_path,))
         self.ac.to(DEV)
@@ -871,7 +1019,8 @@ def evaluate(ctx, files, n=EVAL_N):
 
     if USE_CUDA:
         costs = batched_rollout(local_files, ctx.ac, ctx.mdl_path,
-                                deterministic=True, ort_session=ctx.ort_session)
+                                deterministic=True, ort_session=ctx.ort_session,
+                                csv_cache=ctx.csv_cache)
     elif BATCHED:
         costs = run_parallel_chunked(ctx.pool, local_files,
                                      _batched_eval_worker, WORKERS,
@@ -895,7 +1044,8 @@ def train_one_epoch(epoch, ctx, warmup_off=0):
     if DECAY_LR:
         ctx.ppo.set_lr(epoch, MAX_EP)
     t0 = time.time()
-    ctx.save_ckpt(TMP)
+    if USE_REMOTE:
+        ctx.save_ckpt(TMP)
     batch = random.sample(ctx.tr_f, min(CSVS_EPOCH, len(ctx.tr_f)))
 
     local_batch, remote_slices = _split_files(batch) if USE_REMOTE else (batch, [])
@@ -919,7 +1069,8 @@ def train_one_epoch(epoch, ctx, warmup_off=0):
     tl0 = time.time()
     if USE_CUDA:
         res = batched_rollout(local_batch, ctx.ac, ctx.mdl_path,
-                              deterministic=False, ort_session=ctx.ort_session)
+                              deterministic=False, ort_session=ctx.ort_session,
+                              csv_cache=ctx.csv_cache)
     elif BATCHED:
         res = run_parallel_chunked(ctx.pool, local_batch,
                                    _batched_train_worker, WORKERS,
