@@ -38,12 +38,28 @@ def make_ort_session(model_path):
     options.intra_op_num_threads = ORT_THREADS
     options.inter_op_num_threads = ORT_THREADS
     options.log_severity_level = 3
+    use_cuda = os.getenv('CUDA', '0') == '1'
+    use_trt = os.getenv('TRT', '0') == '1'
+    if use_trt:
+        trt_opts = {
+            'trt_fp16_enable': True,
+            'trt_engine_cache_enable': True,
+            'trt_engine_cache_path': str(Path(model_path).parent),
+            'trt_max_workspace_size': str(2 << 30),  # 2 GB
+        }
+        providers = [
+            ('TensorrtExecutionProvider', trt_opts),
+            ('CUDAExecutionProvider', {}),
+            ('CPUExecutionProvider', {}),
+        ]
+    elif use_cuda:
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    else:
+        providers = ['CPUExecutionProvider']
     with open(str(model_path), 'rb') as f:
-        providers = (['CUDAExecutionProvider', 'CPUExecutionProvider']
-                     if os.getenv('CUDA', '0') == '1' else ['CPUExecutionProvider'])
         sess = ort.InferenceSession(f.read(), options, providers)
         actual = sess.get_providers()
-        print(f"[ORT] requested={providers}  actual={actual}")
+        print(f"[ORT] requested={[p if isinstance(p,str) else p[0] for p in providers]}  actual={actual}")
         return sess
 
 
