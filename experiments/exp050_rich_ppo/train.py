@@ -726,7 +726,7 @@ def _seq_eval_worker(args):
 
 class Ctx:
     def __init__(self):
-        self.ac  = ActorCritic().to(DEV)
+        self.ac  = ActorCritic()
         self.ppo = PPO(self.ac)
         self.mdl_path = ROOT / 'models' / 'tinyphysics.onnx'
         all_f = sorted((ROOT / 'data').glob('*.csv'))
@@ -739,6 +739,8 @@ class Ctx:
         self.best_ep = -1
         self.pool = multiprocessing.Pool(
             WORKERS, initializer=_pool_init, initargs=(self.mdl_path,))
+        # Move to GPU AFTER fork so workers don't inherit broken CUDA context
+        self.ac.to(DEV)
 
     def save_ckpt(self, path=TMP):
         torch.save({'ac': self.ac.state_dict()}, path)
