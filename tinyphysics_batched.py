@@ -149,25 +149,28 @@ class BatchedPhysicsModel:
         return self._predict_cpu(input_data, temperature, rngs)
 
     def _predict_gpu(self, input_data, temperature, rngs):
-        """IOBinding: inputs copy to GPU, output STAYS on GPU.
-        Softmax + sampling done on GPU via torch. Only token indices come back."""
+        """IOBinding: inputs copy to GPU, output written directly into
+        pre-allocated torch tensor on GPU. Softmax + sampling on GPU.
+        Only N ints come back to CPU."""
         torch = self._torch
+        N, CL = input_data['states'].shape[:2]
+
         io = self.ort_session.io_binding()
         io.bind_cpu_input('states', np.ascontiguousarray(input_data['states']))
         io.bind_cpu_input('tokens', np.ascontiguousarray(input_data['tokens']))
-        io.bind_output(self._out_name, 'cuda', 0)
+
+        # Pre-allocate output on GPU; ONNX writes directly into it
+        out_gpu = torch.empty((N, CL, VOCAB_SIZE), dtype=torch.float32, device='cuda')
+        io.bind_output(self._out_name, 'cuda', 0, np.float32,
+                       list(out_gpu.shape), out_gpu.data_ptr())
+
         self.ort_session.run_with_iobinding(io)
 
-        # Output stays on GPU — zero-copy to torch
-        ort_out = io.get_outputs()[0]
-        res = torch.from_dlpack(ort_out)              # (N, CL, VOCAB) on cuda
-
-        # Softmax on GPU
-        probs = torch.softmax(res[:, -1, :] / temperature, dim=-1)
+        # Softmax on GPU (only last timestep)
+        probs = torch.softmax(out_gpu[:, -1, :] / temperature, dim=-1)
         self._last_probs = probs.cpu().numpy()         # cache for expected-value
 
         # Sampling on GPU
-        N = probs.shape[0]
         cumprobs = torch.cumsum(probs, dim=1)
         if rngs is not None:
             u = torch.tensor([rng.rand() for rng in rngs],
