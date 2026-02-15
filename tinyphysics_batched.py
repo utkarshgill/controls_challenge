@@ -280,9 +280,11 @@ class BatchedSimulator:
         """
         CL = CONTEXT_LENGTH
         h = self._hist_len
+        # state & action already written at index h → h-CL+1:h+1
+        # current_lataccel not yet written → h-CL:h
         result = self.sim_model.get_current_lataccel(
-            sim_states=self.state_history[:, h-CL:h, :],
-            actions=self.action_history[:, h-CL:h],
+            sim_states=self.state_history[:, h-CL+1:h+1, :],
+            actions=self.action_history[:, h-CL+1:h+1],
             past_preds=self.current_lataccel_history[:, h-CL:h],
             rngs=self.rngs,
             return_expected=self.compute_expected,
@@ -359,19 +361,26 @@ class BatchedSimulator:
         Returns dict with 'total_cost', 'lataccel_cost', 'jerk_cost' as (N,) arrays,
         plus 'controller_info' = list of dicts returned by controller_fn (if any).
         """
+        import time as _time
+        t_ctrl, t_sim, t_state = 0.0, 0.0, 0.0
         for step_idx in range(CONTEXT_LENGTH, self.T):
-            # Peek at this step's data for the controller (same as step() reads)
+            _t0 = _time.perf_counter()
             roll_la, v_ego, a_ego, target, future_plan = \
                 self.get_state_target_futureplan(step_idx)
-
             state_dict = dict(roll_lataccel=roll_la, v_ego=v_ego, a_ego=a_ego)
+            t_state += _time.perf_counter() - _t0
 
+            _t0 = _time.perf_counter()
             actions = controller_fn(
                 step_idx, target, self.current_lataccel.copy(),
                 state_dict, future_plan)
+            t_ctrl += _time.perf_counter() - _t0
 
+            _t0 = _time.perf_counter()
             self.step(step_idx, actions)
+            t_sim += _time.perf_counter() - _t0
 
+        print(f"  [rollout N={self.N}] ctrl={t_ctrl:.1f}s  sim={t_sim:.1f}s  state={t_state:.1f}s  total={t_ctrl+t_sim+t_state:.1f}s", flush=True)
         return self.compute_cost()
 
     # ── compute_cost  (mirrors lines 186-193) ────────────────
