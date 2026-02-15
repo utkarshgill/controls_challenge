@@ -41,7 +41,10 @@ def make_ort_session(model_path):
     with open(str(model_path), 'rb') as f:
         providers = (['CUDAExecutionProvider', 'CPUExecutionProvider']
                      if os.getenv('CUDA', '0') == '1' else ['CPUExecutionProvider'])
-        return ort.InferenceSession(f.read(), options, providers)
+        sess = ort.InferenceSession(f.read(), options, providers)
+        actual = sess.get_providers()
+        print(f"[ORT] requested={providers}  actual={actual}")
+        return sess
 
 
 def pool_init(model_path):
@@ -150,10 +153,11 @@ class BatchedPhysicsModel:
         N = probs.shape[0]
 
         if rngs is not None:
-            # Per-episode seeded sampling — matches reference exactly
-            samples = np.empty(N, dtype=np.intp)
-            for i in range(N):
-                samples[i] = rngs[i].choice(probs.shape[1], p=probs[i])
+            # Vectorized seeded sampling — advances each RNG once per step
+            cumprobs = np.cumsum(probs, axis=1)
+            u = np.array([rng.rand() for rng in rngs], dtype=np.float64)[:, None]
+            samples = (cumprobs < u).sum(axis=1).astype(np.intp)
+            samples = np.clip(samples, 0, VOCAB_SIZE - 1)
         else:
             # Vectorized sampling (fast, non-deterministic vs reference)
             cumprobs = np.cumsum(probs, axis=1)
