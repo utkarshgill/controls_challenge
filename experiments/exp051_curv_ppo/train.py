@@ -127,7 +127,7 @@ def build_obs(target, current, state, fplan,
         core,
         np.array(hist_act, np.float32) / S_STEER,
         np.array(hist_lat, np.float32) / S_LAT,
-        (_future_raw(fplan, 'lataccel', target) - _future_raw(fplan, 'roll_lataccel', state.roll_lataccel)) * 10000.0
+        (_future_raw(fplan, 'lataccel', target) - _future_raw(fplan, 'roll_lataccel', state.roll_lataccel)) * 1000.0
             / np.maximum(_future_raw(fplan, 'v_ego', state.v_ego) ** 2, 1.0) / S_CURV,
         _future_raw(fplan, 'a_ego', state.a_ego) / S_AEGO,
     ])
@@ -460,7 +460,7 @@ def build_obs_batch(target, current, roll_la, v_ego, a_ego,
     f_roll = _pad_future('roll_lataccel')
     f_v    = _pad_future('v_ego')
     f_a    = _pad_future('a_ego')
-    f_curv = (f_lat - f_roll) * 10000.0 / np.maximum(f_v ** 2, 1.0) / S_CURV
+    f_curv = (f_lat - f_roll) * 1000.0 / np.maximum(f_v ** 2, 1.0) / S_CURV
 
     obs = np.concatenate([core, h_act32 / S_STEER, h_lat / S_LAT,
                           f_curv, f_a / S_AEGO], axis=1)
@@ -574,7 +574,7 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
         f_lat  = _gpu_pad('target_lataccel')
         f_roll = _gpu_pad('roll_lataccel')
         f_v    = _gpu_pad('v_ego')
-        f_curv = (f_lat - f_roll) * 10000.0 / torch.clamp(f_v ** 2, min=1.0) / S_CURV
+        f_curv = (f_lat - f_roll) * 1000.0 / torch.clamp(f_v ** 2, min=1.0) / S_CURV
         f_a    = _gpu_pad('a_ego') / S_AEGO
         obs_buf[:, c:c+FUTURE_K] = f_curv;  c += FUTURE_K
         obs_buf[:, c:c+FUTURE_K] = f_a;     c += FUTURE_K
@@ -709,7 +709,7 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
         f_lat  = _cpu_pad('target_lataccel', target)
         f_roll = _cpu_pad('roll_lataccel', roll_la)
         f_v    = _cpu_pad('v_ego', v_ego)
-        f_curv = (f_lat - f_roll) * 10000.0 / np.maximum(f_v ** 2, 1.0) / S_CURV
+        f_curv = (f_lat - f_roll) * 1000.0 / np.maximum(f_v ** 2, 1.0) / S_CURV
         f_a    = _cpu_pad('a_ego', a_ego) / S_AEGO
         obs_buf[:, c:c+FUTURE_K] = f_curv;  c += FUTURE_K
         obs_buf[:, c:c+FUTURE_K] = f_a;     c += FUTURE_K

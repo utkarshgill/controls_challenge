@@ -178,7 +178,7 @@ class Controller(BaseController):
             core,
             np.array(h_act, np.float32) / S_STEER,
             np.array(h_lat, np.float32) / S_LAT,
-            (_future_raw(future_plan, 'lataccel', target_lataccel) - _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel)) * 10000.0
+            (_future_raw(future_plan, 'lataccel', target_lataccel) - _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel)) * 1000.0
                 / np.maximum(_future_raw(future_plan, 'v_ego', state.v_ego) ** 2, 1.0) / S_CURV,
             _future_raw(future_plan, 'a_ego', state.a_ego) / S_AEGO,
         ])
@@ -217,7 +217,7 @@ class Controller(BaseController):
         f_lat  = _future_raw(future_plan, 'lataccel', target)
         f_roll = _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel)
         f_v    = _future_raw(future_plan, 'v_ego', state.v_ego)
-        f_curv = (f_lat - f_roll) * 10000.0 / np.maximum(f_v ** 2, 1.0) / S_CURV
+        f_curv = (f_lat - f_roll) * 1000.0 / np.maximum(f_v ** 2, 1.0) / S_CURV
         fp = np.concatenate([
             f_curv,
             _future_raw(future_plan, 'a_ego', state.a_ego) / S_AEGO,
@@ -488,7 +488,7 @@ class Controller(BaseController):
         f_lat  = _future_raw(future_plan, 'lataccel', target)
         f_roll = _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel)
         f_v    = _future_raw(future_plan, 'v_ego', state.v_ego)
-        f_curv = (f_lat - f_roll) * 10000.0 / np.maximum(f_v ** 2, 1.0) / S_CURV
+        f_curv = (f_lat - f_roll) * 1000.0 / np.maximum(f_v ** 2, 1.0) / S_CURV
         fp = torch.tensor(np.concatenate([
             f_curv,
             _future_raw(future_plan, 'a_ego', state.a_ego) / S_AEGO,
