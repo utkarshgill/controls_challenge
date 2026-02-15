@@ -131,6 +131,11 @@ class BatchedPhysicsModel:
             self.ort_session = ort_session
         else:
             self.ort_session = make_ort_session(model_path)
+        self._use_gpu = os.getenv('CUDA', '0') == '1'
+        if self._use_gpu:
+            import torch
+            self._torch = torch
+            self._out_name = self.ort_session.get_outputs()[0].name
 
     def softmax(self, x, axis=-1):
         """Mirrors TinyPhysicsModel.softmax."""
@@ -139,32 +144,53 @@ class BatchedPhysicsModel:
 
     def predict(self, input_data: dict, temperature=0.8,
                 rngs: list = None) -> np.ndarray:
-        """Batched predict.  Mirrors TinyPhysicsModel.predict.
+        if self._use_gpu:
+            return self._predict_gpu(input_data, temperature, rngs)
+        return self._predict_cpu(input_data, temperature, rngs)
 
-        rngs: optional list of N np.random.RandomState objects (per-episode).
-              When provided, uses np.random.choice per row to match the
-              reference TinyPhysicsModel.predict exactly.
-        Returns: (N,) int64 token indices.
-        """
+    def _predict_gpu(self, input_data, temperature, rngs):
+        """IOBinding: inputs copy to GPU, output STAYS on GPU.
+        Softmax + sampling done on GPU via torch. Only token indices come back."""
+        torch = self._torch
+        io = self.ort_session.io_binding()
+        io.bind_cpu_input('states', np.ascontiguousarray(input_data['states']))
+        io.bind_cpu_input('tokens', np.ascontiguousarray(input_data['tokens']))
+        io.bind_output(self._out_name, 'cuda', 0)
+        self.ort_session.run_with_iobinding(io)
+
+        # Output stays on GPU — zero-copy to torch
+        ort_out = io.get_outputs()[0]
+        res = torch.from_dlpack(ort_out)              # (N, CL, VOCAB) on cuda
+
+        # Softmax on GPU
+        probs = torch.softmax(res[:, -1, :] / temperature, dim=-1)
+        self._last_probs = probs.cpu().numpy()         # cache for expected-value
+
+        # Sampling on GPU
+        N = probs.shape[0]
+        cumprobs = torch.cumsum(probs, dim=1)
+        if rngs is not None:
+            u = torch.tensor([rng.rand() for rng in rngs],
+                             dtype=torch.float32, device='cuda').unsqueeze(1)
+        else:
+            u = torch.rand(N, 1, device='cuda')
+        samples = (cumprobs < u).sum(dim=1).clamp(0, VOCAB_SIZE - 1)
+        return samples.cpu().numpy().astype(np.intp)
+
+    def _predict_cpu(self, input_data, temperature, rngs):
+        """Original CPU path."""
         res = self.ort_session.run(None, input_data)[0]  # (N, CL, VOCAB_SIZE)
         probs = self.softmax(res / temperature, axis=-1)
-        probs = probs[:, -1, :]                           # (N, VOCAB_SIZE)
-        self._last_probs = probs                           # cache for expected-value
+        probs = probs[:, -1, :]
+        self._last_probs = probs
         N = probs.shape[0]
-
+        cumprobs = np.cumsum(probs, axis=1)
         if rngs is not None:
-            # Vectorized seeded sampling — advances each RNG once per step
-            cumprobs = np.cumsum(probs, axis=1)
             u = np.array([rng.rand() for rng in rngs], dtype=np.float64)[:, None]
-            samples = (cumprobs < u).sum(axis=1).astype(np.intp)
-            samples = np.clip(samples, 0, VOCAB_SIZE - 1)
         else:
-            # Vectorized sampling (fast, non-deterministic vs reference)
-            cumprobs = np.cumsum(probs, axis=1)
             u = np.random.rand(N, 1)
-            samples = (cumprobs < u).sum(axis=1)
-            samples = np.clip(samples, 0, VOCAB_SIZE - 1)
-        return samples
+        samples = (cumprobs < u).sum(axis=1).astype(np.intp)
+        return np.clip(samples, 0, VOCAB_SIZE - 1)
 
     def get_current_lataccel(self, sim_states: np.ndarray,
                              actions: np.ndarray,
