@@ -281,8 +281,8 @@ class BatchedPhysicsModel:
 
         input_data = {'states': states, 'tokens': tokens}
         sample_tokens = self.predict(input_data, temperature=0.8, rng_u=rng_u)
-        # sample_tokens is a GPU int tensor — decode on GPU
-        sampled = self._bins_f32_gpu[sample_tokens].double()
+        # Decode on GPU using float64 bins (must match numpy tokenizer precision)
+        sampled = self._bins_gpu[sample_tokens]
 
         if not return_expected:
             return sampled
