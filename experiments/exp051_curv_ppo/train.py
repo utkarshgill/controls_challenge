@@ -487,7 +487,7 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False,
 
 def _batched_rollout_gpu(sim, ac, N, T, deterministic):
     """All-GPU rollout: controller builds obs on GPU, no CPU<->GPU per step."""
-    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 4
+    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 2  # curv + a_ego
     max_steps = COST_END_IDX - CONTROL_START_IDX
     dg = sim.data_gpu  # GPU tensors: {roll_lataccel, v_ego, a_ego, target_lataccel, steer_command}
 
@@ -563,19 +563,21 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
         obs_buf[:, c:c+HIST_LEN] = h_lat / S_LAT;          c += HIST_LEN
 
         end = min(step_idx + FUTURE_PLAN_STEPS, T)
-        for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
-                            ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
+        def _gpu_pad(attr):
             slc = dg[attr][:, step_idx+1:end]
             w = slc.shape[1]
             if w == 0:
-                fb = dg[attr][:, step_idx]
-                obs_buf[:, c:c+FUTURE_K] = (fb / scale).float().unsqueeze(1)
+                return dg[attr][:, step_idx].float().unsqueeze(1).expand(-1, FUTURE_K)
             elif w < FUTURE_K:
-                obs_buf[:, c:c+w] = slc.float() / scale
-                obs_buf[:, c+w:c+FUTURE_K] = (slc[:, -1:].float() / scale)
-            else:
-                obs_buf[:, c:c+FUTURE_K] = slc[:, :FUTURE_K].float() / scale
-            c += FUTURE_K
+                return torch.cat([slc.float(), slc[:, -1:].float().expand(-1, FUTURE_K - w)], 1)
+            return slc[:, :FUTURE_K].float()
+        f_lat  = _gpu_pad('target_lataccel')
+        f_roll = _gpu_pad('roll_lataccel')
+        f_v    = _gpu_pad('v_ego')
+        f_curv = (f_lat - f_roll) * 10000.0 / torch.clamp(f_v ** 2, min=1.0) / S_CURV
+        f_a    = _gpu_pad('a_ego') / S_AEGO
+        obs_buf[:, c:c+FUTURE_K] = f_curv;  c += FUTURE_K
+        obs_buf[:, c:c+FUTURE_K] = f_a;     c += FUTURE_K
 
         obs_buf.clamp_(-5.0, 5.0)
 
@@ -641,7 +643,7 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
     h_act32 = np.zeros((N, HIST_LEN), np.float32)
     h_lat   = np.zeros((N, HIST_LEN), np.float32)
     h_error = np.zeros((N, HIST_LEN), np.float32)
-    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 4
+    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 2  # curv + a_ego
     obs_buf = np.empty((N, OBS_DIM), np.float32)
     max_steps = COST_END_IDX - CONTROL_START_IDX
     all_obs = np.empty((max_steps, N, OBS_DIM), np.float32)
@@ -695,20 +697,22 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
         obs_buf[:, c:c+HIST_LEN] = h_act32 / S_STEER;     c += HIST_LEN
         obs_buf[:, c:c+HIST_LEN] = h_lat / S_LAT;          c += HIST_LEN
         end = min(step_idx + FUTURE_PLAN_STEPS, T)
-        for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
-                            ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
+        def _cpu_pad(attr, fb):
             slc = fdata[attr][:, step_idx+1:end]
             w = slc.shape[1]
             if w == 0:
-                fb = {'target_lataccel': target, 'roll_lataccel': roll_la,
-                      'v_ego': v_ego, 'a_ego': a_ego}[attr]
-                obs_buf[:, c:c+FUTURE_K] = (fb / scale).astype(np.float32)[:, None]
+                return np.repeat(fb[:, None].astype(np.float32), FUTURE_K, axis=1)
             elif w < FUTURE_K:
-                obs_buf[:, c:c+w] = slc.astype(np.float32) / scale
-                obs_buf[:, c+w:c+FUTURE_K] = (slc[:, -1:].astype(np.float32) / scale)
-            else:
-                obs_buf[:, c:c+FUTURE_K] = slc[:, :FUTURE_K].astype(np.float32) / scale
-            c += FUTURE_K
+                return np.concatenate([slc.astype(np.float32),
+                    np.repeat(slc[:, -1:].astype(np.float32), FUTURE_K - w, axis=1)], 1)
+            return slc[:, :FUTURE_K].astype(np.float32)
+        f_lat  = _cpu_pad('target_lataccel', target)
+        f_roll = _cpu_pad('roll_lataccel', roll_la)
+        f_v    = _cpu_pad('v_ego', v_ego)
+        f_curv = (f_lat - f_roll) * 10000.0 / np.maximum(f_v ** 2, 1.0) / S_CURV
+        f_a    = _cpu_pad('a_ego', a_ego) / S_AEGO
+        obs_buf[:, c:c+FUTURE_K] = f_curv;  c += FUTURE_K
+        obs_buf[:, c:c+FUTURE_K] = f_a;     c += FUTURE_K
         np.clip(obs_buf, -5.0, 5.0, out=obs_buf)
         obs_t = torch.from_numpy(obs_buf).to(_dev)
         with torch.inference_mode():
