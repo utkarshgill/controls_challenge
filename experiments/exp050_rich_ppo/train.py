@@ -27,7 +27,7 @@ PI_LR, VF_LR     = 3e-4, 3e-4
 GAMMA, LAMDA      = 0.95, 0.9
 K_EPOCHS, EPS_CLIP = 4, 0.2
 VF_COEF, ENT_COEF = 1.0, 0.003
-MINI_BS           = 20_000
+MINI_BS           = int(os.getenv('MINI_BS', '100000'))
 CRITIC_WARMUP     = 4
 
 # BC
@@ -289,27 +289,53 @@ class PPO:
         r = np.concatenate(rets)
         return a, r  # advantage normalization moved to minibatch level
 
+    def gae_gpu(self, rew_2d, val_2d, done_2d):
+        """Vectorized GAE on GPU. rew/val/done are (N, S) CUDA tensors."""
+        self._ret_rms.update(rew_2d.detach().cpu().numpy().ravel())
+        rstd = max(self._ret_rms.std, 1e-8)
+        rew_2d = rew_2d / rstd
+
+        N, S = rew_2d.shape
+        adv = torch.empty((N, S), dtype=torch.float32, device=rew_2d.device)
+        g = torch.zeros(N, dtype=torch.float32, device=rew_2d.device)
+        zero = torch.zeros(N, dtype=torch.float32, device=rew_2d.device)
+        for t in range(S - 1, -1, -1):
+            nv = val_2d[:, t + 1] if t < S - 1 else zero
+            mask = 1.0 - done_2d[:, t]
+            delta = rew_2d[:, t] + GAMMA * nv * mask - val_2d[:, t]
+            g = delta + GAMMA * LAMDA * mask * g
+            adv[:, t] = g
+        ret = adv + val_2d
+        return adv.reshape(-1), ret.reshape(-1)
+
     @staticmethod
     def _beta_sigma(a, b):  # std of 2*Beta(a,b)-1 in [-1,1]
         return 2.0 * torch.sqrt(a * b / ((a + b) ** 2 * (a + b + 1.0)))
 
-    def update(self, all_obs, all_raw, all_rew, all_val, all_done,
-               critic_only=False):
-        # Accept either numpy or GPU tensors
-        if isinstance(all_obs[0], torch.Tensor):
+    def update(self, all_obs, all_raw=None, all_rew=None, all_val=None,
+               all_done=None, critic_only=False):
+        if isinstance(all_obs, dict):
+            # GPU fast path — pre-flattened tensors from _batched_rollout_gpu
+            gd = all_obs
+            obs_t = gd['obs']                          # (N*S, OBS) already on GPU
+            raw_t = gd['raw'].unsqueeze(-1)            # (N*S, 1)
+            adv_t, ret_t = self.gae_gpu(gd['rew'], gd['val_2d'], gd['done'])
+        elif isinstance(all_obs[0], torch.Tensor):
             obs_t = torch.cat(all_obs, dim=0).to(DEV)
             raw_t = torch.cat(all_raw, dim=0).unsqueeze(-1).to(DEV)
-            # GAE needs numpy — convert once
             rew_np = [r.cpu().numpy() for r in all_rew]
             val_np = [v.cpu().numpy() for v in all_val]
             don_np = [d.cpu().numpy() for d in all_done]
+            adv, ret = self.gae(rew_np, val_np, don_np)
+            adv_t = torch.FloatTensor(adv).to(DEV)
+            ret_t = torch.FloatTensor(ret).to(DEV)
         else:
             obs_t = torch.FloatTensor(np.concatenate(all_obs)).to(DEV)
             raw_t = torch.FloatTensor(np.concatenate(all_raw)).unsqueeze(-1).to(DEV)
             rew_np, val_np, don_np = all_rew, all_val, all_done
-        adv, ret = self.gae(rew_np, val_np, don_np)
-        adv_t = torch.FloatTensor(adv).to(DEV)
-        ret_t = torch.FloatTensor(ret).to(DEV)
+            adv, ret = self.gae(rew_np, val_np, don_np)
+            adv_t = torch.FloatTensor(adv).to(DEV)
+            ret_t = torch.FloatTensor(ret).to(DEV)
 
         x_t = ((raw_t + 1.0) / 2.0).clamp(1e-6, 1 - 1e-6)  # raw → Beta support (0,1)
 
@@ -333,7 +359,7 @@ class PPO:
                 ).mean()
 
                 if critic_only:
-                    self.vf_opt.zero_grad()
+                    self.vf_opt.zero_grad(set_to_none=True)
                     vf_loss.backward()
                     nn.utils.clip_grad_norm_(self.ac.critic.parameters(), 0.5)
                     self.vf_opt.step()
@@ -349,8 +375,8 @@ class PPO:
                     ent = dist.entropy().mean()   # +log2 is constant, drops out
 
                     loss = pi_loss + VF_COEF * vf_loss - ENT_COEF * ent
-                    self.pi_opt.zero_grad()
-                    self.vf_opt.zero_grad()
+                    self.pi_opt.zero_grad(set_to_none=True)
+                    self.vf_opt.zero_grad(set_to_none=True)
                     loss.backward()
                     nn.utils.clip_grad_norm_(self.ac.actor.parameters(), 0.5)
                     nn.utils.clip_grad_norm_(self.ac.critic.parameters(), 0.5)
@@ -583,15 +609,12 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
     dones = torch.zeros((N, S), dtype=torch.float32, device='cuda')
     dones[:, -1] = 1.0
 
-    # Return GPU tensors + float costs. PPO.update will consume directly.
-    obs_g = all_obs[:S].permute(1, 0, 2)                       # (N, S, OBS)
-    raw_g = all_raw[:S].T                                       # (N, S)
-    val_g = all_val[:S].T                                       # (N, S)
-
-    results = []
-    for i in range(N):
-        results.append((obs_g[i], raw_g[i], rew[i], val_g[i], dones[i], float(total_costs[i])))
-    return results
+    # Return pre-flattened GPU tensors — no per-episode split/recat needed.
+    obs_flat = all_obs[:S].permute(1, 0, 2).reshape(-1, OBS_DIM)  # (N*S, OBS)
+    raw_flat = all_raw[:S].T.reshape(-1)                           # (N*S,)
+    val_2d   = all_val[:S].T                                       # (N, S)
+    return dict(obs=obs_flat, raw=raw_flat, val_2d=val_2d,
+                rew=rew, done=dones, costs=total_costs)
 
 
 def _batched_rollout_cpu(sim, ac, N, T, deterministic):
@@ -1099,14 +1122,18 @@ def train_one_epoch(epoch, ctx, warmup_off=0):
 
     t1 = time.time()
     co = epoch < (CRITIC_WARMUP - warmup_off)
-    info = ctx.ppo.update(
-        [r[0] for r in res], [r[1] for r in res],   # obs, raw_actions
-        [r[2] for r in res], [r[3] for r in res],   # rewards, values
-        [r[4] for r in res],                          # dones
-        critic_only=co)
+    if isinstance(res, dict):
+        # GPU fast path — pre-flattened tensors
+        info = ctx.ppo.update(res, critic_only=co)
+        costs = res['costs'].tolist()
+    else:
+        # CPU path — list of per-episode tuples
+        info = ctx.ppo.update(
+            [r[0] for r in res], [r[1] for r in res],
+            [r[2] for r in res], [r[3] for r in res],
+            [r[4] for r in res], critic_only=co)
+        costs = [r[5] for r in res]
     tu = time.time() - t1
-
-    costs = [r[5] for r in res]
     phase = "  [critic warmup]" if co else ""
     line = (f"E{epoch:3d}  train={np.mean(costs):6.1f}  σ={info['σ']:.4f}"
             f"  π={info['pi']:+.4f}  vf={info['vf']:.1f}  H={info['ent']:.2f}"
