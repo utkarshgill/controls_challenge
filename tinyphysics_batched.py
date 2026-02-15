@@ -139,6 +139,11 @@ class BatchedPhysicsModel:
             self._out_name = self.ort_session.get_outputs()[0].name
             self._last_probs_gpu = None
             self._io = self.ort_session.io_binding()  # reused every step
+            # GPU-resident tokenizer bins for torch.bucketize
+            self._bins_gpu = torch.from_numpy(self.tokenizer.bins.astype(np.float64)).cuda()
+            self._bins_f32_gpu = self._bins_gpu.float()
+            self._lat_lo = float(LATACCEL_RANGE[0])
+            self._lat_hi = float(LATACCEL_RANGE[1])
 
     def softmax(self, x, axis=-1):
         """Mirrors TinyPhysicsModel.softmax."""
@@ -164,24 +169,34 @@ class BatchedPhysicsModel:
             self._cached_N = N
 
     def _predict_gpu(self, input_data, temperature, rng_u):
-        """All-GPU IOBinding: inputs copied into pre-allocated GPU tensors,
-        output stays in pre-allocated GPU tensor.  Zero CPU→GPU per-step
-        overhead beyond the numpy→torch copy."""
+        """All-GPU IOBinding path.  Accepts either numpy or torch GPU tensors
+        for states/tokens.  If torch GPU tensors, zero CPU→GPU transfer."""
         torch = self._torch
-        N, CL = input_data['states'].shape[:2]
-        self._ensure_gpu_bufs(N, CL)
+        states = input_data['states']
+        tokens = input_data['tokens']
 
-        # Copy numpy → pre-allocated GPU tensors (async, pinned would be faster)
-        self._states_gpu.copy_(torch.from_numpy(input_data['states']))
-        self._tokens_gpu.copy_(torch.from_numpy(input_data['tokens']))
+        if isinstance(states, torch.Tensor):
+            # Already on GPU — use directly
+            states_gpu = states
+            tokens_gpu = tokens
+            N, CL = states.shape[:2]
+            self._ensure_gpu_bufs(N, CL)
+        else:
+            # Numpy path — copy to GPU
+            N, CL = states.shape[:2]
+            self._ensure_gpu_bufs(N, CL)
+            self._states_gpu.copy_(torch.from_numpy(states))
+            self._tokens_gpu.copy_(torch.from_numpy(tokens))
+            states_gpu = self._states_gpu
+            tokens_gpu = self._tokens_gpu
 
         io = self._io
         io.clear_binding_inputs()
         io.clear_binding_outputs()
         io.bind_input('states', 'cuda', 0, np.float32,
-                      list(self._states_gpu.shape), self._states_gpu.data_ptr())
+                      list(states_gpu.shape), states_gpu.data_ptr())
         io.bind_input('tokens', 'cuda', 0, np.int64,
-                      list(self._tokens_gpu.shape), self._tokens_gpu.data_ptr())
+                      list(tokens_gpu.shape), tokens_gpu.data_ptr())
         io.bind_output(self._out_name, 'cuda', 0, np.float32,
                        list(self._out_gpu.shape), self._out_gpu.data_ptr())
 
@@ -199,7 +214,7 @@ class BatchedPhysicsModel:
         else:
             u = torch.rand(N, 1, device='cuda')
         samples = (cumprobs < u).sum(dim=1).clamp(0, VOCAB_SIZE - 1)
-        return samples.cpu().numpy().astype(np.intp)
+        return samples
 
     def _predict_cpu(self, input_data, temperature, rng_u, rngs):
         """Original CPU path."""
@@ -218,37 +233,61 @@ class BatchedPhysicsModel:
         samples = (cumprobs < u).sum(axis=1).astype(np.intp)
         return np.clip(samples, 0, VOCAB_SIZE - 1)
 
-    def get_current_lataccel(self, sim_states: np.ndarray,
-                             actions: np.ndarray,
-                             past_preds: np.ndarray,
+    def get_current_lataccel(self, sim_states, actions, past_preds,
                              rng_u=None, rngs=None,
                              return_expected: bool = False):
-        """Batched get_current_lataccel.  Mirrors TinyPhysicsModel method."""
-        N, CL = actions.shape
+        """Batched get_current_lataccel.  Accepts numpy or torch GPU tensors.
+        When GPU tensors: tokenize + build states on GPU, zero CPU transfer."""
+        torch = getattr(self, '_torch', None)
 
-        # Pre-allocate buffers on first call or if N changes
+        if self._use_gpu and torch is not None and isinstance(actions, torch.Tensor):
+            return self._get_current_lataccel_gpu(
+                sim_states, actions, past_preds, rng_u, return_expected)
+
+        # CPU path (always use _predict_cpu to get numpy indices)
+        N, CL = actions.shape
         if not hasattr(self, '_states_buf') or self._states_buf.shape[0] != N:
             self._states_buf = np.empty((N, CL, 4), np.float32)
             self._tokens_buf = np.empty((N, CL), np.int64)
-
-        # Tokenize into pre-allocated buffer (avoids .astype(np.int64) alloc)
         self._tokens_buf[:] = self.tokenizer.encode(past_preds)
-
-        # Build states in pre-allocated buffer (no concat)
         self._states_buf[:, :, 0] = actions
         self._states_buf[:, :, 1:] = sim_states
-
-        input_data = {
-            'states': self._states_buf,
-            'tokens': self._tokens_buf,
-        }
-        sampled = self.tokenizer.decode(self.predict(input_data, temperature=0.8,
-                                                     rng_u=rng_u, rngs=rngs))
+        input_data = {'states': self._states_buf, 'tokens': self._tokens_buf}
+        sampled = self.tokenizer.decode(self._predict_cpu(input_data, temperature=0.8,
+                                                          rng_u=rng_u, rngs=rngs))
         if not return_expected:
             return sampled
-        if self._use_gpu and self._last_probs is None:
+        if self._last_probs is None:
             self._last_probs = self._last_probs_gpu.cpu().numpy()
         expected = np.sum(self._last_probs * self.tokenizer.bins[None, :], axis=-1)
+        return sampled, expected
+
+    def _get_current_lataccel_gpu(self, sim_states, actions, past_preds,
+                                   rng_u, return_expected):
+        """All-GPU path: tokenize via torch.bucketize, build states,
+        predict, decode — all on GPU.  Returns GPU tensor."""
+        torch = self._torch
+        N, CL = actions.shape
+
+        # Tokenize on GPU: clamp + bucketize (replaces np.clip + np.digitize)
+        # NOTE: torch.bucketize(right=False) == np.digitize(right=True)
+        clamped = past_preds.clamp(self._lat_lo, self._lat_hi)
+        tokens = torch.bucketize(clamped, self._bins_gpu, right=False).long()
+
+        # Build states on GPU: (N, CL, 4) = [actions, sim_states]
+        states = torch.empty((N, CL, 4), dtype=torch.float32, device='cuda')
+        states[:, :, 0] = actions.float()
+        states[:, :, 1:] = sim_states.float()
+
+        input_data = {'states': states, 'tokens': tokens}
+        sample_tokens = self.predict(input_data, temperature=0.8, rng_u=rng_u)
+        # sample_tokens is a GPU int tensor — decode on GPU
+        sampled = self._bins_f32_gpu[sample_tokens].double()
+
+        if not return_expected:
+            return sampled
+        probs = self._last_probs_gpu   # (N, VOCAB_SIZE) on GPU
+        expected = (probs * self._bins_f32_gpu.unsqueeze(0)).sum(dim=-1).double()
         return sampled, expected
 
 
@@ -296,7 +335,6 @@ class BatchedSimulator:
         self.current_lataccel_history = np.zeros((N, T), np.float64)
         self.current_lataccel_history[:, :CL] = self.data['target_lataccel'][:, :CL]
 
-        self.current_lataccel = self.current_lataccel_history[:, CL - 1].copy()
         self._hist_len = CL  # tracks how many columns are filled
 
         # Pre-generate random values: only T-CL steps (matching reference which
@@ -307,11 +345,22 @@ class BatchedSimulator:
         for i, rng in enumerate(self.rngs):
             self._rng_all[:, i] = rng.rand(n_steps).astype(np.float32)
 
-        # Move to GPU once (eliminates 500 per-step CPU→GPU transfers)
-        if os.getenv('CUDA', '0') == '1':
-            import torch
-            self._rng_all_gpu = torch.from_numpy(self._rng_all).cuda()
+        # GPU-resident mode: move histories + rng to GPU
+        self._gpu = os.getenv('CUDA', '0') == '1'
+        if self._gpu:
+            import torch as _torch
+            self._torch = _torch
+            self.action_history = _torch.from_numpy(self.action_history).cuda()
+            self.state_history = _torch.from_numpy(self.state_history).cuda()
+            self.current_lataccel_history = _torch.from_numpy(
+                self.current_lataccel_history).cuda()
+            self.current_lataccel = self.current_lataccel_history[:, CL - 1].clone()
+            self._rng_all_gpu = _torch.from_numpy(self._rng_all).cuda()
+            # Cache numpy view of data for controller (read-only, stays on CPU)
+            self._target_lataccel_cpu = self.data['target_lataccel']
+            self._steer_command_cpu = self.data['steer_command']
         else:
+            self.current_lataccel = self.current_lataccel_history[:, CL - 1].copy()
             self._rng_all_gpu = None
 
     # ── get_state_target_futureplan  (mirrors lines 154-165) ─
@@ -351,40 +400,63 @@ class BatchedSimulator:
         """
         CL = CONTEXT_LENGTH
         h = self._hist_len
-        # state & action already written at index h → h-CL+1:h+1
-        # current_lataccel not yet written → h-CL:h
         rng_idx = step_idx - CL
-        if self._rng_all_gpu is not None:
-            rng_u = self._rng_all_gpu[rng_idx]   # already on GPU
-        else:
-            rng_u = self._rng_all[rng_idx]        # numpy (N,)
-        result = self.sim_model.get_current_lataccel(
-            sim_states=self.state_history[:, h-CL+1:h+1, :],
-            actions=self.action_history[:, h-CL+1:h+1],
-            past_preds=self.current_lataccel_history[:, h-CL:h],
-            rng_u=rng_u,
-            return_expected=self.compute_expected,
-        )
-        if self.compute_expected:
-            pred, self.expected_lataccel = result
-        else:
-            pred = result
 
-        pred = np.clip(pred,
-                       self.current_lataccel - MAX_ACC_DELTA,
-                       self.current_lataccel + MAX_ACC_DELTA)
+        if self._gpu:
+            torch = self._torch
+            rng_u = self._rng_all_gpu[rng_idx]
+            # All slices are GPU tensors — entire call stays on GPU
+            result = self.sim_model.get_current_lataccel(
+                sim_states=self.state_history[:, h-CL+1:h+1, :],
+                actions=self.action_history[:, h-CL+1:h+1],
+                past_preds=self.current_lataccel_history[:, h-CL:h],
+                rng_u=rng_u,
+                return_expected=self.compute_expected,
+            )
+            if self.compute_expected:
+                pred, self.expected_lataccel = result
+            else:
+                pred = result
 
-        if step_idx >= CONTROL_START_IDX:
-            self.current_lataccel = pred
+            pred = torch.clamp(pred,
+                               self.current_lataccel - MAX_ACC_DELTA,
+                               self.current_lataccel + MAX_ACC_DELTA)
+            if step_idx >= CONTROL_START_IDX:
+                self.current_lataccel = pred
+            else:
+                self.current_lataccel = self.current_lataccel_history.new_tensor(
+                    self._target_lataccel_cpu[:, step_idx])
+
+            self.current_lataccel_history[:, h] = self.current_lataccel
+            self._hist_len += 1
         else:
-            self.current_lataccel = self.data['target_lataccel'][:, step_idx].copy()
+            rng_u = self._rng_all[rng_idx]
+            result = self.sim_model.get_current_lataccel(
+                sim_states=self.state_history[:, h-CL+1:h+1, :],
+                actions=self.action_history[:, h-CL+1:h+1],
+                past_preds=self.current_lataccel_history[:, h-CL:h],
+                rng_u=rng_u,
+                return_expected=self.compute_expected,
+            )
+            if self.compute_expected:
+                pred, self.expected_lataccel = result
+            else:
+                pred = result
 
-        self.current_lataccel_history[:, self._hist_len] = self.current_lataccel
-        self._hist_len += 1
+            pred = np.clip(pred,
+                           self.current_lataccel - MAX_ACC_DELTA,
+                           self.current_lataccel + MAX_ACC_DELTA)
+            if step_idx >= CONTROL_START_IDX:
+                self.current_lataccel = pred
+            else:
+                self.current_lataccel = self.data['target_lataccel'][:, step_idx].copy()
+
+            self.current_lataccel_history[:, h] = self.current_lataccel
+            self._hist_len += 1
 
     # ── control_step  (mirrors lines 147-152) ────────────────
 
-    def control_step(self, step_idx: int, actions: np.ndarray) -> None:
+    def control_step(self, step_idx: int, actions) -> None:
         """Accept externally-provided actions (N,), clip, append to history.
 
         Mirrors:
@@ -392,14 +464,24 @@ class BatchedSimulator:
           action = clip(action, STEER_RANGE)
           action_history.append(action)
         """
-        if step_idx < CONTROL_START_IDX:
-            actions = self.data['steer_command'][:, step_idx].copy()
-        actions = np.clip(actions, STEER_RANGE[0], STEER_RANGE[1])
-        self.action_history[:, self._hist_len] = actions
+        if self._gpu:
+            torch = self._torch
+            if step_idx < CONTROL_START_IDX:
+                actions = self.action_history.new_tensor(
+                    self._steer_command_cpu[:, step_idx])
+            elif not isinstance(actions, torch.Tensor):
+                actions = self.action_history.new_tensor(actions)
+            actions = torch.clamp(actions, STEER_RANGE[0], STEER_RANGE[1])
+            self.action_history[:, self._hist_len] = actions
+        else:
+            if step_idx < CONTROL_START_IDX:
+                actions = self.data['steer_command'][:, step_idx].copy()
+            actions = np.clip(actions, STEER_RANGE[0], STEER_RANGE[1])
+            self.action_history[:, self._hist_len] = actions
 
     # ── step  (mirrors lines 167-174) ────────────────────────
 
-    def step(self, step_idx: int, actions: np.ndarray) -> dict:
+    def step(self, step_idx: int, actions) -> dict:
         """One full sim step.  Returns state info for the controller.
 
         Mirrors:
@@ -412,18 +494,28 @@ class BatchedSimulator:
         roll_la, v_ego, a_ego, target, future_plan = \
             self.get_state_target_futureplan(step_idx)
 
-        # Write state at current position (pre-allocated)
-        self.state_history[:, self._hist_len, 0] = roll_la
-        self.state_history[:, self._hist_len, 1] = v_ego
-        self.state_history[:, self._hist_len, 2] = a_ego
+        h = self._hist_len
+        if self._gpu:
+            state_np = np.stack([roll_la, v_ego, a_ego], axis=-1)  # (N,3)
+            self.state_history[:, h, :] = self._torch.from_numpy(
+                np.ascontiguousarray(state_np)).cuda()
+        else:
+            self.state_history[:, h, 0] = roll_la
+            self.state_history[:, h, 1] = v_ego
+            self.state_history[:, h, 2] = a_ego
 
         self.control_step(step_idx, actions)
         self.sim_step(step_idx)
 
+        if self._gpu:
+            cur_la = self.current_lataccel.cpu().numpy()
+        else:
+            cur_la = self.current_lataccel.copy()
+
         return dict(
             roll_lataccel=roll_la, v_ego=v_ego, a_ego=a_ego,
             target=target, future_plan=future_plan,
-            current_lataccel=self.current_lataccel.copy(),
+            current_lataccel=cur_la,
         )
 
     # ── rollout  (mirrors lines 195-213) ─────────────────────
@@ -447,13 +539,29 @@ class BatchedSimulator:
             t_state += _time.perf_counter() - _t0
 
             _t0 = _time.perf_counter()
+            if self._gpu:
+                cur_la_np = self.current_lataccel.cpu().numpy()
+            else:
+                cur_la_np = self.current_lataccel.copy()
             actions = controller_fn(
-                step_idx, target, self.current_lataccel.copy(),
+                step_idx, target, cur_la_np,
                 state_dict, future_plan)
             t_ctrl += _time.perf_counter() - _t0
 
             _t0 = _time.perf_counter()
-            self.step(step_idx, actions)
+            # Write state to GPU history
+            h = self._hist_len
+            if self._gpu:
+                state_np = np.stack([roll_la, v_ego, a_ego], axis=-1)
+                self.state_history[:, h, :] = self._torch.from_numpy(
+                    np.ascontiguousarray(state_np)).cuda()
+            else:
+                self.state_history[:, h, 0] = roll_la
+                self.state_history[:, h, 1] = v_ego
+                self.state_history[:, h, 2] = a_ego
+
+            self.control_step(step_idx, actions)
+            self.sim_step(step_idx)
             t_sim += _time.perf_counter() - _t0
 
         print(f"  [rollout N={self.N}] ctrl={t_ctrl:.1f}s  sim={t_sim:.1f}s  state={t_state:.1f}s  total={t_ctrl+t_sim+t_state:.1f}s", flush=True)
@@ -463,8 +571,10 @@ class BatchedSimulator:
 
     def compute_cost(self) -> Dict[str, np.ndarray]:
         """Vectorized cost computation.  Returns dict with (N,) arrays."""
-        target = self.data['target_lataccel'][:, CONTROL_START_IDX:COST_END_IDX]  # bounds-safe slice, like ref
+        target = self.data['target_lataccel'][:, CONTROL_START_IDX:COST_END_IDX]
         pred = self.current_lataccel_history[:, CONTROL_START_IDX:COST_END_IDX]
+        if self._gpu:
+            pred = pred.cpu().numpy()
 
         lat_accel_cost = np.mean((target - pred)**2, axis=1) * 100
         jerk_cost = np.mean((np.diff(pred, axis=1) / DEL_T)**2, axis=1) * 100
