@@ -417,14 +417,23 @@ def build_obs_batch(target, current, roll_la, v_ego, a_ego,
 def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=None):
     sim = BatchedSimulator(str(mdl_path), csv_files, ort_session=ort_session)
     N = sim.N
+    T = sim.T
+    _dev = next(ac.parameters()).device
 
-    # h_act float64: actions accumulate via prev + delta (Python float precision)
+    # Pre-allocate ring buffers (index writes, no concat)
     h_act   = np.zeros((N, HIST_LEN), np.float64)
     h_lat   = np.zeros((N, HIST_LEN), np.float32)
     h_error = np.zeros((N, HIST_LEN), np.float32)
 
+    # Pre-allocate obs output buffer
+    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 4  # core + h_act + h_lat + futures
+    obs_buf = np.empty((N, OBS_DIM), np.float32)
+
     all_obs, all_raw, all_val = [], [], []
     tgt_hist, cur_hist = [], []
+
+    # Pre-compute future plan slices (avoid per-step dict/slice overhead)
+    fdata = sim.data
 
     def controller_fn(step_idx, target, current_la, state_dict, future_plan):
         nonlocal h_act, h_lat, h_error
@@ -433,21 +442,69 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
         v_ego   = state_dict['v_ego']
         a_ego   = state_dict['a_ego']
 
-        cla32  = np.float32(current_la)
-        error  = np.float32(target - current_la)
-        h_error = np.concatenate([h_error[:, 1:], error[:, None]], axis=1)
+        cla32  = current_la.astype(np.float32)
+        error  = (target - current_la).astype(np.float32)
+
+        # Shift left by 1 and write new value (no allocation)
+        h_error[:, :-1] = h_error[:, 1:]
+        h_error[:, -1] = error
         error_integral = h_error.mean(axis=1) * DEL_T
 
         if step_idx < CONTROL_START_IDX:
-            h_act = np.concatenate([h_act[:, 1:], np.zeros((N, 1), np.float64)], axis=1)
-            h_lat = np.concatenate([h_lat[:, 1:], cla32[:, None]], axis=1)
+            h_act[:, :-1] = h_act[:, 1:]
+            h_act[:, -1] = 0.0
+            h_lat[:, :-1] = h_lat[:, 1:]
+            h_lat[:, -1] = cla32
             return np.zeros(N)
 
-        obs = build_obs_batch(target, current_la, roll_la, v_ego, a_ego,
-                              h_act, h_lat, sim.data, step_idx, error_integral=error_integral)
+        # === Inline obs building (avoid function call + column_stack alloc) ===
+        v2 = np.maximum(v_ego * v_ego, 1.0)
+        k_tgt = (target - roll_la) / v2
+        k_cur = (current_la - roll_la) / v2
+        h_act32 = h_act.astype(np.float32)
+        fplan_lat0 = fdata['target_lataccel'][:, min(step_idx + 1, T - 1)]
+        fric = np.sqrt(current_la**2 + a_ego**2) / 7.0
 
-        _dev = next(ac.parameters()).device
-        obs_t = torch.from_numpy(obs).to(_dev)
+        c = 0
+        obs_buf[:, c] = target / S_LAT;                    c += 1
+        obs_buf[:, c] = current_la / S_LAT;                c += 1
+        obs_buf[:, c] = (target - current_la) / S_LAT;     c += 1
+        obs_buf[:, c] = k_tgt / S_CURV;                    c += 1
+        obs_buf[:, c] = k_cur / S_CURV;                    c += 1
+        obs_buf[:, c] = (k_tgt - k_cur) / S_CURV;          c += 1
+        obs_buf[:, c] = v_ego / S_VEGO;                    c += 1
+        obs_buf[:, c] = a_ego / S_AEGO;                    c += 1
+        obs_buf[:, c] = roll_la / S_ROLL;                  c += 1
+        obs_buf[:, c] = h_act32[:, -1] / S_STEER;          c += 1
+        obs_buf[:, c] = error_integral / S_LAT;            c += 1
+        obs_buf[:, c] = (fplan_lat0 - target) / DEL_T / S_LAT; c += 1
+        obs_buf[:, c] = (current_la - h_lat[:, -1]) / DEL_T / S_LAT; c += 1
+        obs_buf[:, c] = (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER; c += 1
+        obs_buf[:, c] = fric;                               c += 1
+        obs_buf[:, c] = np.maximum(0.0, 1.0 - fric);       c += 1
+
+        obs_buf[:, c:c+HIST_LEN] = h_act32 / S_STEER;     c += HIST_LEN
+        obs_buf[:, c:c+HIST_LEN] = h_lat / S_LAT;          c += HIST_LEN
+
+        end = min(step_idx + FUTURE_PLAN_STEPS, T)
+        for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
+                            ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
+            slc = fdata[attr][:, step_idx+1:end]
+            w = slc.shape[1]
+            if w == 0:
+                fb = {'target_lataccel': target, 'roll_lataccel': roll_la,
+                      'v_ego': v_ego, 'a_ego': a_ego}[attr]
+                obs_buf[:, c:c+FUTURE_K] = (fb / scale).astype(np.float32)[:, None]
+            elif w < FUTURE_K:
+                obs_buf[:, c:c+w] = slc.astype(np.float32) / scale
+                obs_buf[:, c+w:c+FUTURE_K] = (slc[:, -1:].astype(np.float32) / scale)
+            else:
+                obs_buf[:, c:c+FUTURE_K] = slc[:, :FUTURE_K].astype(np.float32) / scale
+            c += FUTURE_K
+
+        np.clip(obs_buf, -5.0, 5.0, out=obs_buf)
+
+        obs_t = torch.from_numpy(obs_buf).to(_dev)
         with torch.inference_mode():
             a_p, b_p = ac.beta_params(obs_t)
             val = ac.critic(obs_t).squeeze(-1).cpu().numpy()
@@ -461,11 +518,14 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
         delta  = np.clip(raw.astype(np.float64) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
         action = np.clip(h_act[:, -1] + delta, STEER_RANGE[0], STEER_RANGE[1])
 
-        h_act = np.concatenate([h_act[:, 1:], action[:, None]], axis=1)
-        h_lat = np.concatenate([h_lat[:, 1:], cla32[:, None]], axis=1)
+        # Shift and write (no allocation)
+        h_act[:, :-1] = h_act[:, 1:]
+        h_act[:, -1] = action
+        h_lat[:, :-1] = h_lat[:, 1:]
+        h_lat[:, -1] = cla32
 
         if step_idx < COST_END_IDX:
-            all_obs.append(obs.copy())
+            all_obs.append(obs_buf.copy())
             all_raw.append(raw.copy())
             all_val.append(val.copy())
             tgt_hist.append(target.copy())

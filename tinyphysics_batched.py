@@ -203,23 +203,25 @@ class BatchedPhysicsModel:
                              past_preds: np.ndarray,
                              rng_u=None, rngs=None,
                              return_expected: bool = False):
-        """Batched get_current_lataccel.  Mirrors TinyPhysicsModel method.
-
-        rng_u:  (N,) float32 pre-generated uniform random values (fast path)
-        rngs:   list of N RandomState (legacy path)
-        """
+        """Batched get_current_lataccel.  Mirrors TinyPhysicsModel method."""
+        # Tokenize: clip + digitize (vectorized numpy, fast)
         tokenized_actions = self.tokenizer.encode(past_preds)  # (N, CL)
-        states = np.concatenate(
-            [actions[:, :, None], sim_states], axis=-1)
+
+        # Build states in pre-allocated buffer
+        N, CL = actions.shape
+        if not hasattr(self, '_states_buf') or self._states_buf.shape[0] != N:
+            self._states_buf = np.empty((N, CL, 4), np.float32)
+        self._states_buf[:, :, 0] = actions
+        self._states_buf[:, :, 1:] = sim_states
+
         input_data = {
-            'states': states.astype(np.float32),
+            'states': self._states_buf,
             'tokens': tokenized_actions.astype(np.int64),
         }
         sampled = self.tokenizer.decode(self.predict(input_data, temperature=0.8,
                                                      rng_u=rng_u, rngs=rngs))
         if not return_expected:
             return sampled
-        # Expected value — lazy CPU copy only when actually needed
         if self._use_gpu and self._last_probs is None:
             self._last_probs = self._last_probs_gpu.cpu().numpy()
         expected = np.sum(self._last_probs * self.tokenizer.bins[None, :], axis=-1)
