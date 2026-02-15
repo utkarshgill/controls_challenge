@@ -85,7 +85,9 @@ def preload_csvs(csv_files):
     Returns dict of float64 arrays (matching pandas native precision used by
     the original TinyPhysicsSimulator).
     """
-    dfs = [pd.read_csv(str(f)) for f in csv_files]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(32, len(csv_files))) as pool:
+        dfs = list(pool.map(lambda f: pd.read_csv(str(f)), csv_files))
     N = len(dfs)
     T = max(len(df) for df in dfs)
     roll_la = np.empty((N, T), np.float64)
