@@ -250,6 +250,16 @@ class RunningMeanStd:
         m2 = m_a + m_b + delta**2 * self.count * batch_count / tot
         self.var = m2 / tot
         self.count = tot
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        """Update from pre-computed moments (avoids large array transfer)."""
+        delta = batch_mean - self.mean
+        tot = self.count + batch_count
+        self.mean += delta * batch_count / tot
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta**2 * self.count * batch_count / tot
+        self.var = m2 / tot
+        self.count = tot
     @property
     def std(self): return np.sqrt(self.var + 1e-8)
 
@@ -291,7 +301,10 @@ class PPO:
 
     def gae_gpu(self, rew_2d, val_2d, done_2d):
         """Vectorized GAE on GPU. rew/val/done are (N, S) CUDA tensors."""
-        self._ret_rms.update(rew_2d.detach().cpu().numpy().ravel())
+        with torch.no_grad():
+            flat = rew_2d.reshape(-1)
+            self._ret_rms.update_from_moments(
+                flat.mean().item(), flat.var().item(), flat.numel())
         rstd = max(self._ret_rms.std, 1e-8)
         rew_2d = rew_2d / rstd
 
@@ -346,7 +359,7 @@ class PPO:
 
         N = len(obs_t)
         for _ in range(K_EPOCHS):
-            for idx in torch.randperm(N).split(MINI_BS):
+            for idx in torch.randperm(N, device=obs_t.device).split(MINI_BS):
                 # Per-minibatch advantage normalization
                 mb_adv = adv_t[idx]
                 mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)

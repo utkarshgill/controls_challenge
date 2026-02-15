@@ -646,11 +646,22 @@ class BatchedSimulator:
 
     def compute_cost(self) -> Dict[str, np.ndarray]:
         """Vectorized cost computation.  Returns dict with (N,) arrays."""
+        if self._gpu:
+            _torch = self._torch
+            target_gpu = self.data_gpu['target_lataccel'][:, CONTROL_START_IDX:COST_END_IDX]
+            pred_gpu = self.current_lataccel_history[:, CONTROL_START_IDX:COST_END_IDX]
+            lat_accel_cost = (target_gpu - pred_gpu).pow(2).mean(dim=1) * 100
+            jerk = _torch.diff(pred_gpu, dim=1) / DEL_T
+            jerk_cost = jerk.pow(2).mean(dim=1) * 100
+            total_cost = lat_accel_cost * LAT_ACCEL_COST_MULTIPLIER + jerk_cost
+            # Single GPU->CPU transfer of final (N,) results
+            return {
+                'lataccel_cost': lat_accel_cost.cpu().numpy(),
+                'jerk_cost': jerk_cost.cpu().numpy(),
+                'total_cost': total_cost.cpu().numpy(),
+            }
         target = self.data['target_lataccel'][:, CONTROL_START_IDX:COST_END_IDX]
         pred = self.current_lataccel_history[:, CONTROL_START_IDX:COST_END_IDX]
-        if self._gpu:
-            pred = pred.cpu().numpy()
-
         lat_accel_cost = np.mean((target - pred)**2, axis=1) * 100
         jerk_cost = np.mean((np.diff(pred, axis=1) / DEL_T)**2, axis=1) * 100
         total_cost = lat_accel_cost * LAT_ACCEL_COST_MULTIPLIER + jerk_cost
