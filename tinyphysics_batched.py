@@ -136,6 +136,7 @@ class BatchedPhysicsModel:
             import torch
             self._torch = torch
             self._out_name = self.ort_session.get_outputs()[0].name
+            self._last_probs_gpu = None
 
     def softmax(self, x, axis=-1):
         """Mirrors TinyPhysicsModel.softmax."""
@@ -143,12 +144,12 @@ class BatchedPhysicsModel:
         return e_x / np.sum(e_x, axis=axis, keepdims=True)
 
     def predict(self, input_data: dict, temperature=0.8,
-                rngs: list = None) -> np.ndarray:
+                rng_u=None, rngs=None) -> np.ndarray:
         if self._use_gpu:
-            return self._predict_gpu(input_data, temperature, rngs)
-        return self._predict_cpu(input_data, temperature, rngs)
+            return self._predict_gpu(input_data, temperature, rng_u)
+        return self._predict_cpu(input_data, temperature, rng_u, rngs)
 
-    def _predict_gpu(self, input_data, temperature, rngs):
+    def _predict_gpu(self, input_data, temperature, rng_u):
         """IOBinding: inputs copy to GPU, output written directly into
         pre-allocated torch tensor on GPU. Softmax + sampling on GPU.
         Only N ints come back to CPU."""
@@ -168,19 +169,19 @@ class BatchedPhysicsModel:
 
         # Softmax on GPU (only last timestep)
         probs = torch.softmax(out_gpu[:, -1, :] / temperature, dim=-1)
-        self._last_probs = probs.cpu().numpy()         # cache for expected-value
+        self._last_probs_gpu = probs                   # keep on GPU
+        self._last_probs = None                         # lazy CPU copy
 
-        # Sampling on GPU
+        # Sampling on GPU — rng_u is (N,) float32 from pre-generated table
         cumprobs = torch.cumsum(probs, dim=1)
-        if rngs is not None:
-            u = torch.tensor([rng.rand() for rng in rngs],
-                             dtype=torch.float32, device='cuda').unsqueeze(1)
+        if rng_u is not None:
+            u = torch.from_numpy(rng_u).cuda().unsqueeze(1)
         else:
             u = torch.rand(N, 1, device='cuda')
         samples = (cumprobs < u).sum(dim=1).clamp(0, VOCAB_SIZE - 1)
         return samples.cpu().numpy().astype(np.intp)
 
-    def _predict_cpu(self, input_data, temperature, rngs):
+    def _predict_cpu(self, input_data, temperature, rng_u, rngs):
         """Original CPU path."""
         res = self.ort_session.run(None, input_data)[0]  # (N, CL, VOCAB_SIZE)
         probs = self.softmax(res / temperature, axis=-1)
@@ -188,7 +189,9 @@ class BatchedPhysicsModel:
         self._last_probs = probs
         N = probs.shape[0]
         cumprobs = np.cumsum(probs, axis=1)
-        if rngs is not None:
+        if rng_u is not None:
+            u = rng_u[:, None].astype(np.float64)
+        elif rngs is not None:
             u = np.array([rng.rand() for rng in rngs], dtype=np.float64)[:, None]
         else:
             u = np.random.rand(N, 1)
@@ -198,16 +201,12 @@ class BatchedPhysicsModel:
     def get_current_lataccel(self, sim_states: np.ndarray,
                              actions: np.ndarray,
                              past_preds: np.ndarray,
-                             rngs: list = None,
+                             rng_u=None, rngs=None,
                              return_expected: bool = False):
         """Batched get_current_lataccel.  Mirrors TinyPhysicsModel method.
 
-        sim_states: (N, CL, 3)  float64 — [roll_lataccel, v_ego, a_ego]
-        actions:    (N, CL)     float64
-        past_preds: (N, CL)     float64
-        rngs:       optional list of N RandomState for per-episode seeding
-        return_expected: if True, also return E[lataccel] = sum(probs * bins)
-        Returns:    (N,) float64, or tuple ((N,), (N,)) if return_expected.
+        rng_u:  (N,) float32 pre-generated uniform random values (fast path)
+        rngs:   list of N RandomState (legacy path)
         """
         tokenized_actions = self.tokenizer.encode(past_preds)  # (N, CL)
         states = np.concatenate(
@@ -217,10 +216,12 @@ class BatchedPhysicsModel:
             'tokens': tokenized_actions.astype(np.int64),
         }
         sampled = self.tokenizer.decode(self.predict(input_data, temperature=0.8,
-                                                     rngs=rngs))
+                                                     rng_u=rng_u, rngs=rngs))
         if not return_expected:
             return sampled
-        # Expected value from the SAME forward pass (reuse cached probs)
+        # Expected value — lazy CPU copy only when actually needed
+        if self._use_gpu and self._last_probs is None:
+            self._last_probs = self._last_probs_gpu.cpu().numpy()
         expected = np.sum(self._last_probs * self.tokenizer.bins[None, :], axis=-1)
         return sampled, expected
 
@@ -272,6 +273,12 @@ class BatchedSimulator:
         self.current_lataccel = self.current_lataccel_history[:, CL - 1].copy()
         self._hist_len = CL  # tracks how many columns are filled
 
+        # Pre-generate all random values for sampling (avoids Python loop per step)
+        self._rng_all = np.empty((T, N), dtype=np.float32)
+        for step in range(T):
+            for i, rng in enumerate(self.rngs):
+                self._rng_all[step, i] = rng.rand()
+
     # ── get_state_target_futureplan  (mirrors lines 154-165) ─
 
     def get_state_target_futureplan(self, step_idx: int):
@@ -315,7 +322,7 @@ class BatchedSimulator:
             sim_states=self.state_history[:, h-CL+1:h+1, :],
             actions=self.action_history[:, h-CL+1:h+1],
             past_preds=self.current_lataccel_history[:, h-CL:h],
-            rngs=self.rngs,
+            rng_u=self._rng_all[step_idx],
             return_expected=self.compute_expected,
         )
         if self.compute_expected:
