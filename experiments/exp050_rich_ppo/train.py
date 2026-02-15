@@ -422,6 +422,7 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
 
     # Pre-allocate ring buffers (index writes, no concat)
     h_act   = np.zeros((N, HIST_LEN), np.float64)
+    h_act32 = np.zeros((N, HIST_LEN), np.float32)   # persistent float32 mirror
     h_lat   = np.zeros((N, HIST_LEN), np.float32)
     h_error = np.zeros((N, HIST_LEN), np.float32)
 
@@ -429,14 +430,20 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
     OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 4  # core + h_act + h_lat + futures
     obs_buf = np.empty((N, OBS_DIM), np.float32)
 
-    all_obs, all_raw, all_val = [], [], []
-    tgt_hist, cur_hist = [], []
+    # Pre-allocate training data arrays (avoid 500 list appends + copies + np.stack)
+    max_steps = COST_END_IDX - CONTROL_START_IDX
+    all_obs = np.empty((max_steps, N, OBS_DIM), np.float32)
+    all_raw = np.empty((max_steps, N), np.float32)
+    all_val = np.empty((max_steps, N), np.float32)
+    tgt_hist = np.empty((max_steps, N), np.float64)
+    cur_hist = np.empty((max_steps, N), np.float64)
+    step_ctr = 0
 
     # Pre-compute future plan slices (avoid per-step dict/slice overhead)
     fdata = sim.data
 
     def controller_fn(step_idx, target, current_la, state_dict, future_plan):
-        nonlocal h_act, h_lat, h_error
+        nonlocal h_act, h_act32, h_lat, h_error, step_ctr
 
         roll_la = state_dict['roll_lataccel']
         v_ego   = state_dict['v_ego']
@@ -453,15 +460,16 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
         if step_idx < CONTROL_START_IDX:
             h_act[:, :-1] = h_act[:, 1:]
             h_act[:, -1] = 0.0
+            h_act32[:, :-1] = h_act32[:, 1:]
+            h_act32[:, -1] = 0.0
             h_lat[:, :-1] = h_lat[:, 1:]
             h_lat[:, -1] = cla32
             return np.zeros(N)
 
-        # === Inline obs building (avoid function call + column_stack alloc) ===
+        # === Inline obs building ===
         v2 = np.maximum(v_ego * v_ego, 1.0)
         k_tgt = (target - roll_la) / v2
         k_cur = (current_la - roll_la) / v2
-        h_act32 = h_act.astype(np.float32)
         fplan_lat0 = fdata['target_lataccel'][:, min(step_idx + 1, T - 1)]
         fric = np.sqrt(current_la**2 + a_ego**2) / 7.0
 
@@ -518,18 +526,23 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
         delta  = np.clip(raw.astype(np.float64) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
         action = np.clip(h_act[:, -1] + delta, STEER_RANGE[0], STEER_RANGE[1])
 
-        # Shift and write (no allocation)
+        # Shift and write (no allocation); keep h_act32 in sync
         h_act[:, :-1] = h_act[:, 1:]
         h_act[:, -1] = action
+        h_act32[:, :-1] = h_act32[:, 1:]
+        h_act32[:, -1] = action  # numpy auto-casts f64→f32
         h_lat[:, :-1] = h_lat[:, 1:]
         h_lat[:, -1] = cla32
 
         if step_idx < COST_END_IDX:
-            all_obs.append(obs_buf.copy())
-            all_raw.append(raw.copy())
-            all_val.append(val.copy())
-            tgt_hist.append(target.copy())
-            cur_hist.append(current_la.copy())
+            # Write directly into pre-allocated arrays (no .copy() needed —
+            # obs_buf is overwritten next step, so the data persists here)
+            all_obs[step_ctr] = obs_buf
+            all_raw[step_ctr] = raw
+            all_val[step_ctr] = val
+            tgt_hist[step_ctr] = target
+            cur_hist[step_ctr] = current_la
+            step_ctr += 1
 
         return action
 
@@ -539,21 +552,24 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
     if deterministic:
         return total_costs.tolist()
 
-    obs_arr = np.stack(all_obs, axis=1)
-    raw_arr = np.stack(all_raw, axis=1)
-    val_arr = np.stack(all_val, axis=1)
-    tgt_arr = np.stack(tgt_hist, axis=1)
-    cur_arr = np.stack(cur_hist, axis=1)
-    S = obs_arr.shape[1]
+    # Trim to actual steps collected, transpose to (N, S, ...)
+    S = step_ctr
+    obs_arr = np.ascontiguousarray(all_obs[:S].transpose(1, 0, 2))  # (N, S, OBS)
+    raw_arr = np.ascontiguousarray(all_raw[:S].T)                    # (N, S)
+    val_arr = np.ascontiguousarray(all_val[:S].T)                    # (N, S)
+    tgt_arr = tgt_hist[:S].T                                         # (N, S)
+    cur_arr = cur_hist[:S].T                                         # (N, S)
+
+    # Vectorized reward computation (no per-episode loop)
+    lat_r = (tgt_arr - cur_arr)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
+    jerk_r = np.diff(cur_arr, axis=1, prepend=cur_arr[:, :1]) / DEL_T
+    rew = (-(lat_r + jerk_r**2 * 100) / 500.0).astype(np.float32)  # (N, S)
+    dones = np.zeros((N, S), np.float32)
+    dones[:, -1] = 1.0
 
     results = []
     for i in range(N):
-        dones = np.concatenate([np.zeros(S-1, np.float32), [1.0]])
-        tgt_ep, cur_ep = tgt_arr[i], cur_arr[i]
-        lat_r  = (tgt_ep - cur_ep)**2 * 100 * LAT_ACCEL_COST_MULTIPLIER
-        jerk_r = np.diff(cur_ep, prepend=cur_ep[0]) / DEL_T
-        rew    = (-(lat_r + jerk_r**2 * 100) / 500.0).astype(np.float32)
-        results.append((obs_arr[i], raw_arr[i], rew, val_arr[i], dones, float(total_costs[i])))
+        results.append((obs_arr[i], raw_arr[i], rew[i], val_arr[i], dones[i], float(total_costs[i])))
     return results
 
 

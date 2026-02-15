@@ -132,11 +132,13 @@ class BatchedPhysicsModel:
         else:
             self.ort_session = make_ort_session(model_path)
         self._use_gpu = os.getenv('CUDA', '0') == '1'
+        self._cached_N = 0   # for lazy GPU buffer allocation
         if self._use_gpu:
             import torch
             self._torch = torch
             self._out_name = self.ort_session.get_outputs()[0].name
             self._last_probs_gpu = None
+            self._io = self.ort_session.io_binding()  # reused every step
 
     def softmax(self, x, axis=-1):
         """Mirrors TinyPhysicsModel.softmax."""
@@ -149,33 +151,41 @@ class BatchedPhysicsModel:
             return self._predict_gpu(input_data, temperature, rng_u)
         return self._predict_cpu(input_data, temperature, rng_u, rngs)
 
+    def _ensure_gpu_bufs(self, N, CL):
+        """Lazily allocate / resize GPU buffers when N changes."""
+        if N != self._cached_N:
+            torch = self._torch
+            self._out_gpu = torch.empty((N, CL, VOCAB_SIZE),
+                                        dtype=torch.float32, device='cuda')
+            self._cached_N = N
+
     def _predict_gpu(self, input_data, temperature, rng_u):
-        """IOBinding: inputs copy to GPU, output written directly into
-        pre-allocated torch tensor on GPU. Softmax + sampling on GPU.
+        """IOBinding with reused buffers.  Inputs copy to GPU once,
+        output stays in pre-allocated GPU tensor.  Softmax + sampling on GPU.
         Only N ints come back to CPU."""
         torch = self._torch
         N, CL = input_data['states'].shape[:2]
+        self._ensure_gpu_bufs(N, CL)
 
-        io = self.ort_session.io_binding()
-        io.bind_cpu_input('states', np.ascontiguousarray(input_data['states']))
-        io.bind_cpu_input('tokens', np.ascontiguousarray(input_data['tokens']))
-
-        # Pre-allocate output on GPU; ONNX writes directly into it
-        out_gpu = torch.empty((N, CL, VOCAB_SIZE), dtype=torch.float32, device='cuda')
+        io = self._io
+        io.clear_binding_inputs()
+        io.clear_binding_outputs()
+        io.bind_cpu_input('states', input_data['states'])  # already contiguous
+        io.bind_cpu_input('tokens', input_data['tokens'])
         io.bind_output(self._out_name, 'cuda', 0, np.float32,
-                       list(out_gpu.shape), out_gpu.data_ptr())
+                       list(self._out_gpu.shape), self._out_gpu.data_ptr())
 
         self.ort_session.run_with_iobinding(io)
 
         # Softmax on GPU (only last timestep)
-        probs = torch.softmax(out_gpu[:, -1, :] / temperature, dim=-1)
+        probs = torch.softmax(self._out_gpu[:, -1, :] / temperature, dim=-1)
         self._last_probs_gpu = probs                   # keep on GPU
         self._last_probs = None                         # lazy CPU copy
 
-        # Sampling on GPU — rng_u is (N,) float32 from pre-generated table
+        # Sampling on GPU — rng_u is a GPU tensor slice (no CPU→GPU transfer)
         cumprobs = torch.cumsum(probs, dim=1)
         if rng_u is not None:
-            u = torch.from_numpy(rng_u).cuda().unsqueeze(1)
+            u = rng_u.unsqueeze(1) if rng_u.dim() == 1 else rng_u
         else:
             u = torch.rand(N, 1, device='cuda')
         samples = (cumprobs < u).sum(dim=1).clamp(0, VOCAB_SIZE - 1)
@@ -204,19 +214,23 @@ class BatchedPhysicsModel:
                              rng_u=None, rngs=None,
                              return_expected: bool = False):
         """Batched get_current_lataccel.  Mirrors TinyPhysicsModel method."""
-        # Tokenize: clip + digitize (vectorized numpy, fast)
-        tokenized_actions = self.tokenizer.encode(past_preds)  # (N, CL)
-
-        # Build states in pre-allocated buffer
         N, CL = actions.shape
+
+        # Pre-allocate buffers on first call or if N changes
         if not hasattr(self, '_states_buf') or self._states_buf.shape[0] != N:
             self._states_buf = np.empty((N, CL, 4), np.float32)
+            self._tokens_buf = np.empty((N, CL), np.int64)
+
+        # Tokenize into pre-allocated buffer (avoids .astype(np.int64) alloc)
+        self._tokens_buf[:] = self.tokenizer.encode(past_preds)
+
+        # Build states in pre-allocated buffer (no concat)
         self._states_buf[:, :, 0] = actions
         self._states_buf[:, :, 1:] = sim_states
 
         input_data = {
             'states': self._states_buf,
-            'tokens': tokenized_actions.astype(np.int64),
+            'tokens': self._tokens_buf,
         }
         sampled = self.tokenizer.decode(self.predict(input_data, temperature=0.8,
                                                      rng_u=rng_u, rngs=rngs))
@@ -275,11 +289,20 @@ class BatchedSimulator:
         self.current_lataccel = self.current_lataccel_history[:, CL - 1].copy()
         self._hist_len = CL  # tracks how many columns are filled
 
-        # Pre-generate all random values for sampling (avoids Python loop per step)
-        self._rng_all = np.empty((T, N), dtype=np.float32)
-        for step in range(T):
-            for i, rng in enumerate(self.rngs):
-                self._rng_all[step, i] = rng.rand()
+        # Pre-generate random values: only T-CL steps (matching reference which
+        # seeds RNG then immediately enters the loop at CONTEXT_LENGTH).
+        # Vectorized: one rng.rand(T-CL) call per episode instead of T*N scalar calls.
+        n_steps = T - CL
+        self._rng_all = np.empty((n_steps, N), dtype=np.float32)
+        for i, rng in enumerate(self.rngs):
+            self._rng_all[:, i] = rng.rand(n_steps).astype(np.float32)
+
+        # Move to GPU once (eliminates 500 per-step CPU→GPU transfers)
+        if os.getenv('CUDA', '0') == '1':
+            import torch
+            self._rng_all_gpu = torch.from_numpy(self._rng_all).cuda()
+        else:
+            self._rng_all_gpu = None
 
     # ── get_state_target_futureplan  (mirrors lines 154-165) ─
 
@@ -320,11 +343,16 @@ class BatchedSimulator:
         h = self._hist_len
         # state & action already written at index h → h-CL+1:h+1
         # current_lataccel not yet written → h-CL:h
+        rng_idx = step_idx - CL
+        if self._rng_all_gpu is not None:
+            rng_u = self._rng_all_gpu[rng_idx]   # already on GPU
+        else:
+            rng_u = self._rng_all[rng_idx]        # numpy (N,)
         result = self.sim_model.get_current_lataccel(
             sim_states=self.state_history[:, h-CL+1:h+1, :],
             actions=self.action_history[:, h-CL+1:h+1],
             past_preds=self.current_lataccel_history[:, h-CL:h],
-            rng_u=self._rng_all[step_idx],
+            rng_u=rng_u,
             return_expected=self.compute_expected,
         )
         if self.compute_expected:
