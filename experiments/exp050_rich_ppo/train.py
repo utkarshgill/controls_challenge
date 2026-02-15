@@ -25,8 +25,8 @@ DELTA_SCALE, MAX_DELTA = 0.25, 0.5
 # PPO
 PI_LR, VF_LR     = 3e-4, 3e-4
 GAMMA, LAMDA      = 0.95, 0.9
-K_EPOCHS, EPS_CLIP = 4, 0.15
-VF_COEF, ENT_COEF = 1.0, 0.01
+K_EPOCHS, EPS_CLIP = 4, 0.2
+VF_COEF, ENT_COEF = 1.0, 0.001
 MINI_BS           = int(os.getenv('MINI_BS', '100000'))
 CRITIC_WARMUP     = 4
 
