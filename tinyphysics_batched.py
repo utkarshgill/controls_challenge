@@ -200,6 +200,12 @@ class BatchedPhysicsModel:
                                            dtype=torch.float32, device='cuda')
             self._tokens_gpu = torch.empty((N, CL),
                                            dtype=torch.int64, device='cuda')
+            self._clamped_buf = torch.empty((N, CL),
+                                            dtype=torch.float64, device='cuda')
+            # Cache shape lists for IOBinding (avoid per-step list() calls)
+            self._states_shape = [N, CL, 4]
+            self._tokens_shape = [N, CL]
+            self._out_shape = [N, CL, VOCAB_SIZE]
             self._cached_N = N
 
     def _predict_gpu(self, input_data, temperature, rng_u):
@@ -228,11 +234,11 @@ class BatchedPhysicsModel:
         io.clear_binding_inputs()
         io.clear_binding_outputs()
         io.bind_input('states', 'cuda', 0, np.float32,
-                      list(states_gpu.shape), states_gpu.data_ptr())
+                      self._states_shape, states_gpu.data_ptr())
         io.bind_input('tokens', 'cuda', 0, np.int64,
-                      list(tokens_gpu.shape), tokens_gpu.data_ptr())
+                      self._tokens_shape, tokens_gpu.data_ptr())
         io.bind_output(self._out_name, 'cuda', 0, np.float32,
-                       list(self._out_gpu.shape), self._out_gpu.data_ptr())
+                       self._out_shape, self._out_gpu.data_ptr())
 
         self.ort_session.run_with_iobinding(io)
 
@@ -299,28 +305,27 @@ class BatchedPhysicsModel:
     def _get_current_lataccel_gpu(self, sim_states, actions, past_preds,
                                    rng_u, return_expected):
         """All-GPU path: tokenize via torch.bucketize, build states,
-        predict, decode — all on GPU.  Returns GPU tensor."""
+        predict, decode — all on GPU.  Returns GPU tensor.
+        Reuses pre-allocated buffers (zero per-step CUDA mallocs)."""
         torch = self._torch
         N, CL = actions.shape
+        self._ensure_gpu_bufs(N, CL)
 
-        # Tokenize on GPU: clamp + bucketize (replaces np.clip + np.digitize)
-        # NOTE: torch.bucketize(right=False) == np.digitize(right=True)
-        clamped = past_preds.clamp(self._lat_lo, self._lat_hi)
-        tokens = torch.bucketize(clamped, self._bins_gpu, right=False).long()
+        # Tokenize on GPU: clamp in-place, bucketize
+        torch.clamp(past_preds, self._lat_lo, self._lat_hi, out=self._clamped_buf)
+        tokens = torch.bucketize(self._clamped_buf, self._bins_gpu, right=False)
 
-        # Build states on GPU: (N, CL, 4) = [actions, sim_states]
-        states = torch.empty((N, CL, 4), dtype=torch.float32, device='cuda')
-        states[:, :, 0] = actions.float()
-        states[:, :, 1:] = sim_states.float()
+        # Build states in pre-allocated buffer
+        self._states_gpu[:, :, 0] = actions.float()
+        self._states_gpu[:, :, 1:] = sim_states.float()
 
-        input_data = {'states': states, 'tokens': tokens}
+        input_data = {'states': self._states_gpu, 'tokens': tokens}
         sample_tokens = self.predict(input_data, temperature=0.8, rng_u=rng_u)
-        # Decode on GPU using float64 bins (must match numpy tokenizer precision)
         sampled = self._bins_gpu[sample_tokens]
 
         if not return_expected:
             return sampled
-        probs = self._last_probs_gpu   # (N, VOCAB_SIZE) on GPU
+        probs = self._last_probs_gpu
         expected = (probs * self._bins_f32_gpu.unsqueeze(0)).sum(dim=-1).double()
         return sampled, expected
 
