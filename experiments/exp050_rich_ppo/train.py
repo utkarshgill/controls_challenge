@@ -446,16 +446,17 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False, ort_session=No
         obs = build_obs_batch(target, current_la, roll_la, v_ego, a_ego,
                               h_act, h_lat, sim.data, step_idx, error_integral=error_integral)
 
-        obs_t = torch.from_numpy(obs)
+        _dev = next(ac.parameters()).device
+        obs_t = torch.from_numpy(obs).to(_dev)
         with torch.inference_mode():
             a_p, b_p = ac.beta_params(obs_t)
-            val = ac.critic(obs_t).squeeze(-1).numpy()
+            val = ac.critic(obs_t).squeeze(-1).cpu().numpy()
 
         if deterministic:
-            raw = (2.0 * a_p / (a_p + b_p) - 1.0).numpy()      # Beta mean
+            raw = (2.0 * a_p / (a_p + b_p) - 1.0).cpu().numpy()
         else:
             x   = torch.distributions.Beta(a_p, b_p).sample()
-            raw = (2.0 * x - 1.0).numpy()
+            raw = (2.0 * x - 1.0).cpu().numpy()
 
         delta  = np.clip(raw.astype(np.float64) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
         action = np.clip(h_act[:, -1] + delta, STEER_RANGE[0], STEER_RANGE[1])
@@ -737,9 +738,14 @@ class Ctx:
         self.tr_f = rest
         self.best = float('inf')
         self.best_ep = -1
-        self.pool = multiprocessing.Pool(
-            WORKERS, initializer=_pool_init, initargs=(self.mdl_path,))
-        # Move to GPU AFTER fork so workers don't inherit broken CUDA context
+        if USE_CUDA:
+            from tinyphysics_batched import make_ort_session
+            self.ort_session = make_ort_session(self.mdl_path)
+            self.pool = None
+        else:
+            self.ort_session = None
+            self.pool = multiprocessing.Pool(
+                WORKERS, initializer=_pool_init, initargs=(self.mdl_path,))
         self.ac.to(DEV)
 
     def save_ckpt(self, path=TMP):
@@ -787,7 +793,10 @@ def evaluate(ctx, files, n=EVAL_N):
         t.start()
         remote_threads.append(t)
 
-    if BATCHED:
+    if USE_CUDA:
+        costs = batched_rollout(local_files, ctx.ac, ctx.mdl_path,
+                                deterministic=True, ort_session=ctx.ort_session)
+    elif BATCHED:
         costs = run_parallel_chunked(ctx.pool, local_files,
                                      _batched_eval_worker, WORKERS,
                                      extra_args=(str(TMP),))
@@ -832,7 +841,10 @@ def train_one_epoch(epoch, ctx, warmup_off=0):
         remote_threads.append(t)
 
     tl0 = time.time()
-    if BATCHED:
+    if USE_CUDA:
+        res = batched_rollout(local_batch, ctx.ac, ctx.mdl_path,
+                              deterministic=False, ort_session=ctx.ort_session)
+    elif BATCHED:
         res = run_parallel_chunked(ctx.pool, local_batch,
                                    _batched_train_worker, WORKERS,
                                    extra_args=(str(TMP),))
@@ -930,8 +942,9 @@ def train():
 
     print(f"\nDone. Best val: {ctx.best:.1f} (epoch {ctx.best_ep})")
     ctx.save_ckpt(EXP_DIR / 'final_model.pt')
-    ctx.pool.terminate()
-    ctx.pool.join()
+    if ctx.pool:
+        ctx.pool.terminate()
+        ctx.pool.join()
     if TMP.exists(): TMP.unlink()
 
 
