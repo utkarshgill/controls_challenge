@@ -110,8 +110,8 @@ def batched_eval(files, model_path, checkpoint_path, device):
     # GPU ring buffers
     h_act   = torch.zeros((N, HIST_LEN), dtype=torch.float64, device=device)
     h_act32 = torch.zeros((N, HIST_LEN), dtype=torch.float32, device=device)
-    h_lat   = torch.zeros((N, HIST_LEN), dtype=torch.float32, device=device)
-    h_error = torch.zeros((N, HIST_LEN), dtype=torch.float32, device=device)
+    h_lat   = torch.zeros((N, HIST_LEN), dtype=torch.float64, device=device)
+    h_error = torch.zeros((N, HIST_LEN), dtype=torch.float64, device=device)
     obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device=device)
 
     # Keep a reference to sim's numpy data for CPU path
@@ -140,8 +140,8 @@ def batched_eval(files, model_path, checkpoint_path, device):
             fplan_lat0 = torch.from_numpy(np.asarray(fplan_lat0_np, dtype=np.float64)).to(device)
             data_src = None
 
-        cla32 = current_la.float()
-        error = (target - current_la).float()
+        cla64 = current_la.double()
+        error = (target - current_la).double()
 
         h_error[:, :-1] = h_error[:, 1:].clone()
         h_error[:, -1] = error
@@ -202,7 +202,7 @@ def batched_eval(files, model_path, checkpoint_path, device):
             c += FUTURE_K
 
         obs_buf.clamp_(-5.0, 5.0)
-        return cla32
+        return cla64
 
     def _onnx_expected_gpu(p_actions, p_states, p_preds):
         """Batched ONNX → E[lataccel]. All inputs are GPU tensors.
@@ -401,10 +401,10 @@ def batched_eval(files, model_path, checkpoint_path, device):
         """Batched controller for all N episodes (GPU: 1 extra arg, CPU: 4 extra args)."""
         if len(args) == 1:
             # GPU path: controller_fn(step_idx, sim_ref)
-            cla32 = _build_obs(step_idx, sim_ref=args[0])
+            cla64 = _build_obs(step_idx, sim_ref=args[0])
         else:
             # CPU path: controller_fn(step_idx, target, cur_la, state_dict, future_plan)
-            cla32 = _build_obs(step_idx, cpu_target=args[0], cpu_cur_la=args[1],
+            cla64 = _build_obs(step_idx, cpu_target=args[0], cpu_cur_la=args[1],
                                cpu_state=args[2], cpu_fplan=args[3])
 
         is_cpu_path = len(args) != 1
@@ -415,7 +415,7 @@ def batched_eval(files, model_path, checkpoint_path, device):
             h_act32[:, :-1] = h_act32[:, 1:].clone()
             h_act32[:, -1] = 0.0
             h_lat[:, :-1] = h_lat[:, 1:].clone()
-            h_lat[:, -1] = cla32
+            h_lat[:, -1] = cla64
             zeros = torch.zeros(N, dtype=torch.float64, device=device)
             return zeros.numpy() if is_cpu_path else zeros
 
@@ -424,10 +424,10 @@ def batched_eval(files, model_path, checkpoint_path, device):
         else:
             with torch.inference_mode():
                 out = actor(obs_buf)
-            a_p = F.softplus(out[:, 0]) + 1.0
-            b_p = F.softplus(out[:, 1]) + 1.0
+            a_p = F.softplus(out[:, 0]).double() + 1.0
+            b_p = F.softplus(out[:, 1]).double() + 1.0
             raw = 2.0 * a_p / (a_p + b_p) - 1.0
-            delta = (raw.double() * DELTA_SCALE).clamp(-MAX_DELTA, MAX_DELTA)
+            delta = (raw * DELTA_SCALE).clamp(-MAX_DELTA, MAX_DELTA)
             action = (h_act[:, -1] + delta).clamp(STEER_RANGE[0], STEER_RANGE[1])
 
         # Update histories
@@ -436,7 +436,7 @@ def batched_eval(files, model_path, checkpoint_path, device):
         h_act32[:, :-1] = h_act32[:, 1:].clone()
         h_act32[:, -1] = action.float()
         h_lat[:, :-1] = h_lat[:, 1:].clone()
-        h_lat[:, -1] = cla32
+        h_lat[:, -1] = cla64
 
         return action.numpy() if is_cpu_path else action
 

@@ -146,11 +146,11 @@ class CSVCache:
         CL = CONTEXT_LENGTH
         n_steps = self.T - CL
         N_all = len(self._files)
-        self._rng_all = np.empty((N_all, n_steps), dtype=np.float32)
+        self._rng_all = np.empty((N_all, n_steps), dtype=np.float64)
         for i, f in enumerate(self._files):
-            seed = int(md5(('data/' + Path(f).name).encode()).hexdigest(), 16) % 10**4
+            seed = int(md5(str(f).encode()).hexdigest(), 16) % 10**4
             rng = np.random.RandomState(seed)
-            self._rng_all[i, :] = rng.rand(n_steps).astype(np.float32)
+            self._rng_all[i, :] = rng.rand(n_steps)
         print(f"  [CSVCache] {N_all} files, T={self.T}, "
               f"loaded in {_t.time()-t0:.1f}s", flush=True)
 
@@ -263,13 +263,14 @@ class BatchedPhysicsModel:
         self._last_probs_gpu = probs                   # keep on GPU
         self._last_probs = None                         # lazy CPU copy
 
-        # Sampling on GPU — rng_u is a GPU tensor slice (no CPU→GPU transfer)
-        cumprobs = torch.cumsum(probs, dim=1)
+        # Sampling on GPU — match np.random.choice: normalize CDF, searchsorted right
+        cdf = torch.cumsum(probs, dim=1)
+        cdf = cdf / cdf[:, -1:]  # normalize like np.random.choice
         if rng_u is not None:
             u = rng_u.unsqueeze(1) if rng_u.dim() == 1 else rng_u
         else:
-            u = torch.rand(N, 1, device='cuda')
-        samples = (cumprobs < u).sum(dim=1).clamp(0, VOCAB_SIZE - 1)
+            u = torch.rand(N, 1, device='cuda', dtype=torch.float64)
+        samples = torch.searchsorted(cdf.double(), u.double()).squeeze(1).clamp(0, VOCAB_SIZE - 1)
         return samples
 
     def _predict_cpu(self, input_data, temperature, rng_u, rngs):
@@ -279,14 +280,15 @@ class BatchedPhysicsModel:
         probs = probs[:, -1, :]
         self._last_probs = probs
         N = probs.shape[0]
-        cumprobs = np.cumsum(probs, axis=1)
+        cdf = np.cumsum(probs, axis=1)
+        cdf /= cdf[:, -1:]  # normalize like np.random.choice
         if rng_u is not None:
-            u = rng_u[:, None].astype(np.float64)
+            u = rng_u.astype(np.float64)
         elif rngs is not None:
-            u = np.array([rng.rand() for rng in rngs], dtype=np.float64)[:, None]
+            u = np.array([rng.rand() for rng in rngs], dtype=np.float64)
         else:
-            u = np.random.rand(N, 1)
-        samples = (cumprobs < u).sum(axis=1).astype(np.intp)
+            u = np.random.rand(N)
+        samples = np.array([np.searchsorted(cdf[i], u[i], side='right') for i in range(N)], dtype=np.intp)
         return np.clip(samples, 0, VOCAB_SIZE - 1)
 
     def get_current_lataccel(self, sim_states, actions, past_preds,
@@ -399,11 +401,11 @@ class BatchedSimulator:
         else:
             self.rngs = []
             for f in getattr(self, 'csv_files', []):
-                seed = int(md5(('data/' + Path(f).name).encode()).hexdigest(), 16) % 10**4
+                seed = int(md5(str(f).encode()).hexdigest(), 16) % 10**4
                 self.rngs.append(np.random.RandomState(seed))
-            self._rng_all = np.empty((n_steps, N), dtype=np.float32)
+            self._rng_all = np.empty((n_steps, N), dtype=np.float64)
             for i, rng in enumerate(self.rngs):
-                self._rng_all[:, i] = rng.rand(n_steps).astype(np.float32)
+                self._rng_all[:, i] = rng.rand(n_steps)
 
         if self._gpu:
             _torch = self._torch
