@@ -1177,10 +1177,9 @@ def train():
         if 'pi_opt' in ckpt:
             ctx.ppo.pi_opt.load_state_dict(ckpt['pi_opt'])
             ctx.ppo.vf_opt.load_state_dict(ckpt['vf_opt'])
-            # Re-apply eps=1e-5 (old checkpoints saved with 1e-8)
-            for opt in (ctx.ppo.pi_opt, ctx.ppo.vf_opt):
-                for pg in opt.param_groups:
-                    pg['eps'] = 1e-5
+            # Re-apply eps and force LR from code (checkpoint may have decayed LR)
+            for pg in ctx.ppo.pi_opt.param_groups: pg['lr'] = PI_LR; pg['eps'] = 1e-5
+            for pg in ctx.ppo.vf_opt.param_groups: pg['lr'] = VF_LR; pg['eps'] = 1e-5
             if 'ret_rms' in ckpt:
                 r = ckpt['ret_rms']
                 ctx.ppo._ret_rms.mean = r['mean']
