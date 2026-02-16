@@ -20,7 +20,7 @@ np.random.seed(42)
 HIST_LEN, FUTURE_K   = 20, 50
 STATE_DIM, HIDDEN     = 256, 256        # 16 core + 40 hist + 200 future
 A_LAYERS, C_LAYERS    = 4, 4
-DELTA_SCALE, MAX_DELTA = 0.1, 0.5
+DELTA_SCALE, MAX_DELTA = 0.2, 0.5
 
 # PPO
 PI_LR, VF_LR     = 3e-4, 3e-4
