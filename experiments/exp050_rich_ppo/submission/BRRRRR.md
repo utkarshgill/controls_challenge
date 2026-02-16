@@ -46,42 +46,27 @@ Every episode is independent. The ONNX model processes `(1, 20, 4)` but it could
 
 ---
 
-## Part 2: Batched Simulation (50 min → 40s)
+## Part 2: Multiprocessing (50 min → 40s)
 
-### The Rewrite
+Every episode is independent. The obvious move: throw cores at it.
 
-I built `tinyphysics_batched.py`, a drop-in replacement that runs N episodes in lockstep. Instead of:
+### Attempt 1: 100 Workers, 1 CSV Each
 
-```
-for episode in 5000_episodes:
-    for step in 580_steps:
-        predict(1, 20, 4)  →  5000 × 580 = 2,900,000 ONNX calls
-```
+Spawned 100 `process_map` workers, each loading its own ONNX session and running a single episode. The MacBook has 12 cores. 100 CPU-bound processes fighting over 12 cores means constant context switching, cache thrashing, and 100 ONNX model loads. Slower than expected.
 
-Now:
+### Attempt 2: 1 Worker, Batched ONNX (100 CSVs)
 
-```
-for step in 580_steps:
-    predict(5000, 20, 4)  →  580 ONNX calls
-```
+The ONNX model accepts arbitrary batch dimensions — `(100, 20, 4)` instead of `(1, 20, 4)`. One worker, one model load, one fat call per step. But a single core running 100 episodes in lockstep through 580 sequential ONNX calls is still bottlenecked by that one core. Very slow.
 
-Same total compute, 5000x fewer kernel launches. The ONNX model's transformer handles the batch dimension natively.
+### Attempt 3: 10 Workers × 10 CSVs
 
-Histories become `(N, T)` arrays instead of Python lists. State becomes `(N, T, 3)`. Every operation (clip, append, slice) operates on arrays, not scalars.
+The sweet spot. 10 workers on 12 cores — minimal context switching, each core stays busy. Each worker loads one ONNX session and processes 10 CSVs sequentially (`chunksize=10`). `process_map` from `tqdm.contrib.concurrent` handles the pool.
 
-### The Parity Trap
-
-Sounds simple. It wasn't. The reference simulator has subtle behaviors:
-
-- **RNG seeding**: Each episode seeds `np.random.seed(hash(filename))`. Batched version needs per-episode `RandomState` objects.
-- **History management**: Reference uses `.append()` on lists. I use pre-allocated arrays with index writes.
-- **`np.digitize` behavior**: `right=True` means "intervals closed on the right." One wrong flag and every token shifts by one, and the autoregressive simulation diverges catastrophically over 500 steps.
-
-Getting exact numerical parity took multiple iterations. A float32 vs float64 mismatch in token decoding caused the score to jump from 49.7 to 59.2. 20% regression from a precision bug in one line.
+Each worker reloads the ONNX model and policy checkpoint per invocation — not elegant, but `process_map` spawns fresh processes so there's no persistent state.
 
 ### Result
 
-5,000 episodes with PID controller: **~40 seconds** on CPU (10 workers with multiprocessing). Down from ~50 minutes for 5000 CSVs. With the RL policy controller it's slower (~80s for 1000 CSVs) because every step runs a neural net forward pass.
+5,000 episodes with PID controller: **~40 seconds** on CPU. Down from ~50 minutes. With the RL policy controller it's slower (~80s for 1000 CSVs) because every step runs a neural net forward pass on top of the ONNX call.
 
 **Speedup: ~75x** 
 
@@ -165,7 +150,9 @@ The MacBook cluster was scrappy, held together by USB-C cables and pickle socket
 
 ## Part 3: Moving to GPU (40s → 20s rollout)
 
-CPU multiprocessing hit a wall. 10 workers, each running a batched ONNX session, still 40s on rollouts. The ONNX model is a transformer. Running `(5000, 20, 4)` through a GPU should be nearly the same latency as `(1, 20, 4)`.
+CPU multiprocessing hit a wall. 10 workers on 12 cores, still ~40s per rollout. The ONNX model is a transformer — it handles arbitrary batch dimensions natively. Running `(5000, 20, 4)` through a GPU should be nearly the same latency as `(1, 20, 4)`.
+
+After renting an RTX 5060 Ti on Vast.ai, I built `tinyphysics_batched.py` — a full rewrite that runs all N episodes in lockstep. Instead of multiprocessing with one episode per worker, one process batches everything into a single ONNX call per step. Histories become `(N, T)` arrays, state becomes `(N, T, 3)`, every operation works on arrays instead of scalars.
 
 ### ONNX Runtime CUDA EP
 
@@ -359,7 +346,7 @@ ctrl: 9.5s -> **1.3s**.
 | Step | What Changed | Rollout Time (5000 eps) | Epoch Time | Cumulative Speedup |
 |---|---|---|---|---|
 | Baseline | Sequential single-episode | ~50 min | N/A | 1x |
-| Batched CPU | N episodes in lockstep, multiprocessing | ~40s | ~60s | 75x |
+| CPU multiprocessing | 10 workers × 10 CSVs, process_map | ~40s | ~60s | 75x |
 | MacBook Cluster | 3 Macs, persistent TCP, weighted splits | ~45s (3000 CSVs) | ~55s | 3x data/time |
 | GPU ONNX | CUDAExecutionProvider, single process | ~25s | ~45s | 120x |
 | IOBinding + GPU tokenize | Zero-copy ONNX I/O, torch.bucketize | ~20s | ~40s | 150x |
@@ -543,7 +530,7 @@ PPO update (3s) processes ~2.5M datapoints through 4 epochs of mini-batch SGD wi
 
 ## Conclusion
 
-1. **Batch** episodes into one ONNX call (75x)
+1. **CPU multiprocessing** — 10 workers × 10 CSVs each (75x)
 2. **MacBook cluster** over Thunderbolt, persistent TCP, weighted splits (3x data throughput)
 3. **GPU ONNX** with CUDAExecutionProvider (1.6x)
 4. **IOBind** inputs and outputs to GPU memory (1.25x)

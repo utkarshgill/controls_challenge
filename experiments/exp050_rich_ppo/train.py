@@ -17,17 +17,17 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 # architecture
-HIST_LEN, FUTURE_K   = 20, 50
-STATE_DIM, HIDDEN     = 256, 256        # 16 core + 40 hist + 200 future
+HIST_LEN, FUTURE_K   = 20, 49            # 49 = true FuturePlan length from tinyphysics.py
+STATE_DIM, HIDDEN     = 350, 256         # flat obs: 16 core + 40 hist + 49*6 future (4 raw + 2 deriv)
 A_LAYERS, C_LAYERS    = 4, 4
-DELTA_SCALE, MAX_DELTA = 0.25, 0.5
+DELTA_SCALE, MAX_DELTA = 0.1, 0.5
 
 # PPO
 PI_LR, VF_LR     = float(os.getenv('PI_LR', '3e-4')), float(os.getenv('VF_LR', '3e-4'))
 GAMMA, LAMDA      = 0.95, 0.9
 K_EPOCHS, EPS_CLIP = 4, 0.2
 VF_COEF, ENT_COEF = 1.0, 0.001
-ACT_SMOOTH        = float(os.getenv('ACT_SMOOTH', '5.0'))  # penalty on |Δaction|²
+ACT_SMOOTH        = float(os.getenv('ACT_SMOOTH', '0.0'))  # penalty on |Δaction|² (0 = match competition metric)
 MINI_BS           = int(os.getenv('MINI_BS', '100000'))
 CRITIC_WARMUP     = 4
 
@@ -124,14 +124,21 @@ def build_obs(target, current, state, fplan,
         max(0.0, 1.0 - fric),
     ], dtype=np.float32)
 
+    fut_lat  = _future_raw(fplan, 'lataccel', target) / S_LAT
+    fut_roll = _future_raw(fplan, 'roll_lataccel', state.roll_lataccel) / S_ROLL
+    fut_v    = _future_raw(fplan, 'v_ego', state.v_ego) / S_VEGO
+    fut_a    = _future_raw(fplan, 'a_ego', state.a_ego) / S_AEGO
+    dfut_lat  = np.diff(np.concatenate([[target / S_LAT], fut_lat])) / DEL_T
+    dfut_roll = np.diff(np.concatenate([[state.roll_lataccel / S_ROLL], fut_roll])) / DEL_T
+
     obs = np.concatenate([
         core,
         np.array(hist_act, np.float32) / S_STEER,
         np.array(hist_lat, np.float32) / S_LAT,
-        _future_raw(fplan, 'lataccel', target) / S_LAT,
-        _future_raw(fplan, 'roll_lataccel', state.roll_lataccel) / S_ROLL,
-        _future_raw(fplan, 'v_ego', state.v_ego) / S_VEGO,
-        _future_raw(fplan, 'a_ego', state.a_ego) / S_AEGO,
+        fut_lat, dfut_lat,
+        fut_roll, dfut_roll,
+        fut_v,
+        fut_a,
     ])
     return np.clip(obs, -5.0, 5.0)
 
@@ -140,27 +147,78 @@ def _ortho_init(module, gain=np.sqrt(2)):
         nn.init.orthogonal_(module.weight, gain=gain)
         nn.init.zeros_(module.bias)
 
+_CORE_DIM  = 16
+_HIST_CONV_OUT = HIDDEN              # history encoder output dim
+_FUT_CONV_OUT  = HIDDEN              # future encoder output dim
+_MLP_IN    = _CORE_DIM + _HIST_CONV_OUT + _FUT_CONV_OUT  # 528
+
+class _TemporalEncoder(nn.Module):
+    """Extracts core features, encodes history and future with separate 1D convs."""
+    def __init__(self):
+        super().__init__()
+        self.hist_conv = nn.Sequential(
+            nn.Conv1d(2, HIDDEN, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(HIDDEN, HIDDEN, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+        )
+        self.fut_conv = nn.Sequential(
+            nn.Conv1d(6, HIDDEN, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(HIDDEN, HIDDEN, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+        )
+
+    def forward(self, obs):
+        core = obs[:, :_CORE_DIM]                                   # (B, 16)
+        i = _CORE_DIM
+        h_act = obs[:, i:i+HIST_LEN];     i += HIST_LEN
+        h_lat = obs[:, i:i+HIST_LEN];     i += HIST_LEN
+        hist_seq = torch.stack([h_act, h_lat], dim=1)              # (B, 2, 20)
+        hist_emb = self.hist_conv(hist_seq)                         # (B, 16)
+
+        fut_lat   = obs[:, i:i+FUTURE_K];   i += FUTURE_K
+        dfut_lat  = obs[:, i:i+FUTURE_K];   i += FUTURE_K
+        fut_roll  = obs[:, i:i+FUTURE_K];   i += FUTURE_K
+        dfut_roll = obs[:, i:i+FUTURE_K];   i += FUTURE_K
+        fut_v     = obs[:, i:i+FUTURE_K];   i += FUTURE_K
+        fut_a     = obs[:, i:i+FUTURE_K];   i += FUTURE_K
+        fut_seq = torch.stack([fut_lat, dfut_lat, fut_roll, dfut_roll,
+                               fut_v, fut_a], dim=1)               # (B, 6, 49)
+        fut_emb = self.fut_conv(fut_seq)                            # (B, 32)
+
+        return torch.cat([core, hist_emb, fut_emb], dim=1)         # (B, 64)
+
+class _Head(nn.Module):
+    """Encoder + MLP head. .parameters() includes both convs and MLP weights."""
+    def __init__(self, out_dim, n_layers):
+        super().__init__()
+        self.enc = _TemporalEncoder()
+        layers = [nn.Linear(_MLP_IN, HIDDEN), nn.ReLU()]
+        for _ in range(n_layers - 1):
+            layers += [nn.Linear(HIDDEN, HIDDEN), nn.ReLU()]
+        layers.append(nn.Linear(HIDDEN, out_dim))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, obs):
+        return self.mlp(self.enc(obs))
+
 class ActorCritic(nn.Module):
     def __init__(self):
         super().__init__()
-        a = [nn.Linear(STATE_DIM, HIDDEN), nn.ReLU()]
-        for _ in range(A_LAYERS - 1):
-            a += [nn.Linear(HIDDEN, HIDDEN), nn.ReLU()]
-        a.append(nn.Linear(HIDDEN, 2))       # Beta: (α_raw, β_raw)
-        self.actor = nn.Sequential(*a)
+        self.actor  = _Head(out_dim=2, n_layers=A_LAYERS)
+        self.critic = _Head(out_dim=1, n_layers=C_LAYERS)
 
-        c = [nn.Linear(STATE_DIM, HIDDEN), nn.ReLU()]
-        for _ in range(C_LAYERS - 1):
-            c += [nn.Linear(HIDDEN, HIDDEN), nn.ReLU()]
-        c.append(nn.Linear(HIDDEN, 1))
-        self.critic = nn.Sequential(*c)
-
-        for layer in self.actor[:-1]:
+        for layer in self.actor.mlp[:-1]:
             _ortho_init(layer)
-        _ortho_init(self.actor[-1], gain=0.01)
-        for layer in self.critic[:-1]:
+        _ortho_init(self.actor.mlp[-1], gain=0.01)
+        for layer in self.critic.mlp[:-1]:
             _ortho_init(layer)
-        _ortho_init(self.critic[-1], gain=1.0)
+        _ortho_init(self.critic.mlp[-1], gain=1.0)
 
     def beta_params(self, obs_t):
         out = self.actor(obs_t)
@@ -448,20 +506,25 @@ def build_obs_batch(target, current, roll_la, v_ego, a_ego,
     ]).astype(np.float32)
 
     end = min(step_idx + FUTURE_PLAN_STEPS, T)
-    fallback = {'target_lataccel': target, 'roll_lataccel': roll_la,
+    cur_vals = {'target_lataccel': target, 'roll_lataccel': roll_la,
                 'v_ego': v_ego, 'a_ego': a_ego}
     futures = []
     for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
                         ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
         slc = fplan_data[attr][:, step_idx+1:end]
         if slc.shape[1] == 0:
-            padded = np.repeat(fallback[attr][:, None], FUTURE_K, axis=1)
+            padded = np.repeat(cur_vals[attr][:, None], FUTURE_K, axis=1)
         elif slc.shape[1] < FUTURE_K:
             padded = np.concatenate([slc,
                 np.repeat(slc[:, -1:], FUTURE_K - slc.shape[1], axis=1)], 1)
         else:
             padded = slc
-        futures.append(padded.astype(np.float32) / scale)
+        padded_scaled = padded.astype(np.float32) / scale
+        futures.append(padded_scaled)
+        if attr in ('target_lataccel', 'roll_lataccel'):
+            cur_col = (cur_vals[attr] / scale).astype(np.float32)[:, None]
+            with_cur = np.concatenate([cur_col, padded_scaled], axis=1)
+            futures.append(np.diff(with_cur, axis=1) / DEL_T)
 
     obs = np.concatenate([core, h_act32 / S_STEER, h_lat / S_LAT] + futures, axis=1)
     return np.clip(obs, -5.0, 5.0)
@@ -487,7 +550,7 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False,
 
 def _batched_rollout_gpu(sim, ac, N, T, deterministic):
     """All-GPU rollout: controller builds obs on GPU, no CPU<->GPU per step."""
-    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 4
+    OBS_DIM = 16 + HIST_LEN * 2 + FUTURE_K * 6
     max_steps = COST_END_IDX - CONTROL_START_IDX
     dg = sim.data_gpu  # GPU tensors: {roll_lataccel, v_ego, a_ego, target_lataccel, steer_command}
 
@@ -564,6 +627,8 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
         obs_buf[:, c:c+HIST_LEN] = h_lat / S_LAT;          c += HIST_LEN
 
         end = min(step_idx + FUTURE_PLAN_STEPS, T)
+        cur_gpu = {'target_lataccel': target, 'roll_lataccel': roll_la,
+                   'v_ego': v_ego, 'a_ego': a_ego}
         for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
                             ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
             slc = dg[attr][:, step_idx+1:end]
@@ -577,6 +642,11 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
             else:
                 obs_buf[:, c:c+FUTURE_K] = slc[:, :FUTURE_K].float() / scale
             c += FUTURE_K
+            if attr in ('target_lataccel', 'roll_lataccel'):
+                cur_col = (cur_gpu[attr] / scale).float().unsqueeze(1)
+                with_cur = torch.cat([cur_col, obs_buf[:, c-FUTURE_K:c]], dim=1)
+                obs_buf[:, c:c+FUTURE_K] = torch.diff(with_cur, dim=1) / DEL_T
+                c += FUTURE_K
 
         obs_buf.clamp_(-5.0, 5.0)
 
@@ -645,7 +715,7 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
     h_act32 = np.zeros((N, HIST_LEN), np.float32)
     h_lat   = np.zeros((N, HIST_LEN), np.float32)
     h_error = np.zeros((N, HIST_LEN), np.float32)
-    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 4
+    OBS_DIM = 16 + HIST_LEN * 2 + FUTURE_K * 6
     obs_buf = np.empty((N, OBS_DIM), np.float32)
     max_steps = COST_END_IDX - CONTROL_START_IDX
     all_obs = np.empty((max_steps, N, OBS_DIM), np.float32)
@@ -700,13 +770,14 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
         obs_buf[:, c:c+HIST_LEN] = h_act32 / S_STEER;     c += HIST_LEN
         obs_buf[:, c:c+HIST_LEN] = h_lat / S_LAT;          c += HIST_LEN
         end = min(step_idx + FUTURE_PLAN_STEPS, T)
+        cur_cpu = {'target_lataccel': target, 'roll_lataccel': roll_la,
+                   'v_ego': v_ego, 'a_ego': a_ego}
         for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
                             ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
             slc = fdata[attr][:, step_idx+1:end]
             w = slc.shape[1]
             if w == 0:
-                fb = {'target_lataccel': target, 'roll_lataccel': roll_la,
-                      'v_ego': v_ego, 'a_ego': a_ego}[attr]
+                fb = cur_cpu[attr]
                 obs_buf[:, c:c+FUTURE_K] = (fb / scale).astype(np.float32)[:, None]
             elif w < FUTURE_K:
                 obs_buf[:, c:c+w] = slc.astype(np.float32) / scale
@@ -714,6 +785,11 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
             else:
                 obs_buf[:, c:c+FUTURE_K] = slc[:, :FUTURE_K].astype(np.float32) / scale
             c += FUTURE_K
+            if attr in ('target_lataccel', 'roll_lataccel'):
+                cur_col = (cur_cpu[attr] / scale).astype(np.float32)[:, None]
+                with_cur = np.concatenate([cur_col, obs_buf[:, c-FUTURE_K:c]], axis=1)
+                obs_buf[:, c:c+FUTURE_K] = np.diff(with_cur, axis=1) / DEL_T
+                c += FUTURE_K
         np.clip(obs_buf, -5.0, 5.0, out=obs_buf)
         obs_t = torch.from_numpy(obs_buf).to(_dev)
         with torch.inference_mode():
