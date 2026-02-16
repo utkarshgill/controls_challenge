@@ -209,9 +209,26 @@ def batched_eval(files, model_path, checkpoint_path, device):
         obs_buf.clamp_(-5.0, 5.0)
         return cla64
 
+    MPC_CHUNK = int(os.getenv('MPC_CHUNK', '8192'))  # max batch for MPC ONNX calls
+
     def _onnx_expected_gpu(p_actions, p_states, p_preds):
-        """Batched ONNX → E[lataccel]. All inputs are GPU tensors.
+        """Batched ONNX → E[lataccel]. Chunks large batches to avoid OOM.
         p_actions: (P, CL), p_states: (P, CL, 3), p_preds: (P, CL)."""
+        nonlocal mpc_out_buf
+        P, CL = p_actions.shape
+
+        if P <= MPC_CHUNK:
+            return _onnx_expected_gpu_inner(p_actions, p_states, p_preds)
+
+        # Chunk to avoid GPU OOM
+        results = []
+        for start in range(0, P, MPC_CHUNK):
+            end = min(start + MPC_CHUNK, P)
+            results.append(_onnx_expected_gpu_inner(
+                p_actions[start:end], p_states[start:end], p_preds[start:end]))
+        return torch.cat(results, dim=0)
+
+    def _onnx_expected_gpu_inner(p_actions, p_states, p_preds):
         nonlocal mpc_out_buf
         P, CL = p_actions.shape
 
