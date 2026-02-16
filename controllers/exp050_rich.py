@@ -26,7 +26,7 @@ STATE_DIM   = 256
 HIDDEN      = 256
 A_LAYERS    = 4
 C_LAYERS    = 4
-DELTA_SCALE = 0.2
+DELTA_SCALE = 0.25
 MAX_DELTA   = 0.5
 WARMUP_N    = CONTROL_START_IDX - CONTEXT_LENGTH
 FUTURE_K    = 50
@@ -40,6 +40,8 @@ S_CURV  = 0.02
 
 MODEL      = os.getenv('MODEL', '')                   # path to controller weights (fallback: best_model.pt)
 LPF_ALPHA  = float(os.getenv('LPF_ALPHA', '0'))      # low-pass: 0=off, 0.15=subtle
+KALMAN_Q   = float(os.getenv('KALMAN_Q', '0'))       # Kalman process noise (0=off, try 0.01)
+KALMAN_R   = float(os.getenv('KALMAN_R', '1.0'))     # Kalman measurement noise (higher=smoother)
 MPC        = int(os.getenv('MPC', '0'))               # predict-and-correct via ONNX
 MPC_K      = float(os.getenv('MPC_K', '0.2'))         # correction gain
 MPC_MAX    = float(os.getenv('MPC_MAX', '0.1'))       # max correction magnitude
@@ -114,6 +116,9 @@ class Controller(BaseController):
         self._gpu_io_cache = {}   # pre-allocated IOBinding buffers
         # Decoupled MPC RNG — independent of simulator's global np.random state
         self._mpc_rng = np.random.RandomState(42)
+        # Kalman filter state
+        self._kf_x = 0.0   # state estimate (smoothed action)
+        self._kf_P = 1.0   # estimate covariance
 
     # ── hook called by TinyPhysicsSimulator.__init__ ──
     def set_model(self, model):
@@ -657,6 +662,17 @@ class Controller(BaseController):
             action = float(np.clip(self._h_act[-1] + delta, *STEER_RANGE))
             if MPC and self._sim_model is not None:
                 action = self._mpc_correct(action, current_lataccel, state, future_plan)
+
+        # ── Kalman smoother: adaptive filtering on action stream ──
+        if KALMAN_Q > 0:
+            # predict
+            x_pred = self._kf_x
+            P_pred = self._kf_P + KALMAN_Q
+            # update
+            K = P_pred / (P_pred + KALMAN_R)
+            self._kf_x = x_pred + K * (action - x_pred)
+            self._kf_P = (1 - K) * P_pred
+            action = self._kf_x
 
         # ── Subtle low-pass: blend towards previous action ──
         if LPF_ALPHA > 0:
