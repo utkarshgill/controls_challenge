@@ -26,7 +26,7 @@ STATE_DIM   = 256
 HIDDEN      = 256
 A_LAYERS    = 4
 C_LAYERS    = 4
-DELTA_SCALE = 0.2
+DELTA_SCALE = 0.25
 MAX_DELTA   = 0.5
 WARMUP_N    = CONTROL_START_IDX - CONTEXT_LENGTH
 FUTURE_K    = 50
@@ -86,22 +86,14 @@ class Controller(BaseController):
         if checkpoint_path is None and MODEL:
             checkpoint_path = MODEL
         if checkpoint_path is None:
-            search_dirs = [
-                Path(__file__).parent.parent / 'experiments' / 'exp050_rich_ppo',
-                Path(__file__).parent,  # same dir as controller
-            ]
-            for d in search_dirs:
-                for name in ('best_model.pt', 'final_model.pt'):
-                    p = d / name
-                    if p.exists():
-                        checkpoint_path = str(p)
-                        break
-                if checkpoint_path is not None:
+            exp = Path(__file__).parent.parent / 'experiments' / 'exp050_rich_ppo'
+            for name in ('best_model.pt', 'final_model.pt'):
+                p = exp / name
+                if p.exists():
+                    checkpoint_path = str(p)
                     break
             if checkpoint_path is None:
-                raise FileNotFoundError(
-                    f"No checkpoint found. Place best_model.pt in controllers/ "
-                    f"or experiments/exp050_rich_ppo/")
+                raise FileNotFoundError(f"No checkpoint in {exp}")
 
         self.ac = ActorCritic()
         data = torch.load(checkpoint_path, weights_only=False, map_location=DEV)
@@ -665,6 +657,7 @@ class Controller(BaseController):
             action = float(np.clip(self._h_act[-1] + delta, *STEER_RANGE))
             if MPC and self._sim_model is not None:
                 action = self._mpc_correct(action, current_lataccel, state, future_plan)
+
 
         # ── Subtle low-pass: blend towards previous action ──
         if LPF_ALPHA > 0:
