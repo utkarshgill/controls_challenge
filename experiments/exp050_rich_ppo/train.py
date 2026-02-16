@@ -20,7 +20,7 @@ np.random.seed(42)
 HIST_LEN, FUTURE_K   = 20, 49            # 49 = true FuturePlan length from tinyphysics.py
 STATE_DIM, HIDDEN     = 350, 256         # flat obs: 16 core + 40 hist + 49*6 future (4 raw + 2 deriv)
 A_LAYERS, C_LAYERS    = 4, 4
-DELTA_SCALE, MAX_DELTA = 0.1, 0.5
+DELTA_SCALE, MAX_DELTA = 0.25, 0.5
 
 # PPO
 PI_LR, VF_LR     = float(os.getenv('PI_LR', '3e-4')), float(os.getenv('VF_LR', '3e-4'))
@@ -148,26 +148,26 @@ def _ortho_init(module, gain=np.sqrt(2)):
         nn.init.zeros_(module.bias)
 
 _CORE_DIM  = 16
-_HIST_CONV_OUT = HIDDEN              # history encoder output dim
-_FUT_CONV_OUT  = HIDDEN              # future encoder output dim
-_MLP_IN    = _CORE_DIM + _HIST_CONV_OUT + _FUT_CONV_OUT  # 528
+_HIST_CONV_OUT = 16                # history encoder output dim
+_FUT_CONV_OUT  = 32                # future encoder output dim
+_MLP_IN    = _CORE_DIM + _HIST_CONV_OUT + _FUT_CONV_OUT  # 64
 
 class _TemporalEncoder(nn.Module):
     """Extracts core features, encodes history and future with separate 1D convs."""
     def __init__(self):
         super().__init__()
         self.hist_conv = nn.Sequential(
-            nn.Conv1d(2, HIDDEN, kernel_size=5, padding=2),
+            nn.Conv1d(2, 16, kernel_size=5, padding=2),
             nn.ReLU(),
-            nn.Conv1d(HIDDEN, HIDDEN, kernel_size=5, padding=2),
+            nn.Conv1d(16, _HIST_CONV_OUT, kernel_size=5, padding=2),
             nn.ReLU(),
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
         )
         self.fut_conv = nn.Sequential(
-            nn.Conv1d(6, HIDDEN, kernel_size=5, padding=2),
+            nn.Conv1d(6, 32, kernel_size=5, padding=2),
             nn.ReLU(),
-            nn.Conv1d(HIDDEN, HIDDEN, kernel_size=5, padding=2),
+            nn.Conv1d(32, _FUT_CONV_OUT, kernel_size=5, padding=2),
             nn.ReLU(),
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
