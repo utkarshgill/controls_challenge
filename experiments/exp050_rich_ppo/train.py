@@ -20,13 +20,14 @@ np.random.seed(42)
 HIST_LEN, FUTURE_K   = 20, 50
 STATE_DIM, HIDDEN     = 256, 256        # 16 core + 40 hist + 200 future
 A_LAYERS, C_LAYERS    = 4, 4
-DELTA_SCALE, MAX_DELTA = 0.25, 0.5
+DELTA_SCALE, MAX_DELTA = 0.2, 0.5
 
 # PPO
-PI_LR, VF_LR     = 3e-4, 3e-4
+PI_LR, VF_LR     = float(os.getenv('PI_LR', '3e-4')), float(os.getenv('VF_LR', '3e-4'))
 GAMMA, LAMDA      = 0.95, 0.9
 K_EPOCHS, EPS_CLIP = 4, 0.2
 VF_COEF, ENT_COEF = 1.0, 0.001
+ACT_SMOOTH        = float(os.getenv('ACT_SMOOTH', '5.0'))  # penalty on |Δaction|²
 MINI_BS           = int(os.getenv('MINI_BS', '100000'))
 CRITIC_WARMUP     = 4
 
@@ -229,9 +230,11 @@ class DeltaController(BaseController):
 def compute_rewards(traj):
     tgt = np.array([t['tgt'] for t in traj], np.float32)
     cur = np.array([t['cur'] for t in traj], np.float32)
+    act = np.array([t.get('act', 0.0) for t in traj], np.float32)
     lat  = (tgt - cur)**2 * 100 * LAT_ACCEL_COST_MULTIPLIER
     jerk = np.diff(cur, prepend=cur[0]) / DEL_T
-    return (-(lat + jerk**2 * 100) / 500.0).astype(np.float32)
+    act_d = np.diff(act, prepend=act[0]) / DEL_T
+    return (-(lat + jerk**2 * 100 + act_d**2 * ACT_SMOOTH) / 500.0).astype(np.float32)
 
 
 class RunningMeanStd:
@@ -504,6 +507,7 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
         all_val = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
         tgt_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
         cur_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
+        act_hist_buf = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
     step_ctr = 0
 
     def controller_fn(step_idx, sim_ref):
@@ -603,6 +607,7 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
             all_val[step_ctr] = val
             tgt_hist[step_ctr] = target
             cur_hist[step_ctr] = current_la
+            act_hist_buf[step_ctr] = action
             step_ctr += 1
 
         return action
@@ -617,9 +622,11 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
     S = step_ctr
     tgt_arr = tgt_hist[:S].T                                   # (N, S)
     cur_arr = cur_hist[:S].T
+    act_arr = act_hist_buf[:S].T                               # (N, S)
     lat_r = (tgt_arr - cur_arr)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
     jerk_r = torch.diff(cur_arr, dim=1, prepend=cur_arr[:, :1]) / DEL_T
-    rew = (-(lat_r + jerk_r**2 * 100) / 500.0).float()        # (N, S)
+    act_dr = torch.diff(act_arr, dim=1, prepend=act_arr[:, :1]) / DEL_T
+    rew = (-(lat_r + jerk_r**2 * 100 + act_dr**2 * ACT_SMOOTH) / 500.0).float()
     dones = torch.zeros((N, S), dtype=torch.float32, device='cuda')
     dones[:, -1] = 1.0
 
@@ -646,6 +653,7 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
     all_val = np.empty((max_steps, N), np.float32)
     tgt_hist = np.empty((max_steps, N), np.float64)
     cur_hist = np.empty((max_steps, N), np.float64)
+    act_hist_buf = np.empty((max_steps, N), np.float64)
     step_ctr = 0
     fdata = sim.data
 
@@ -730,6 +738,7 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
             all_val[step_ctr] = val
             tgt_hist[step_ctr] = target
             cur_hist[step_ctr] = current_la
+            act_hist_buf[step_ctr] = action
             step_ctr += 1
         return action
 
@@ -743,9 +752,11 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
     val_arr = np.ascontiguousarray(all_val[:S].T)
     tgt_arr = tgt_hist[:S].T
     cur_arr = cur_hist[:S].T
+    act_arr = act_hist_buf[:S].T
     lat_r = (tgt_arr - cur_arr)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
     jerk_r = np.diff(cur_arr, axis=1, prepend=cur_arr[:, :1]) / DEL_T
-    rew = (-(lat_r + jerk_r**2 * 100) / 500.0).astype(np.float32)
+    act_dr = np.diff(act_arr, axis=1, prepend=act_arr[:, :1]) / DEL_T
+    rew = (-(lat_r + jerk_r**2 * 100 + act_dr**2 * ACT_SMOOTH) / 500.0).astype(np.float32)
     dones = np.zeros((N, S), np.float32)
     dones[:, -1] = 1.0
     results = []
@@ -1201,7 +1212,7 @@ def train():
     ctx.save_best()
 
     print(f"\nPPO  csvs={CSVS_EPOCH}  epochs={MAX_EP}  workers={WORKERS}  dev={DEV}  (batched chunks)")
-    print(f"  π_lr={PI_LR}  vf_lr={VF_LR}  ent={ENT_COEF}"
+    print(f"  π_lr={PI_LR}  vf_lr={VF_LR}  ent={ENT_COEF}  act_smooth={ACT_SMOOTH}"
           f"  dist=Beta  Δscale={DELTA_SCALE}"
           f"  layers={A_LAYERS}+{C_LAYERS}  K={K_EPOCHS}  dim={STATE_DIM}\n")
 
