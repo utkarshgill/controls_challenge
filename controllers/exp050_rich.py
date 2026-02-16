@@ -112,6 +112,8 @@ class Controller(BaseController):
         self._gpu_ort = None      # GPU ONNX session for MPC (created in set_model)
         self._gpu_bins = None     # tokenizer bins as GPU tensor
         self._gpu_io_cache = {}   # pre-allocated IOBinding buffers
+        # Decoupled MPC RNG — independent of simulator's global np.random state
+        self._mpc_rng = np.random.RandomState(42)
 
     # ── hook called by TinyPhysicsSimulator.__init__ ──
     def set_model(self, model):
@@ -362,7 +364,7 @@ class Controller(BaseController):
 
         # Step-0 candidates: sample N deltas from policy Beta (CPU — tiny N)
         a_p, b_p = self._beta_params(obs)
-        samp = np.random.beta(a_p, b_p, size=N)
+        samp = self._mpc_rng.beta(a_p, b_p, size=N)
         samp[0] = a_p / (a_p + b_p)
         deltas = np.clip((2.0 * samp - 1.0) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
         prev_steer = self._h_act[-1]
@@ -446,7 +448,7 @@ class Controller(BaseController):
                     a_ps = (F.softplus(out[..., 0]) + 1.0)
                     b_ps = (F.softplus(out[..., 1]) + 1.0)
                 # Sample on CPU (Beta dist, tiny N)
-                s = np.random.beta(a_ps.cpu().numpy(), b_ps.cpu().numpy())
+                s = self._mpc_rng.beta(a_ps.cpu().numpy(), b_ps.cpu().numpy())
                 d = np.clip((2.0 * s - 1.0) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
                 cur = torch.from_numpy(
                     np.clip(r_act[:, -1].cpu().numpy() + d, STEER_RANGE[0], STEER_RANGE[1])
@@ -501,7 +503,7 @@ class Controller(BaseController):
 
         # Step-0 candidates: sample N deltas from policy Beta
         a_p, b_p = self._beta_params(obs)
-        samp = np.random.beta(a_p, b_p, size=N)
+        samp = self._mpc_rng.beta(a_p, b_p, size=N)
         samp[0] = a_p / (a_p + b_p)                              # slot 0 = mean (no-regression)
         deltas = np.clip((2.0 * samp - 1.0) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
         prev_steer = self._h_act[-1]
@@ -582,7 +584,7 @@ class Controller(BaseController):
                     out = self.ac.actor(torch.from_numpy(obs_batch).to(DEV))
                     a_ps = (F.softplus(out[..., 0]) + 1.0).cpu().numpy()
                     b_ps = (F.softplus(out[..., 1]) + 1.0).cpu().numpy()
-                s = np.random.beta(a_ps, b_ps)
+                s = self._mpc_rng.beta(a_ps, b_ps)
                 d = np.clip((2.0 * s - 1.0) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
                 cur = np.clip(r_act[:, -1] + d, STEER_RANGE[0], STEER_RANGE[1])
 

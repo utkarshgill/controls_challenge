@@ -98,6 +98,8 @@ def batched_eval(files, model_path, checkpoint_path, device):
     # MPC setup
     do_mpc = MPC_N > 0 and use_gpu
     mpc_ort = _make_mpc_ort(model_path, device) if do_mpc else None
+    # Per-episode MPC RNG — matches controller's RandomState(42) per episode
+    mpc_rngs = [np.random.RandomState(42) for _ in range(N)] if do_mpc else None
     tok = LataccelTokenizer()
     if use_gpu:
         gpu_bins = torch.from_numpy(tok.bins).to(device)
@@ -107,11 +109,14 @@ def batched_eval(files, model_path, checkpoint_path, device):
 
     OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 4
 
-    # GPU ring buffers
+    # GPU ring buffers (match controller's __init__: all start at 0.0)
     h_act   = torch.zeros((N, HIST_LEN), dtype=torch.float64, device=device)
     h_act32 = torch.zeros((N, HIST_LEN), dtype=torch.float32, device=device)
     h_lat   = torch.zeros((N, HIST_LEN), dtype=torch.float64, device=device)
     h_error = torch.zeros((N, HIST_LEN), dtype=torch.float64, device=device)
+    h_roll  = torch.zeros((N, HIST_LEN), dtype=torch.float64, device=device)
+    h_v     = torch.zeros((N, HIST_LEN), dtype=torch.float64, device=device)
+    h_a     = torch.zeros((N, HIST_LEN), dtype=torch.float64, device=device)
     obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device=device)
 
     # Keep a reference to sim's numpy data for CPU path
@@ -227,7 +232,7 @@ def batched_eval(files, model_path, checkpoint_path, device):
 
         logits = out_buf[:, -1, :] / 0.8
         probs = torch.softmax(logits, dim=-1)
-        return (probs * gpu_bins_f32.unsqueeze(0)).sum(dim=-1)  # (P,)
+        return (probs.double() * gpu_bins.unsqueeze(0)).sum(dim=-1)  # (P,) float64
 
     def _mpc_shoot(step_idx, sim_ref):
         """Batched MPC shooting across ALL N episodes × MPC_N candidates.
@@ -235,15 +240,17 @@ def batched_eval(files, model_path, checkpoint_path, device):
         H, CL = MPC_H, CONTEXT_LENGTH
         K = MPC_N  # candidates per episode
 
-        # Get Beta params for all N episodes
+        # Get Beta params for all N episodes (float64 to match controller's .item() + 1.0)
         with torch.inference_mode():
             out = actor(obs_buf)
-        a_p = F.softplus(out[:, 0]) + 1.0  # (N,)
-        b_p = F.softplus(out[:, 1]) + 1.0  # (N,)
+        a_p = F.softplus(out[:, 0]).double() + 1.0  # (N,) float64
+        b_p = F.softplus(out[:, 1]).double() + 1.0  # (N,) float64
 
-        # Sample K candidates per episode → (N, K)
+        # Sample K candidates per episode using per-episode RNG → (N, K)
         a_np, b_np = a_p.cpu().numpy(), b_p.cpu().numpy()
-        samp = np.random.beta(a_np[:, None], b_np[:, None], size=(N, K))  # (N, K)
+        samp = np.empty((N, K), dtype=np.float64)
+        for i in range(N):
+            samp[i] = mpc_rngs[i].beta(a_np[i], b_np[i], size=K)
         samp[:, 0] = a_np / (a_np + b_np)  # slot 0 = mean (no-regression)
         deltas = np.clip((2.0 * samp - 1.0) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
         prev_steer = h_act[:, -1].cpu().numpy()  # (N,)
@@ -254,15 +261,25 @@ def batched_eval(files, model_path, checkpoint_path, device):
         # Flatten: (N*K,) for batched ONNX
         P = N * K
 
-        # ONNX context: tile each episode K times → (N*K, CL, ...)
-        h = sim_ref._hist_len
-        all_pr = sim_ref.current_lataccel_history[:, h-CL:h]   # (N, CL) float64
-        all_st = sim_ref.state_history[:, h-CL+1:h+1, :]       # (N, CL, 3) float64
-        all_ac_base = sim_ref.action_history[:, h-CL+1:h+1]    # (N, CL) float64
+        # ONNX context from controller's internal ring buffers (NOT sim_ref history)
+        # Matches: h_pr = (_h_lat + [current_lataccel])[-CL:]
+        current_la = sim_ref.current_lataccel  # (N,)
+        all_pr_base = torch.cat([h_lat[:, 1:], current_la.unsqueeze(1)], dim=1)  # (N, CL)
+
+        # Matches: h_st = (zip(_h_roll, _h_v, _h_a) + [(state)])[-CL:]
+        roll_la = dg['roll_lataccel'][:, step_idx]
+        v_ego_st = dg['v_ego'][:, step_idx]
+        a_ego_st = dg['a_ego'][:, step_idx]
+        st_buf = torch.stack([h_roll, h_v, h_a], dim=2)  # (N, HIST_LEN, 3)
+        cur_st = torch.stack([roll_la, v_ego_st, a_ego_st], dim=1).unsqueeze(1)  # (N, 1, 3)
+        all_st_base = torch.cat([st_buf[:, 1:, :], cur_st], dim=1)  # (N, CL, 3)
+
+        # Matches: h_ac = _h_act[-CL:]
+        all_ac_base = h_act.clone()  # (N, CL)
 
         # Tile for K candidates: (N, CL) → (N*K, CL)
-        all_pr = all_pr.unsqueeze(1).expand(-1, K, -1).reshape(P, CL)
-        all_st = all_st.unsqueeze(1).expand(-1, K, -1, -1).reshape(P, CL, 3)
+        all_pr = all_pr_base.unsqueeze(1).expand(-1, K, -1).reshape(P, CL)
+        all_st = all_st_base.unsqueeze(1).expand(-1, K, -1, -1).reshape(P, CL, 3)
         all_ac = all_ac_base.unsqueeze(1).expand(-1, K, -1).reshape(P, CL)
 
         # Rolling histories for policy rollout: (N*K, HIST_LEN)
@@ -300,22 +317,28 @@ def batched_eval(files, model_path, checkpoint_path, device):
             # Shift ONNX context
             all_pr = torch.cat([all_pr[:, 1:], pred_la.double().unsqueeze(1)], dim=1)
             all_ac = torch.cat([all_ac[:, 1:], cur.unsqueeze(1)], dim=1)
-            if step < H - 1 and step < fp_len:
-                ns_r = fp_roll[:, step].unsqueeze(1).expand(-1, K).reshape(P, 1)
-                ns_v = fp_v[:, step].unsqueeze(1).expand(-1, K).reshape(P, 1)
-                ns_a = fp_a[:, step].unsqueeze(1).expand(-1, K).reshape(P, 1)
+            if step < H - 1:
+                # Always update all_st — use future plan if available, else last state (fallback)
+                if step < fp_len:
+                    ns_r = fp_roll[:, step].unsqueeze(1).expand(-1, K).reshape(P, 1)
+                    ns_v = fp_v[:, step].unsqueeze(1).expand(-1, K).reshape(P, 1)
+                    ns_a = fp_a[:, step].unsqueeze(1).expand(-1, K).reshape(P, 1)
+                else:
+                    ns_r = all_st[:, -1:, 0]  # (P, 1) fallback
+                    ns_v = all_st[:, -1:, 1]
+                    ns_a = all_st[:, -1:, 2]
                 ns = torch.cat([ns_r, ns_v, ns_a], dim=1).unsqueeze(1)  # (P, 1, 3)
                 all_st = torch.cat([all_st[:, 1:, :], ns], dim=1)
 
-            # History shift
-            r_act = torch.cat([r_act[:, 1:], cur.float().unsqueeze(1)], dim=1)
-            r_lat = torch.cat([r_lat[:, 1:], pred_la.float().unsqueeze(1)], dim=1)
-            r_err = torch.cat([r_err[:, 1:], (tgt.float() - pred_la.float()).unsqueeze(1)], dim=1)
+            # History shift (float64 to match controller's numpy float64 arrays)
+            r_act = torch.cat([r_act[:, 1:], cur.double().unsqueeze(1)], dim=1)
+            r_lat = torch.cat([r_lat[:, 1:], pred_la.double().unsqueeze(1)], dim=1)
+            r_err = torch.cat([r_err[:, 1:], (tgt.double() - pred_la.double()).unsqueeze(1)], dim=1)
             prev_la = pred_la.double()
 
             # Policy-rolled next actions for steps 1+
             if step < H - 1:
-                ei = r_err.mean(dim=1) * DEL_T  # (P,)
+                ei = r_err.mean(dim=1).float() * DEL_T  # (P,) float32, matches controller
                 # Build batched obs for all P candidates
                 # Use future plan data for the shifted state
                 off = step + 1
@@ -350,16 +373,21 @@ def batched_eval(files, model_path, checkpoint_path, device):
                 obs_p[:, c] = p_v.float() / S_VEGO;                 c += 1
                 obs_p[:, c] = p_a.float() / S_AEGO;                 c += 1
                 obs_p[:, c] = p_roll.float() / S_ROLL;              c += 1
-                obs_p[:, c] = r_act[:, -1] / S_STEER;               c += 1
+                obs_p[:, c] = r_act[:, -1].float() / S_STEER;       c += 1
                 obs_p[:, c] = ei / S_LAT;                           c += 1
-                # Approximate future delta
-                obs_p[:, c] = 0.0;                                   c += 1
-                obs_p[:, c] = (pred_la.float() - r_lat[:, -1]) / DEL_T / S_LAT; c += 1
-                obs_p[:, c] = (r_act[:, -1] - r_act[:, -2]) / DEL_T / S_STEER; c += 1
+                # Future delta: (fplan_lat0 - target) / DEL_T / S_LAT
+                # fplan_lat0 = shifted_future_plan.lataccel[0] if available, else target
+                if off < fp_len:
+                    _fpl0 = fp_lat[:, off].unsqueeze(1).expand(-1, K).reshape(P)
+                else:
+                    _fpl0 = p_tgt
+                obs_p[:, c] = (_fpl0.float() - p_tgt.float()) / DEL_T / S_LAT; c += 1
+                obs_p[:, c] = (pred_la.float() - r_lat[:, -1].float()) / DEL_T / S_LAT; c += 1
+                obs_p[:, c] = (r_act[:, -1].float() - r_act[:, -2].float()) / DEL_T / S_STEER; c += 1
                 obs_p[:, c] = fric_p;                                c += 1
                 obs_p[:, c] = torch.clamp(1.0 - fric_p, min=0.0);   c += 1
-                obs_p[:, c:c+HIST_LEN] = r_act / S_STEER;           c += HIST_LEN
-                obs_p[:, c:c+HIST_LEN] = r_lat / S_LAT;             c += HIST_LEN
+                obs_p[:, c:c+HIST_LEN] = r_act.float() / S_STEER;   c += HIST_LEN
+                obs_p[:, c:c+HIST_LEN] = r_lat.float() / S_LAT;    c += HIST_LEN
                 # Future plan: tile from episode level
                 fp_off = off
                 fp_end2 = min(step_idx + 1 + fp_off + FUTURE_K, T)
@@ -383,9 +411,13 @@ def batched_eval(files, model_path, checkpoint_path, device):
 
                 with torch.inference_mode():
                     out_p = actor(obs_p)
-                a_ps = (F.softplus(out_p[:, 0]) + 1.0)
-                b_ps = (F.softplus(out_p[:, 1]) + 1.0)
-                s = np.random.beta(a_ps.cpu().numpy(), b_ps.cpu().numpy())
+                a_ps = (F.softplus(out_p[:, 0]) + 1.0).cpu().numpy()
+                b_ps = (F.softplus(out_p[:, 1]) + 1.0).cpu().numpy()
+                # Per-episode RNG: each episode's K candidates share one RNG
+                s = np.empty(P, dtype=np.float64)
+                for i in range(N):
+                    s[i*K:(i+1)*K] = mpc_rngs[i].beta(
+                        a_ps[i*K:(i+1)*K], b_ps[i*K:(i+1)*K])
                 d = np.clip((2.0 * s - 1.0) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
                 cur = torch.from_numpy(
                     np.clip(r_act[:, -1].cpu().numpy() + d, STEER_RANGE[0], STEER_RANGE[1])
@@ -410,12 +442,27 @@ def batched_eval(files, model_path, checkpoint_path, device):
         is_cpu_path = len(args) != 1
 
         if step_idx < CONTROL_START_IDX:
+            # Matches controller's _push(0.0, current_lataccel, state) during warmup
+            if not is_cpu_path:
+                _roll = dg['roll_lataccel'][:, step_idx]
+                _vv   = dg['v_ego'][:, step_idx]
+                _aa   = dg['a_ego'][:, step_idx]
+            else:
+                _roll = torch.from_numpy(np.asarray(args[2]['roll_lataccel'], dtype=np.float64)).to(device)
+                _vv   = torch.from_numpy(np.asarray(args[2]['v_ego'], dtype=np.float64)).to(device)
+                _aa   = torch.from_numpy(np.asarray(args[2]['a_ego'], dtype=np.float64)).to(device)
             h_act[:, :-1] = h_act[:, 1:].clone()
             h_act[:, -1] = 0.0
             h_act32[:, :-1] = h_act32[:, 1:].clone()
             h_act32[:, -1] = 0.0
             h_lat[:, :-1] = h_lat[:, 1:].clone()
             h_lat[:, -1] = cla64
+            h_roll[:, :-1] = h_roll[:, 1:].clone()
+            h_roll[:, -1] = _roll
+            h_v[:, :-1] = h_v[:, 1:].clone()
+            h_v[:, -1] = _vv
+            h_a[:, :-1] = h_a[:, 1:].clone()
+            h_a[:, -1] = _aa
             zeros = torch.zeros(N, dtype=torch.float64, device=device)
             return zeros.numpy() if is_cpu_path else zeros
 
@@ -430,13 +477,27 @@ def batched_eval(files, model_path, checkpoint_path, device):
             delta = (raw * DELTA_SCALE).clamp(-MAX_DELTA, MAX_DELTA)
             action = (h_act[:, -1] + delta).clamp(STEER_RANGE[0], STEER_RANGE[1])
 
-        # Update histories
+        # Update histories — matches controller's _push(action, current_lataccel, state)
+        if not is_cpu_path:
+            _roll = dg['roll_lataccel'][:, step_idx]
+            _vv   = dg['v_ego'][:, step_idx]
+            _aa   = dg['a_ego'][:, step_idx]
+        else:
+            _roll = torch.from_numpy(np.asarray(args[2]['roll_lataccel'], dtype=np.float64)).to(device)
+            _vv   = torch.from_numpy(np.asarray(args[2]['v_ego'], dtype=np.float64)).to(device)
+            _aa   = torch.from_numpy(np.asarray(args[2]['a_ego'], dtype=np.float64)).to(device)
         h_act[:, :-1] = h_act[:, 1:].clone()
         h_act[:, -1] = action
         h_act32[:, :-1] = h_act32[:, 1:].clone()
         h_act32[:, -1] = action.float()
         h_lat[:, :-1] = h_lat[:, 1:].clone()
         h_lat[:, -1] = cla64
+        h_roll[:, :-1] = h_roll[:, 1:].clone()
+        h_roll[:, -1] = _roll
+        h_v[:, :-1] = h_v[:, 1:].clone()
+        h_v[:, -1] = _vv
+        h_a[:, :-1] = h_a[:, 1:].clone()
+        h_a[:, -1] = _aa
 
         return action.numpy() if is_cpu_path else action
 
@@ -507,7 +568,7 @@ def main():
     parser.add_argument("--sequential", action="store_true",
                         help="Run sequentially with official run_rollout (for parity)")
     parser.add_argument("--verify", action="store_true",
-                        help="Verify parity with MPC_N=0 against official run_rollout")
+                        help="Verify parity against official run_rollout (supports MPC)")
     args = parser.parse_args()
 
     data_path = Path(args.data_path)
@@ -610,12 +671,12 @@ def _sequential_eval(files, args):
 
 
 def _verify(files, args):
-    """Verify parity between batched and sequential with MPC_N=0."""
-    os.environ['MPC_N'] = '0'
-    os.environ['MPC'] = '0'
-    print(f"[verify] {len(files)} files, MPC_N=0 (deterministic), comparing batched vs sequential...")
+    """Verify parity between batched and sequential (supports MPC_N>0)."""
+    mpc_n = int(os.getenv('MPC_N', '0'))
+    mpc_h = int(os.getenv('MPC_H', '1'))
+    print(f"[verify] {len(files)} files, MPC_N={mpc_n}, MPC_H={mpc_h}, comparing batched vs sequential...")
 
-    # Sequential costs
+    # Sequential costs (official run_rollout path)
     seq_costs = []
     for f in tqdm(files, desc="sequential"):
         cost, _, _ = run_rollout(f, args.test_controller, args.model_path)
@@ -628,16 +689,22 @@ def _verify(files, args):
     batch_costs = batch_cost_dict['total_cost']
 
     max_diff = 0.0
+    diffs = []
     for i in range(len(files)):
         diff = abs(seq_costs[i] - batch_costs[i])
+        diffs.append(diff)
         max_diff = max(max_diff, diff)
-        if diff > 0.1:
-            print(f"  [!] {files[i].stem}: seq={seq_costs[i]:.4f} batch={batch_costs[i]:.4f} diff={diff:.4f}")
+        if diff > 1e-6:
+            print(f"  [!] {files[i].stem}: seq={seq_costs[i]:.6f} batch={batch_costs[i]:.6f} diff={diff:.2e}")
 
-    if max_diff < 0.01:
-        print(f"[verify] PASS — max_diff={max_diff:.6f}")
+    mean_diff = np.mean(diffs)
+    print(f"[verify] max_diff={max_diff:.2e}  mean_diff={mean_diff:.2e}")
+    if max_diff < 1e-8:
+        print(f"[verify] PASS — exact parity (<1e-8)")
+    elif max_diff < 1e-4:
+        print(f"[verify] CLOSE — near-parity (likely ONNX batch-size float diffs)")
     else:
-        print(f"[verify] WARN — max_diff={max_diff:.4f} (expected for GPU vs CPU float differences)")
+        print(f"[verify] FAIL — significant divergence")
 
 
 if __name__ == "__main__":
