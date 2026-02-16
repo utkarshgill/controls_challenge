@@ -1,4 +1,4 @@
-# exp050 — 256-dim Beta PPO with delta actions, NLL BC pretrain, Huber VF loss
+# exp050 — 400-dim Beta PPO with delta actions, NLL BC pretrain, Huber VF loss
 
 import numpy as np, pandas as pd, sys, os, time, random, json, subprocess, tempfile, multiprocessing
 import io, pickle, socket, struct, threading
@@ -17,8 +17,8 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 # architecture
-HIST_LEN, FUTURE_K   = 20, 50
-STATE_DIM, HIDDEN     = 256, 256        # 16 core + 40 hist + 200 future
+HIST_LEN, FUTURE_K   = 20, 49
+STATE_DIM, HIDDEN     = 400, 256        # 16 core + 40 hist + 294 future (6×49) + 50 curvature
 A_LAYERS, C_LAYERS    = 4, 4
 DELTA_SCALE, MAX_DELTA = 0.1, 0.5
 
@@ -26,8 +26,8 @@ DELTA_SCALE, MAX_DELTA = 0.1, 0.5
 PI_LR, VF_LR     = float(os.getenv('PI_LR', '3e-4')), float(os.getenv('VF_LR', '3e-4'))
 GAMMA, LAMDA      = 0.95, 0.9
 K_EPOCHS, EPS_CLIP = 4, 0.2
-VF_COEF, ENT_COEF = 1.0, 0.01
-ACT_SMOOTH        = float(os.getenv('ACT_SMOOTH', '0.0'))  # penalty on |Δaction|²
+VF_COEF, ENT_COEF = 1.0, 0.001
+ACT_SMOOTH        = float(os.getenv('ACT_SMOOTH', '5.0'))  # penalty on |Δaction|²
 MINI_BS           = int(os.getenv('MINI_BS', '100000'))
 CRITIC_WARMUP     = 4
 
@@ -53,7 +53,7 @@ DEV        = torch.device('cuda' if USE_CUDA and torch.cuda.is_available() else 
 # observation scaling
 S_LAT, S_STEER = 5.0, 2.0
 S_VEGO, S_AEGO = 40.0, 4.0
-S_ROLL, S_CURV = 2.0, 0.02
+S_ROLL, S_CURV = 2.0, 0.001
 
 EXP_DIR = Path(__file__).parent
 TMP     = EXP_DIR / '.ckpt.pt'
@@ -124,14 +124,25 @@ def build_obs(target, current, state, fplan,
         max(0.0, 1.0 - fric),
     ], dtype=np.float32)
 
+    fut_lat  = _future_raw(fplan, 'lataccel', target)
+    fut_roll = _future_raw(fplan, 'roll_lataccel', state.roll_lataccel)
+    fut_v    = _future_raw(fplan, 'v_ego', state.v_ego)
+    diff_lat  = np.diff(np.concatenate([[target], fut_lat])) / S_LAT
+    diff_roll = np.diff(np.concatenate([[state.roll_lataccel], fut_roll])) / S_ROLL
+    curv = np.concatenate([[k_tgt],
+        (fut_lat - fut_roll) / np.maximum(fut_v * fut_v, 1.0)]) / S_CURV
+
     obs = np.concatenate([
         core,
         np.array(hist_act, np.float32) / S_STEER,
         np.array(hist_lat, np.float32) / S_LAT,
-        _future_raw(fplan, 'lataccel', target) / S_LAT,
-        _future_raw(fplan, 'roll_lataccel', state.roll_lataccel) / S_ROLL,
-        _future_raw(fplan, 'v_ego', state.v_ego) / S_VEGO,
+        fut_lat / S_LAT,
+        fut_roll / S_ROLL,
+        fut_v / S_VEGO,
         _future_raw(fplan, 'a_ego', state.a_ego) / S_AEGO,
+        diff_lat,
+        diff_roll,
+        curv,
     ])
     return np.clip(obs, -5.0, 5.0)
 
@@ -451,6 +462,7 @@ def build_obs_batch(target, current, roll_la, v_ego, a_ego,
     fallback = {'target_lataccel': target, 'roll_lataccel': roll_la,
                 'v_ego': v_ego, 'a_ego': a_ego}
     futures = []
+    raw_padded = {}
     for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
                         ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
         slc = fplan_data[attr][:, step_idx+1:end]
@@ -460,8 +472,21 @@ def build_obs_batch(target, current, roll_la, v_ego, a_ego,
             padded = np.concatenate([slc,
                 np.repeat(slc[:, -1:], FUTURE_K - slc.shape[1], axis=1)], 1)
         else:
-            padded = slc
+            padded = slc[:, :FUTURE_K]
         futures.append(padded.astype(np.float32) / scale)
+        raw_padded[attr] = padded
+
+    for attr, scale, anchor in [('target_lataccel', S_LAT, target),
+                                ('roll_lataccel', S_ROLL, roll_la)]:
+        full = np.concatenate([anchor[:, None], raw_padded[attr].astype(np.float32)], axis=1)
+        futures.append(np.diff(full, axis=1) / scale)
+
+    fut_v2 = np.maximum(raw_padded['v_ego'].astype(np.float32) ** 2, 1.0)
+    curv_future = (raw_padded['target_lataccel'].astype(np.float32)
+                   - raw_padded['roll_lataccel'].astype(np.float32)) / fut_v2
+    curv_current = (k_tgt[:, None]).astype(np.float32)
+    curv = np.concatenate([curv_current, curv_future], axis=1) / S_CURV
+    futures.append(curv)
 
     obs = np.concatenate([core, h_act32 / S_STEER, h_lat / S_LAT] + futures, axis=1)
     return np.clip(obs, -5.0, 5.0)
@@ -487,7 +512,7 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False,
 
 def _batched_rollout_gpu(sim, ac, N, T, deterministic):
     """All-GPU rollout: controller builds obs on GPU, no CPU<->GPU per step."""
-    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 4
+    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 6 + 50
     max_steps = COST_END_IDX - CONTROL_START_IDX
     dg = sim.data_gpu  # GPU tensors: {roll_lataccel, v_ego, a_ego, target_lataccel, steer_command}
 
@@ -542,28 +567,32 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
         fplan_lat0 = dg['target_lataccel'][:, min(step_idx + 1, T - 1)]
         fric = torch.sqrt(current_la**2 + a_ego**2) / 7.0
 
-        c = 0
-        obs_buf[:, c] = target / S_LAT;                    c += 1
-        obs_buf[:, c] = current_la / S_LAT;                c += 1
-        obs_buf[:, c] = (target - current_la) / S_LAT;     c += 1
-        obs_buf[:, c] = k_tgt / S_CURV;                    c += 1
-        obs_buf[:, c] = k_cur / S_CURV;                    c += 1
-        obs_buf[:, c] = (k_tgt - k_cur) / S_CURV;          c += 1
-        obs_buf[:, c] = v_ego / S_VEGO;                    c += 1
-        obs_buf[:, c] = a_ego / S_AEGO;                    c += 1
-        obs_buf[:, c] = roll_la / S_ROLL;                  c += 1
-        obs_buf[:, c] = h_act32[:, -1] / S_STEER;          c += 1
-        obs_buf[:, c] = error_integral / S_LAT;            c += 1
-        obs_buf[:, c] = (fplan_lat0 - target) / DEL_T / S_LAT; c += 1
-        obs_buf[:, c] = (current_la - h_lat[:, -1]) / DEL_T / S_LAT; c += 1
-        obs_buf[:, c] = (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER; c += 1
-        obs_buf[:, c] = fric;                               c += 1
-        obs_buf[:, c] = torch.clamp(1.0 - fric, min=0.0);  c += 1
+        # 16 core features
+        obs_buf[:, 0]  = target / S_LAT
+        obs_buf[:, 1]  = current_la / S_LAT
+        obs_buf[:, 2]  = (target - current_la) / S_LAT
+        obs_buf[:, 3]  = k_tgt / S_CURV
+        obs_buf[:, 4]  = k_cur / S_CURV
+        obs_buf[:, 5]  = (k_tgt - k_cur) / S_CURV
+        obs_buf[:, 6]  = v_ego / S_VEGO
+        obs_buf[:, 7]  = a_ego / S_AEGO
+        obs_buf[:, 8]  = roll_la / S_ROLL
+        obs_buf[:, 9]  = h_act32[:, -1] / S_STEER
+        obs_buf[:, 10] = error_integral / S_LAT
+        obs_buf[:, 11] = (fplan_lat0 - target) / DEL_T / S_LAT
+        obs_buf[:, 12] = (current_la - h_lat[:, -1]) / DEL_T / S_LAT
+        obs_buf[:, 13] = (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER
+        obs_buf[:, 14] = fric
+        obs_buf[:, 15] = torch.clamp(1.0 - fric, min=0.0)
 
-        obs_buf[:, c:c+HIST_LEN] = h_act32 / S_STEER;     c += HIST_LEN
-        obs_buf[:, c:c+HIST_LEN] = h_lat / S_LAT;          c += HIST_LEN
+        # 20 hist_act + 20 hist_lat
+        obs_buf[:, 16:36] = h_act32 / S_STEER
+        obs_buf[:, 36:56] = h_lat / S_LAT
 
+        # 4×49 raw future channels + 2×49 diff channels + 50 curvature
+        c = 56
         end = min(step_idx + FUTURE_PLAN_STEPS, T)
+        raw_slices = {}
         for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
                             ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
             slc = dg[attr][:, step_idx+1:end]
@@ -576,7 +605,45 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
                 obs_buf[:, c+w:c+FUTURE_K] = (slc[:, -1:].float() / scale)
             else:
                 obs_buf[:, c:c+FUTURE_K] = slc[:, :FUTURE_K].float() / scale
+            raw_slices[attr] = slc
             c += FUTURE_K
+
+        for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL)]:
+            slc = raw_slices[attr]
+            anchor = dg[attr][:, step_idx].unsqueeze(1)
+            w = slc.shape[1]
+            if w == 0:
+                obs_buf[:, c:c+FUTURE_K] = 0.0
+            else:
+                full = torch.cat([anchor, slc[:, :FUTURE_K].float()], dim=1)
+                d = torch.diff(full, dim=1) / scale
+                dw = d.shape[1]
+                if dw < FUTURE_K:
+                    obs_buf[:, c:c+dw] = d
+                    obs_buf[:, c+dw:c+FUTURE_K] = 0.0
+                else:
+                    obs_buf[:, c:c+FUTURE_K] = d[:, :FUTURE_K]
+            c += FUTURE_K
+
+        # 50-dim curvature: current step + 49 future
+        obs_buf[:, c] = k_tgt / S_CURV
+        c += 1
+        slc_lat = raw_slices['target_lataccel']
+        slc_roll = raw_slices['roll_lataccel']
+        slc_v = raw_slices['v_ego']
+        w = slc_lat.shape[1]
+        if w == 0:
+            obs_buf[:, c:c+FUTURE_K] = (k_tgt / S_CURV).unsqueeze(1)
+        else:
+            fv2 = torch.clamp(slc_v[:, :FUTURE_K].float() ** 2, min=1.0)
+            fk = (slc_lat[:, :FUTURE_K].float() - slc_roll[:, :FUTURE_K].float()) / fv2 / S_CURV
+            fw = fk.shape[1]
+            if fw < FUTURE_K:
+                obs_buf[:, c:c+fw] = fk
+                obs_buf[:, c+fw:c+FUTURE_K] = fk[:, -1:]
+            else:
+                obs_buf[:, c:c+FUTURE_K] = fk
+        c += FUTURE_K
 
         obs_buf.clamp_(-5.0, 5.0)
 
@@ -645,7 +712,7 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
     h_act32 = np.zeros((N, HIST_LEN), np.float32)
     h_lat   = np.zeros((N, HIST_LEN), np.float32)
     h_error = np.zeros((N, HIST_LEN), np.float32)
-    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 4
+    OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 6 + 50
     obs_buf = np.empty((N, OBS_DIM), np.float32)
     max_steps = COST_END_IDX - CONTROL_START_IDX
     all_obs = np.empty((max_steps, N, OBS_DIM), np.float32)
@@ -680,26 +747,33 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
         k_cur = (current_la - roll_la) / v2
         fplan_lat0 = fdata['target_lataccel'][:, min(step_idx + 1, T - 1)]
         fric = np.sqrt(current_la**2 + a_ego**2) / 7.0
-        c = 0
-        obs_buf[:, c] = target / S_LAT;                    c += 1
-        obs_buf[:, c] = current_la / S_LAT;                c += 1
-        obs_buf[:, c] = (target - current_la) / S_LAT;     c += 1
-        obs_buf[:, c] = k_tgt / S_CURV;                    c += 1
-        obs_buf[:, c] = k_cur / S_CURV;                    c += 1
-        obs_buf[:, c] = (k_tgt - k_cur) / S_CURV;          c += 1
-        obs_buf[:, c] = v_ego / S_VEGO;                    c += 1
-        obs_buf[:, c] = a_ego / S_AEGO;                    c += 1
-        obs_buf[:, c] = roll_la / S_ROLL;                  c += 1
-        obs_buf[:, c] = h_act32[:, -1] / S_STEER;          c += 1
-        obs_buf[:, c] = error_integral / S_LAT;            c += 1
-        obs_buf[:, c] = (fplan_lat0 - target) / DEL_T / S_LAT; c += 1
-        obs_buf[:, c] = (current_la - h_lat[:, -1]) / DEL_T / S_LAT; c += 1
-        obs_buf[:, c] = (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER; c += 1
-        obs_buf[:, c] = fric;                               c += 1
-        obs_buf[:, c] = np.maximum(0.0, 1.0 - fric);       c += 1
-        obs_buf[:, c:c+HIST_LEN] = h_act32 / S_STEER;     c += HIST_LEN
-        obs_buf[:, c:c+HIST_LEN] = h_lat / S_LAT;          c += HIST_LEN
+
+        # 16 core features
+        obs_buf[:, 0]  = target / S_LAT
+        obs_buf[:, 1]  = current_la / S_LAT
+        obs_buf[:, 2]  = (target - current_la) / S_LAT
+        obs_buf[:, 3]  = k_tgt / S_CURV
+        obs_buf[:, 4]  = k_cur / S_CURV
+        obs_buf[:, 5]  = (k_tgt - k_cur) / S_CURV
+        obs_buf[:, 6]  = v_ego / S_VEGO
+        obs_buf[:, 7]  = a_ego / S_AEGO
+        obs_buf[:, 8]  = roll_la / S_ROLL
+        obs_buf[:, 9]  = h_act32[:, -1] / S_STEER
+        obs_buf[:, 10] = error_integral / S_LAT
+        obs_buf[:, 11] = (fplan_lat0 - target) / DEL_T / S_LAT
+        obs_buf[:, 12] = (current_la - h_lat[:, -1]) / DEL_T / S_LAT
+        obs_buf[:, 13] = (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER
+        obs_buf[:, 14] = fric
+        obs_buf[:, 15] = np.maximum(0.0, 1.0 - fric)
+
+        # 20 hist_act + 20 hist_lat
+        obs_buf[:, 16:36] = h_act32 / S_STEER
+        obs_buf[:, 36:56] = h_lat / S_LAT
+
+        # 4×49 raw future channels + 2×49 diff channels + 50 curvature
+        c = 56
         end = min(step_idx + FUTURE_PLAN_STEPS, T)
+        raw_slices = {}
         for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
                             ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
             slc = fdata[attr][:, step_idx+1:end]
@@ -713,7 +787,45 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
                 obs_buf[:, c+w:c+FUTURE_K] = (slc[:, -1:].astype(np.float32) / scale)
             else:
                 obs_buf[:, c:c+FUTURE_K] = slc[:, :FUTURE_K].astype(np.float32) / scale
+            raw_slices[attr] = slc
             c += FUTURE_K
+
+        for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL)]:
+            slc = raw_slices[attr]
+            anchor_val = {'target_lataccel': target, 'roll_lataccel': roll_la}[attr]
+            w = slc.shape[1]
+            if w == 0:
+                obs_buf[:, c:c+FUTURE_K] = 0.0
+            else:
+                full = np.concatenate([anchor_val[:, None], slc[:, :FUTURE_K].astype(np.float32)], axis=1)
+                d = np.diff(full, axis=1) / scale
+                dw = d.shape[1]
+                if dw < FUTURE_K:
+                    obs_buf[:, c:c+dw] = d
+                    obs_buf[:, c+dw:c+FUTURE_K] = 0.0
+                else:
+                    obs_buf[:, c:c+FUTURE_K] = d[:, :FUTURE_K]
+            c += FUTURE_K
+
+        # 50-dim curvature: current step + 49 future
+        obs_buf[:, c] = k_tgt / S_CURV
+        c += 1
+        slc_lat = raw_slices['target_lataccel']
+        slc_roll = raw_slices['roll_lataccel']
+        slc_v = raw_slices['v_ego']
+        w = slc_lat.shape[1]
+        if w == 0:
+            obs_buf[:, c:c+FUTURE_K] = (k_tgt / S_CURV)[:, None]
+        else:
+            fv2 = np.maximum(slc_v[:, :FUTURE_K].astype(np.float32) ** 2, 1.0)
+            fk = (slc_lat[:, :FUTURE_K].astype(np.float32) - slc_roll[:, :FUTURE_K].astype(np.float32)) / fv2 / S_CURV
+            fw = fk.shape[1]
+            if fw < FUTURE_K:
+                obs_buf[:, c:c+fw] = fk
+                obs_buf[:, c+fw:c+FUTURE_K] = fk[:, -1:]
+            else:
+                obs_buf[:, c:c+FUTURE_K] = fk
+        c += FUTURE_K
         np.clip(obs_buf, -5.0, 5.0, out=obs_buf)
         obs_t = torch.from_numpy(obs_buf).to(_dev)
         with torch.inference_mode():

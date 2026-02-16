@@ -1,4 +1,4 @@
-"""exp050: Physics-Aligned PPO controller (256-dim, Beta, ReLU, 4+4 layers, deterministic)
+"""exp050: Physics-Aligned PPO controller (400-dim, Beta, ReLU, 4+4 layers, deterministic)
 With optional N-step MPC correction via ONNX physics model + future_plan lookahead.
 CUDA=1 enables GPU-accelerated MPC (actor + ONNX on GPU, all tensors GPU-resident).
 """
@@ -22,21 +22,21 @@ if not USE_CUDA:
     torch.set_num_threads(1)
 
 HIST_LEN    = 20
-STATE_DIM   = 256
+STATE_DIM   = 400
 HIDDEN      = 256
 A_LAYERS    = 4
 C_LAYERS    = 4
 DELTA_SCALE = 0.1
 MAX_DELTA   = 0.5
 WARMUP_N    = CONTROL_START_IDX - CONTEXT_LENGTH
-FUTURE_K    = 50
+FUTURE_K    = 49
 
 S_LAT   = 5.0
 S_STEER = 2.0
 S_VEGO  = 40.0
 S_AEGO  = 4.0
 S_ROLL  = 2.0
-S_CURV  = 0.02
+S_CURV  = 0.001
 
 MODEL      = os.getenv('MODEL', '')                   # path to controller weights (fallback: best_model.pt)
 LPF_ALPHA  = float(os.getenv('LPF_ALPHA', '0'))      # low-pass: 0=off, 0.15=subtle
@@ -150,7 +150,7 @@ class Controller(BaseController):
         self._h_roll = self._h_roll[1:] + [state.roll_lataccel]
 
     def _build_obs(self, target_lataccel, current_lataccel, state, future_plan, error_integral, h_act, h_lat):
-        """Build the 256-dim observation vector."""
+        """Build the 400-dim observation vector."""
         error = target_lataccel - current_lataccel
         k_tgt = _curv(target_lataccel, state.roll_lataccel, state.v_ego)
         k_cur = _curv(current_lataccel, state.roll_lataccel, state.v_ego)
@@ -177,19 +177,30 @@ class Controller(BaseController):
             max(0.0, 1.0 - fric),
         ], dtype=np.float32)
 
+        fut_lat  = _future_raw(future_plan, 'lataccel', target_lataccel)
+        fut_roll = _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel)
+        fut_v    = _future_raw(future_plan, 'v_ego', state.v_ego)
+        diff_lat  = np.diff(np.concatenate([[target_lataccel], fut_lat])) / S_LAT
+        diff_roll = np.diff(np.concatenate([[state.roll_lataccel], fut_roll])) / S_ROLL
+        curv = np.concatenate([[k_tgt],
+            (fut_lat - fut_roll) / np.maximum(fut_v * fut_v, 1.0)]) / S_CURV
+
         obs = np.concatenate([
             core,
             np.array(h_act, np.float32) / S_STEER,
             np.array(h_lat, np.float32) / S_LAT,
-            _future_raw(future_plan, 'lataccel', target_lataccel) / S_LAT,
-            _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel) / S_ROLL,
-            _future_raw(future_plan, 'v_ego', state.v_ego) / S_VEGO,
+            fut_lat / S_LAT,
+            fut_roll / S_ROLL,
+            fut_v / S_VEGO,
             _future_raw(future_plan, 'a_ego', state.a_ego) / S_AEGO,
+            diff_lat,
+            diff_roll,
+            curv,
         ])
         return np.clip(obs, -5.0, 5.0)
 
     def _build_obs_batch(self, target, cur_la, state, future_plan, ei, h_act, h_lat):
-        """Vectorised obs for N candidates. cur_la/ei: (N,), h_act/h_lat: (N,20). Returns (N,256)."""
+        """Vectorised obs for N candidates. cur_la/ei: (N,), h_act/h_lat: (N,20). Returns (N,400)."""
         N = len(cur_la)
         k_tgt = _curv(target, state.roll_lataccel, state.v_ego)
         _flat = getattr(future_plan, 'lataccel', None)
@@ -218,12 +229,23 @@ class Controller(BaseController):
             np.maximum(0.0, 1.0 - fric),
         ]).astype(np.float32)
 
+        fut_lat  = _future_raw(future_plan, 'lataccel', target)
+        fut_roll = _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel)
+        fut_v    = _future_raw(future_plan, 'v_ego', state.v_ego)
+        diff_lat  = np.diff(np.concatenate([[target], fut_lat])) / S_LAT
+        diff_roll = np.diff(np.concatenate([[state.roll_lataccel], fut_roll])) / S_ROLL
+        curv = np.concatenate([[k_tgt],
+            (fut_lat - fut_roll) / np.maximum(fut_v * fut_v, 1.0)]) / S_CURV
+
         fp = np.concatenate([
-            _future_raw(future_plan, 'lataccel', target) / S_LAT,
-            _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel) / S_ROLL,
-            _future_raw(future_plan, 'v_ego', state.v_ego) / S_VEGO,
+            fut_lat / S_LAT,
+            fut_roll / S_ROLL,
+            fut_v / S_VEGO,
             _future_raw(future_plan, 'a_ego', state.a_ego) / S_AEGO,
-        ])  # (200,) — shared, tile once
+            diff_lat,
+            diff_roll,
+            curv,
+        ])  # (344,) — shared, tile once
         return np.clip(np.concatenate([
             core,
             h_act.astype(np.float32) / S_STEER,
@@ -458,7 +480,7 @@ class Controller(BaseController):
 
     def _build_obs_batch_gpu(self, target, cur_la, state, future_plan, ei, h_act, h_lat):
         """GPU vectorised obs for N candidates. cur_la/ei: (N,) GPU, h_act/h_lat: (N,20) GPU.
-        Returns (N, 256) float32 GPU tensor."""
+        Returns (N, 400) float32 GPU tensor."""
         N = cur_la.shape[0]
         k_tgt = _curv(target, state.roll_lataccel, state.v_ego)
         _flat = getattr(future_plan, 'lataccel', None)
@@ -487,12 +509,23 @@ class Controller(BaseController):
             torch.clamp(1.0 - fric, min=0.0),
         ], dim=1)  # (N, 16)
 
+        fut_lat_np  = _future_raw(future_plan, 'lataccel', target)
+        fut_roll_np = _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel)
+        fut_v_np    = _future_raw(future_plan, 'v_ego', state.v_ego)
+        diff_lat_np  = np.diff(np.concatenate([[target], fut_lat_np])) / S_LAT
+        diff_roll_np = np.diff(np.concatenate([[state.roll_lataccel], fut_roll_np])) / S_ROLL
+        curv_np = np.concatenate([[k_tgt],
+            (fut_lat_np - fut_roll_np) / np.maximum(fut_v_np * fut_v_np, 1.0)]) / S_CURV
+
         fp = torch.tensor(np.concatenate([
-            _future_raw(future_plan, 'lataccel', target) / S_LAT,
-            _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel) / S_ROLL,
-            _future_raw(future_plan, 'v_ego', state.v_ego) / S_VEGO,
+            fut_lat_np / S_LAT,
+            fut_roll_np / S_ROLL,
+            fut_v_np / S_VEGO,
             _future_raw(future_plan, 'a_ego', state.a_ego) / S_AEGO,
-        ]), dtype=torch.float32, device=DEV).unsqueeze(0).expand(N, -1)  # (N, 200)
+            diff_lat_np,
+            diff_roll_np,
+            curv_np,
+        ]), dtype=torch.float32, device=DEV).unsqueeze(0).expand(N, -1)  # (N, 344)
 
         obs = torch.cat([core, h_act / S_STEER, h_lat / S_LAT, fp], dim=1)
         return obs.clamp(-5.0, 5.0)
