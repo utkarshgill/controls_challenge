@@ -20,7 +20,7 @@ np.random.seed(42)
 HIST_LEN, FUTURE_K   = 20, 49            # 49 = true FuturePlan length from tinyphysics.py
 STATE_DIM, HIDDEN     = 350, 256         # flat obs: 16 core + 40 hist + 49*6 future (4 raw + 2 deriv)
 A_LAYERS, C_LAYERS    = 4, 4
-DELTA_SCALE, MAX_DELTA = 0.1, 0.5
+DELTA_SCALE, MAX_DELTA = 0.01, 0.5
 
 # PPO
 PI_LR, VF_LR     = float(os.getenv('PI_LR', '3e-4')), float(os.getenv('VF_LR', '3e-4'))
