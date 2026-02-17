@@ -26,7 +26,7 @@ DELTA_SCALE, MAX_DELTA = 0.25, 0.5
 PI_LR, VF_LR     = float(os.getenv('PI_LR', '3e-4')), float(os.getenv('VF_LR', '3e-4'))
 GAMMA, LAMDA      = 0.95, 0.9
 K_EPOCHS, EPS_CLIP = 4, 0.2
-VF_COEF, ENT_COEF = 1.0, 0.01
+VF_COEF, ENT_COEF = 1.0, 0.001
 ACT_SMOOTH        = float(os.getenv('ACT_SMOOTH', '5.0'))  # penalty on |Δaction|²
 MINI_BS           = int(os.getenv('MINI_BS', '100000'))
 CRITIC_WARMUP     = 4
@@ -150,6 +150,8 @@ def _ortho_init(module, gain=np.sqrt(2)):
 class ActorCritic(nn.Module):
     def __init__(self):
         super().__init__()
+        self.ff_gain = nn.Parameter(torch.tensor(1.0))
+
         a = [nn.Linear(STATE_DIM, HIDDEN), nn.ReLU()]
         for _ in range(A_LAYERS - 1):
             a += [nn.Linear(HIDDEN, HIDDEN), nn.ReLU()]
@@ -168,6 +170,13 @@ class ActorCritic(nn.Module):
         for layer in self.critic[:-1]:
             _ortho_init(layer)
         _ortho_init(self.critic[-1], gain=1.0)
+
+    def feedforward_delta(self, target_la, road_la, v_ego,
+                          current_la):
+        v2    = torch.clamp(v_ego ** 2, min=1.0)
+        kappa_desired = (target_la - road_la) / v2
+        kappa_actual  = (current_la - road_la) / v2
+        return (kappa_desired - kappa_actual) * self.ff_gain
 
     def beta_params(self, obs_t):
         out = self.actor(obs_t)
@@ -224,8 +233,14 @@ class DeltaController(BaseController):
                         error_integral=error_integral)
         raw, val = self.ac.act(obs, self.det)
 
-        delta  = float(np.clip(raw * DELTA_SCALE, -MAX_DELTA, MAX_DELTA))
-        action = float(np.clip(self._h_act[-1] + delta, *STEER_RANGE))
+        ff_val = self.ac.ff_gain.item()
+        v2 = max(state.v_ego ** 2, 1.0)
+        kappa_desired = (target_lataccel - state.roll_lataccel) / v2
+        kappa_actual  = (current_lataccel - state.roll_lataccel) / v2
+        delta_ff = (kappa_desired - kappa_actual) * ff_val
+
+        delta_corr = float(raw * DELTA_SCALE)
+        action = float(np.clip(self._h_act[-1] + delta_ff + delta_corr, *STEER_RANGE))
         self._push(action, current_lataccel, state)
 
         if step_idx < COST_END_IDX:
@@ -278,7 +293,7 @@ class RunningMeanStd:
 class PPO:
     def __init__(self, ac):
         self.ac = ac
-        self.pi_opt = optim.Adam(ac.actor.parameters(), lr=PI_LR, eps=1e-5)
+        self.pi_opt = optim.Adam(list(ac.actor.parameters()) + [ac.ff_gain], lr=PI_LR, eps=1e-5)
         self.vf_opt = optim.Adam(ac.critic.parameters(), lr=VF_LR, eps=1e-5)
         self._ret_rms = RunningMeanStd()  # for return normalization
 
@@ -513,6 +528,8 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
     h_error = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
     obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device='cuda')
 
+    ff_val = ac.ff_gain.double().detach()
+
     # Obs layout offsets
     C = 16
     H1 = C + HIST_LEN
@@ -628,8 +645,13 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
             x = torch.distributions.Beta(a_p, b_p).sample()
             raw = 2.0 * x - 1.0
 
-        delta  = (raw.double() * DELTA_SCALE).clamp(-MAX_DELTA, MAX_DELTA)
-        action = (h_act[:, -1] + delta).clamp(STEER_RANGE[0], STEER_RANGE[1])
+        v2_ff = torch.clamp(v_ego ** 2, min=1.0)
+        kappa_desired = (target - roll_la) / v2_ff
+        kappa_actual  = (current_la - roll_la) / v2_ff
+        delta_ff = (kappa_desired - kappa_actual) * ff_val
+
+        delta_corr = raw.double() * DELTA_SCALE
+        action = (h_act[:, -1] + delta_ff + delta_corr).clamp(STEER_RANGE[0], STEER_RANGE[1])
 
         # Shift and write
         h_act[:, :-1] = h_act[:, 1:]
@@ -694,6 +716,8 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
     act_hist_buf = np.empty((max_steps, N), np.float64)
     step_ctr = 0
     fdata = sim.data
+
+    ff_val_cpu = ac.ff_gain.item()
 
     def controller_fn(step_idx, target, current_la, state_dict, future_plan):
         nonlocal h_act, h_act32, h_lat, h_error, step_ctr
@@ -786,8 +810,13 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
         else:
             x   = torch.distributions.Beta(a_p, b_p).sample()
             raw = (2.0 * x - 1.0).cpu().numpy()
-        delta  = np.clip(raw.astype(np.float64) * DELTA_SCALE, -MAX_DELTA, MAX_DELTA)
-        action = np.clip(h_act[:, -1] + delta, STEER_RANGE[0], STEER_RANGE[1])
+        v2_ff = np.maximum(v_ego ** 2, 1.0)
+        kappa_desired = (target - roll_la) / v2_ff
+        kappa_actual  = (current_la - roll_la) / v2_ff
+        delta_ff = (kappa_desired - kappa_actual) * ff_val_cpu
+
+        delta_corr = raw.astype(np.float64) * DELTA_SCALE
+        action = np.clip(h_act[:, -1] + delta_ff + delta_corr, STEER_RANGE[0], STEER_RANGE[1])
         h_act[:, :-1] = h_act[:, 1:]
         h_act[:, -1] = action
         h_act32[:, :-1] = h_act32[:, 1:]
@@ -927,7 +956,9 @@ def _bc_worker(csv_path):
     })
     steer = data['steer_command'].values
     tgt   = data['target_lataccel'].values
-    obs_list, raw_list = [], []
+    roll  = data['roll_lataccel'].values
+    vego  = data['v_ego'].values
+    obs_list, phys_list = [], []
     h_act  = [0.0] * HIST_LEN
     h_lat  = [0.0] * HIST_LEN
     h_v    = [0.0] * HIST_LEN
@@ -939,45 +970,47 @@ def _bc_worker(csv_path):
         current_la = tgt[step_idx]  # BC assumes perfect tracking
 
         state = State(
-            roll_lataccel=data['roll_lataccel'].values[step_idx],
-            v_ego=data['v_ego'].values[step_idx],
+            roll_lataccel=roll[step_idx],
+            v_ego=vego[step_idx],
             a_ego=data['a_ego'].values[step_idx])
         fplan = FuturePlan(
             lataccel=tgt[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist(),
-            roll_lataccel=data['roll_lataccel'].values[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist(),
-            v_ego=data['v_ego'].values[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist(),
+            roll_lataccel=roll[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist(),
+            v_ego=vego[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist(),
             a_ego=data['a_ego'].values[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist())
 
         obs = build_obs(target_la, current_la, state, fplan,
                         h_act, h_lat, h_v, h_a, h_roll)
 
         prev_act = h_act[-1]
-        delta = steer[step_idx] - prev_act
-        raw_target = np.clip(delta / DELTA_SCALE, -1.0, 1.0)  # Beta support
+        expert_delta = steer[step_idx] - prev_act
         obs_list.append(obs)
-        raw_list.append(raw_target)
+        phys_list.append([target_la, roll[step_idx], vego[step_idx],
+                          current_la, expert_delta])
+
         h_act = h_act[1:] + [steer[step_idx]]
         h_lat = h_lat[1:] + [tgt[step_idx]]
-        h_v = h_v[1:] + [data['v_ego'].values[step_idx]]
+        h_v = h_v[1:] + [vego[step_idx]]
         h_a = h_a[1:] + [data['a_ego'].values[step_idx]]
-        h_roll = h_roll[1:] + [data['roll_lataccel'].values[step_idx]]
+        h_roll = h_roll[1:] + [roll[step_idx]]
 
     return (np.array(obs_list, np.float32),
-            np.array(raw_list, np.float32))
+            np.array(phys_list, np.float32))
 
 
 def pretrain_bc(ac, csv_files, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
     print(f"BC pretrain: extracting from {len(csv_files)} CSVs ...")
     results = process_map(_bc_worker, [str(f) for f in csv_files],
                           max_workers=BC_WORKERS, chunksize=50, disable=False)
-    all_obs = np.concatenate([r[0] for r in results])
-    all_raw = np.concatenate([r[1] for r in results])
+    all_obs  = np.concatenate([r[0] for r in results])
+    all_phys = np.concatenate([r[1] for r in results])
     N = len(all_obs)
     print(f"BC pretrain: {N} samples, {epochs} epochs")
 
-    obs_t = torch.FloatTensor(all_obs).to(DEV)
-    raw_t = torch.FloatTensor(all_raw).to(DEV)
-    opt = optim.AdamW(ac.actor.parameters(), lr=lr, weight_decay=1e-4)
+    obs_t  = torch.FloatTensor(all_obs).to(DEV)
+    phys_t = torch.FloatTensor(all_phys).to(DEV)
+    opt = optim.AdamW(list(ac.actor.parameters()) + [ac.ff_gain],
+                      lr=lr, weight_decay=1e-4)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     for ep in range(epochs):
@@ -986,16 +1019,22 @@ def pretrain_bc(ac, csv_files, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
         n_batches = 0
         for idx in perm.split(batch_size):
             a_p, b_p = ac.beta_params(obs_t[idx])
-            x_target = ((raw_t[idx] + 1.0) / 2.0).clamp(1e-6, 1 - 1e-6)
+            delta_ff = ac.feedforward_delta(
+                phys_t[idx, 0], phys_t[idx, 1], phys_t[idx, 2],
+                phys_t[idx, 3])
+            expert_delta = phys_t[idx, 4]
+            correction = expert_delta - delta_ff
+            x_target = ((correction / DELTA_SCALE + 1.0) / 2.0).clamp(1e-6, 1 - 1e-6)
             loss = -torch.distributions.Beta(a_p, b_p).log_prob(x_target).mean()
             opt.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(ac.actor.parameters(), BC_GRAD_CLIP)
+            nn.utils.clip_grad_norm_(list(ac.actor.parameters()) + [ac.ff_gain], BC_GRAD_CLIP)
             opt.step()
             total_loss += loss.item()
             n_batches += 1
         sched.step()
-        print(f"  BC epoch {ep}: loss={total_loss/n_batches:.6f}  lr={opt.param_groups[0]['lr']:.1e}")
+        print(f"  BC epoch {ep}: loss={total_loss/n_batches:.6f}"
+              f"  ff_gain={ac.ff_gain.item():.3f}  lr={opt.param_groups[0]['lr']:.1e}")
 
     print("BC pretrain done.\n")
 
@@ -1246,9 +1285,15 @@ def train():
     resumed = False
     if RESUME and (EXP_DIR / 'best_model.pt').exists():
         ckpt = torch.load(EXP_DIR / 'best_model.pt', weights_only=False, map_location=DEV)
-        ctx.ac.load_state_dict(ckpt['ac'])
+        ctx.ac.load_state_dict(ckpt['ac'], strict=False)
+        if 'ff_gain' not in ckpt['ac']:
+            ctx.ac.ff_gain.data.fill_(0.0)
+            print(f"  Old checkpoint — ff_gain not found, set to 0 (no feedforward)")
         if 'pi_opt' in ckpt:
-            ctx.ppo.pi_opt.load_state_dict(ckpt['pi_opt'])
+            try:
+                ctx.ppo.pi_opt.load_state_dict(ckpt['pi_opt'])
+            except (ValueError, KeyError):
+                print(f"  pi_opt state mismatch (ff_gain added), skipping optimizer resume")
             ctx.ppo.vf_opt.load_state_dict(ckpt['vf_opt'])
             # Re-apply eps and force LR from code (checkpoint may have decayed LR)
             for pg in ctx.ppo.pi_opt.param_groups: pg['lr'] = PI_LR; pg['eps'] = 1e-5
@@ -1275,7 +1320,7 @@ def train():
 
     print(f"\nPPO  csvs={CSVS_EPOCH}  epochs={MAX_EP}  workers={WORKERS}  dev={DEV}  (batched chunks)")
     print(f"  π_lr={PI_LR}  vf_lr={VF_LR}  ent={ENT_COEF}  act_smooth={ACT_SMOOTH}"
-          f"  dist=Beta  Δscale={DELTA_SCALE}"
+          f"  dist=Beta  Δscale={DELTA_SCALE}  ff_gain={ctx.ac.ff_gain.item():.3f}"
           f"  layers={A_LAYERS}+{C_LAYERS}  K={K_EPOCHS}  dim={STATE_DIM}\n")
 
     warmup_off = CRITIC_WARMUP if resumed else 0

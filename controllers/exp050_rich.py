@@ -68,6 +68,8 @@ def _curv(lat, roll, v):
 class ActorCritic(nn.Module):
     def __init__(self):
         super().__init__()
+        self.ff_gain = nn.Parameter(torch.tensor(1.0))
+
         a = [nn.Linear(STATE_DIM, HIDDEN), nn.ReLU()]
         for _ in range(A_LAYERS - 1):
             a += [nn.Linear(HIDDEN, HIDDEN), nn.ReLU()]
@@ -97,8 +99,11 @@ class Controller(BaseController):
 
         self.ac = ActorCritic()
         data = torch.load(checkpoint_path, weights_only=False, map_location=DEV)
-        self.ac.load_state_dict(data['ac'])
+        self.ac.load_state_dict(data['ac'], strict=False)
+        if 'ff_gain' not in data['ac']:
+            self.ac.ff_gain.data.fill_(0.0)
         self.ac.to(DEV).eval()
+        self._ff_val = self.ac.ff_gain.item()
         self.n = 0
         self._h_act   = [0.0] * HIST_LEN
         self._h_lat   = [0.0] * HIST_LEN
@@ -670,12 +675,17 @@ class Controller(BaseController):
         obs = self._build_obs(target_lataccel, current_lataccel, state, future_plan,
                               error_integral, list(self._h_act), list(self._h_lat))
 
+        v2 = max(state.v_ego ** 2, 1.0)
+        kappa_desired = (target_lataccel - state.roll_lataccel) / v2
+        kappa_actual  = (current_lataccel - state.roll_lataccel) / v2
+        delta_ff = (kappa_desired - kappa_actual) * self._ff_val
+
         if MPC_N > 0 and self._sim_model is not None:
             action = self._mpc_shoot(obs, current_lataccel, state, future_plan)
         else:
             raw = self._mean_action(obs)
-            delta = float(np.clip(raw * DELTA_SCALE, -MAX_DELTA, MAX_DELTA))
-            action = float(np.clip(self._h_act[-1] + delta, *STEER_RANGE))
+            delta_corr = float(raw * DELTA_SCALE)
+            action = float(np.clip(self._h_act[-1] + delta_ff + delta_corr, *STEER_RANGE))
             if MPC and self._sim_model is not None:
                 action = self._mpc_correct(action, current_lataccel, state, future_plan)
 
@@ -688,13 +698,6 @@ class Controller(BaseController):
         if RATE_LIMIT > 0:
             prev = self._h_act[-1]
             action = float(np.clip(action, prev - RATE_LIMIT, prev + RATE_LIMIT))
-
-        # ── Speed-normalized steer: scale output by v/v_ref ──
-        # At low speed, less steer needed for same lat_accel; at high speed, more
-        if VNORM:
-            V_REF = 20.0  # m/s reference speed (~45 mph)
-            v = max(state.v_ego, 1.0)
-            action = action * (v / V_REF)
 
         self._push(action, current_lataccel, state)
         return action
