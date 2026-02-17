@@ -54,7 +54,7 @@ DEV        = torch.device('cuda' if USE_CUDA and torch.cuda.is_available() else 
 # observation scaling
 S_LAT, S_STEER = 5.0, 2.0
 S_VEGO, S_AEGO = 40.0, 4.0
-S_ROLL, S_CURV = 2.0, 0.001
+S_ROLL, S_CURV = 2.0, 0.02
 
 EXP_DIR = Path(__file__).parent
 TMP     = EXP_DIR / '.ckpt.pt'
