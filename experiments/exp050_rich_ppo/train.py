@@ -918,7 +918,7 @@ def _bc_extract_gpu(csv_cache, mdl_path, ort_session):
         C = 16; H1 = C + HIST_LEN; H2 = H1 + HIST_LEN
         F_LAT = H2; F_ROLL = F_LAT + FUTURE_K; F_V = F_ROLL + FUTURE_K; F_A = F_V + FUTURE_K
 
-        for step_idx in range(CL, T):
+        for step_idx in range(CL, CSI):
             # Write state
             sim.state_history[:, sim._hist_len, 0] = dg['roll_lataccel'][:, step_idx]
             sim.state_history[:, sim._hist_len, 1] = dg['v_ego'][:, step_idx]
@@ -927,9 +927,6 @@ def _bc_extract_gpu(csv_cache, mdl_path, ort_session):
             sim.control_step(step_idx, None)
             # ONNX prediction + warmup override (stores sim.raw_pred)
             sim.sim_step(step_idx)
-
-            if step_idx >= CSI:
-                break
 
             si = step_idx - CL
             target     = dg['target_lataccel'][:, step_idx]
