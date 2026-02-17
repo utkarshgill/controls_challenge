@@ -43,10 +43,10 @@ MINI_BS     = int(os.getenv('MINI_BS', '100000'))
 CRITIC_WARMUP = 3
 
 # ── BC ────────────────────────────────────────────────────────
-BC_EPOCHS   = int(os.getenv('BC_EPOCHS', '40'))
-BC_LR       = float(os.getenv('BC_LR', '3e-4'))
+BC_EPOCHS   = int(os.getenv('BC_EPOCHS', '20'))
+BC_LR       = float(os.getenv('BC_LR', '0.01'))
 BC_BS       = int(os.getenv('BC_BS', '8192'))
-BC_GRAD_CLIP = 1.0
+BC_GRAD_CLIP = 2.0
 
 # ── runtime ───────────────────────────────────────────────────
 CSVS_EPOCH = int(os.getenv('CSVS', '500'))
