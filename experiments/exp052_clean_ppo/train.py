@@ -472,8 +472,9 @@ class TrainingContext:
         self.best, self.best_ep = float('inf'), 'init'
 
     def save_best(self):
+        ac_sd = {k.replace('._orig_mod', ''): v for k, v in self.ac.state_dict().items()}
         torch.save({
-            'ac': self.ac.state_dict(),
+            'ac': ac_sd,
             'pi_opt': self.ppo.pi_opt.state_dict(),
             'vf_opt': self.ppo.vf_opt.state_dict(),
             'ret_rms': {'mean': self.ppo._rms.mean, 'var': self.ppo._rms.var,
@@ -514,9 +515,6 @@ def train_one_epoch(epoch, ctx):
 
 def train():
     ac = ActorCritic().to(DEV)
-    ac.actor = torch.compile(ac.actor)
-    ac.critic = torch.compile(ac.critic)
-    ppo = PPO(ac)
     mdl_path = ROOT / 'models' / 'tinyphysics.onnx'
     ort_sess = make_ort_session(mdl_path)
 
@@ -531,18 +529,23 @@ def train():
         ckpt = torch.load(BEST_PT, weights_only=False, map_location=DEV)
         ac.load_state_dict(ckpt['ac'])
         if 'pi_opt' in ckpt:
-            ppo.pi_opt.load_state_dict(ckpt['pi_opt'])
-            ppo.vf_opt.load_state_dict(ckpt['vf_opt'])
-            for pg in ppo.pi_opt.param_groups: pg['lr'] = PI_LR; pg['eps'] = 1e-5
-            for pg in ppo.vf_opt.param_groups: pg['lr'] = VF_LR; pg['eps'] = 1e-5
-            if 'ret_rms' in ckpt:
-                r = ckpt['ret_rms']
-                ppo._rms.mean, ppo._rms.var, ppo._rms.count = r['mean'], r['var'], r['count']
-        warmup_off = CRITIC_WARMUP
+            warmup_off = CRITIC_WARMUP
         print(f"Resumed from {BEST_PT.name}")
     else:
         all_csvs = sorted((ROOT / 'data').glob('*.csv'))
         pretrain_bc(ac, all_csvs)
+
+    ac.actor = torch.compile(ac.actor)
+    ac.critic = torch.compile(ac.critic)
+    ppo = PPO(ac)
+    if RESUME and BEST_PT.exists() and 'pi_opt' in ckpt:
+        ppo.pi_opt.load_state_dict(ckpt['pi_opt'])
+        ppo.vf_opt.load_state_dict(ckpt['vf_opt'])
+        for pg in ppo.pi_opt.param_groups: pg['lr'] = PI_LR; pg['eps'] = 1e-5
+        for pg in ppo.vf_opt.param_groups: pg['lr'] = VF_LR; pg['eps'] = 1e-5
+        if 'ret_rms' in ckpt:
+            r = ckpt['ret_rms']
+            ppo._rms.mean, ppo._rms.var, ppo._rms.count = r['mean'], r['var'], r['count']
 
     ctx = TrainingContext(ac, ppo, mdl_path, ort_sess, tr_f, va_f, csv_cache, warmup_off)
 
@@ -559,7 +562,8 @@ def train():
         train_one_epoch(epoch, ctx)
 
     print(f"\nDone. Best: {ctx.best:.1f} (epoch {ctx.best_ep})")
-    torch.save({'ac': ac.state_dict()}, EXP_DIR / 'final_model.pt')
+    ac_sd = {k.replace('._orig_mod', ''): v for k, v in ac.state_dict().items()}
+    torch.save({'ac': ac_sd}, EXP_DIR / 'final_model.pt')
     if TMP.exists(): TMP.unlink()
 
 
