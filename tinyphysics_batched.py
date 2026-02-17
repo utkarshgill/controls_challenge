@@ -431,6 +431,32 @@ class BatchedSimulator:
             self.current_lataccel = self.current_lataccel_history[:, CL - 1].copy()
             self._rng_all_gpu = None
 
+    # ── reload_data (persistent simulator, zero-alloc) ─────────
+
+    def reload_data(self, cached_data, cached_rng):
+        """Swap episode data into existing GPU buffers without re-allocation.
+        Requires N and T to be unchanged."""
+        assert cached_data['N'] == self.N and cached_data['T'] == self.T
+        self.data = cached_data
+        self._cached_rng = cached_rng
+        _torch = self._torch
+        for k in ('roll_lataccel', 'v_ego', 'a_ego', 'target_lataccel', 'steer_command'):
+            self.data_gpu[k].copy_(
+                _torch.from_numpy(np.ascontiguousarray(cached_data[k], dtype=np.float64)))
+        CL = CONTEXT_LENGTH
+        self._hist_len = CL
+        self._rng_all = cached_rng.T.copy()
+        self._rng_all_gpu.copy_(_torch.from_numpy(self._rng_all))
+        self.action_history.zero_()
+        self.action_history[:, :CL] = self.data_gpu['steer_command'][:, :CL]
+        self.state_history.zero_()
+        self.state_history[:, :CL, 0] = self.data_gpu['roll_lataccel'][:, :CL]
+        self.state_history[:, :CL, 1] = self.data_gpu['v_ego'][:, :CL]
+        self.state_history[:, :CL, 2] = self.data_gpu['a_ego'][:, :CL]
+        self.current_lataccel_history.zero_()
+        self.current_lataccel_history[:, :CL] = self.data_gpu['target_lataccel'][:, :CL]
+        self.current_lataccel = self.current_lataccel_history[:, CL - 1].clone()
+
     # ── get_state_target_futureplan  (mirrors lines 154-165) ─
 
     def get_state_target_futureplan(self, step_idx: int):
