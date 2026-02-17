@@ -271,7 +271,10 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache,
     S = si
     obs_flat = all_obs[:S].permute(1, 0, 2).reshape(-1, OBS_DIM)
     with torch.inference_mode():
-        val_2d = ac.critic(obs_flat).squeeze(-1).reshape(N, S)
+        vals = []
+        for _i in range(0, len(obs_flat), MINI_BS):
+            vals.append(ac.critic(obs_flat[_i:_i + MINI_BS]).squeeze(-1))
+        val_2d = torch.cat(vals).reshape(N, S)
 
     tgt = tgt_hist[:S].T; cur = cur_hist[:S].T; act = act_hist[:S].T
     lat_r = (tgt - cur)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
@@ -442,8 +445,11 @@ class PPO:
         x_t = ((raw + 1) / 2).clamp(1e-6, 1 - 1e-6)
 
         with torch.no_grad():
-            a_old, b_old = self.ac.beta_params(obs)
-            old_lp = torch.distributions.Beta(a_old, b_old).log_prob(x_t.squeeze(-1))
+            old_lp = torch.empty(len(obs), device='cuda')
+            for _i in range(0, len(obs), MINI_BS):
+                _s = slice(_i, _i + MINI_BS)
+                _a, _b = self.ac.beta_params(obs[_s])
+                old_lp[_s] = torch.distributions.Beta(_a, _b).log_prob(x_t[_s].squeeze(-1))
         old_val = gd['val_2d'].reshape(-1)
 
         for _ in range(K_EPOCHS):
