@@ -554,7 +554,6 @@ def train():
             ppo._rms.mean, ppo._rms.var, ppo._rms.count = r['mean'], r['var'], r['count']
 
     sim_model = BatchedPhysicsModel(str(mdl_path), ort_session=ort_sess)
-    sim_model.warmup_cuda_graph(CSVS_EPOCH, CONTEXT_LENGTH)
 
     ctx = TrainingContext(ac, ppo, mdl_path, ort_sess, tr_f, va_f, csv_cache, warmup_off, sim_model)
 
