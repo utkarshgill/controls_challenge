@@ -98,44 +98,38 @@ def run_parallel_chunked(pool, csv_files, worker_fn, n_workers, extra_args=()):
 
 # ── CSV loading ──────────────────────────────────────────────
 
-def _parse_one_csv(path):
-    df = pd.read_csv(str(path))
-    return (np.sin(df['roll'].values) * ACC_G,
-            df['vEgo'].values, df['aEgo'].values,
-            df['targetLateralAcceleration'].values,
-            -df['steerCommand'].values)
-
-
 def preload_csvs(csv_files):
-    """Load N CSVs into (N, T) numpy arrays via multiprocessing.
+    """Load N CSVs into (N, T) numpy arrays.
 
-    Caches result to .npy_cache/ so subsequent runs load in <1s.
+    Returns dict of float64 arrays (matching pandas native precision used by
+    the original TinyPhysicsSimulator).
     """
-    cache_dir = Path(csv_files[0]).parent / '.npy_cache'
-    cache_file = cache_dir / f'n{len(csv_files)}.npz'
-    if cache_file.exists():
-        d = np.load(cache_file)
-        return {k: d[k] for k in ('roll_lataccel', 'v_ego', 'a_ego',
-                'target_lataccel', 'steer_command', 'N', 'T')}
-
-    import multiprocessing as mp
-    with mp.Pool(min(mp.cpu_count(), len(csv_files))) as pool:
-        rows = pool.map(_parse_one_csv, csv_files)
-    N = len(rows)
-    T = max(len(r[0]) for r in rows)
-    arrs = [np.empty((N, T), np.float64) for _ in range(5)]
-    for i, cols in enumerate(rows):
-        L = len(cols[0])
-        for j, col in enumerate(cols):
-            arrs[j][i, :L] = col
-            if L < T: arrs[j][i, L:] = col[-1]
-    names = ['roll_lataccel', 'v_ego', 'a_ego', 'target_lataccel', 'steer_command']
-    result = {n: a for n, a in zip(names, arrs)}
-    result['N'], result['T'] = np.int64(N), np.int64(T)
-
-    cache_dir.mkdir(exist_ok=True)
-    np.savez(cache_file, **result)
-    return result
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(32, len(csv_files))) as pool:
+        dfs = list(pool.map(lambda f: pd.read_csv(str(f)), csv_files))
+    N = len(dfs)
+    T = max(len(df) for df in dfs)
+    roll_la = np.empty((N, T), np.float64)
+    v_ego   = np.empty((N, T), np.float64)
+    a_ego   = np.empty((N, T), np.float64)
+    tgt_la  = np.empty((N, T), np.float64)
+    steer   = np.empty((N, T), np.float64)
+    for i, df in enumerate(dfs):
+        L = len(df)
+        roll_la[i, :L] = np.sin(df['roll'].values) * ACC_G
+        v_ego[i, :L]   = df['vEgo'].values
+        a_ego[i, :L]   = df['aEgo'].values
+        tgt_la[i, :L]  = df['targetLateralAcceleration'].values
+        steer[i, :L]   = -df['steerCommand'].values
+        # Edge-pad short CSVs (repeat last row)
+        if L < T:
+            roll_la[i, L:] = roll_la[i, L - 1]
+            v_ego[i, L:]   = v_ego[i, L - 1]
+            a_ego[i, L:]   = a_ego[i, L - 1]
+            tgt_la[i, L:]  = tgt_la[i, L - 1]
+            steer[i, L:]   = steer[i, L - 1]
+    return dict(roll_lataccel=roll_la, v_ego=v_ego, a_ego=a_ego,
+                target_lataccel=tgt_la, steer_command=steer, N=N, T=T)
 
 
 class CSVCache:
@@ -495,7 +489,6 @@ class BatchedSimulator:
             pred = torch.clamp(pred,
                                self.current_lataccel - MAX_ACC_DELTA,
                                self.current_lataccel + MAX_ACC_DELTA)
-            self.raw_pred = pred
             if step_idx >= CONTROL_START_IDX:
                 self.current_lataccel = pred
             else:
@@ -520,7 +513,6 @@ class BatchedSimulator:
             pred = np.clip(pred,
                            self.current_lataccel - MAX_ACC_DELTA,
                            self.current_lataccel + MAX_ACC_DELTA)
-            self.raw_pred = pred
             if step_idx >= CONTROL_START_IDX:
                 self.current_lataccel = pred
             else:
