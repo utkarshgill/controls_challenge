@@ -17,6 +17,7 @@ from tinyphysics import (CONTROL_START_IDX, COST_END_IDX, CONTEXT_LENGTH,
 from tinyphysics_batched import BatchedSimulator, CSVCache, make_ort_session
 
 torch.manual_seed(42); np.random.seed(42)
+torch.set_float32_matmul_precision('high')
 DEV = torch.device('cuda')
 
 # ── architecture ──────────────────────────────────────────────
