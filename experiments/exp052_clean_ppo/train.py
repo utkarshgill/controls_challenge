@@ -421,7 +421,7 @@ def train():
     va_f = all_csv[:EVAL_N]
     tr_f = all_csv[EVAL_N:]
     random.seed(42); random.shuffle(tr_f)
-    csv_cache = CSVCache(list(set(str(f) for f in tr_f + va_f)))
+    csv_cache = CSVCache(sorted(set(str(f) for f in tr_f + va_f)))
 
     warmup_off = 0
     if RESUME and BEST_PT.exists():
