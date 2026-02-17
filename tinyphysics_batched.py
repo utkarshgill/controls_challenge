@@ -46,7 +46,6 @@ def make_ort_session(model_path):
             'trt_engine_cache_enable': True,
             'trt_engine_cache_path': str(Path(model_path).parent),
             'trt_max_workspace_size': str(2 << 30),  # 2 GB
-            'trt_cuda_graph_enable': True,
         }
         providers = [
             ('TensorrtExecutionProvider', trt_opts),
