@@ -489,6 +489,7 @@ class BatchedSimulator:
             pred = torch.clamp(pred,
                                self.current_lataccel - MAX_ACC_DELTA,
                                self.current_lataccel + MAX_ACC_DELTA)
+            self.raw_pred = pred
             if step_idx >= CONTROL_START_IDX:
                 self.current_lataccel = pred
             else:
@@ -513,6 +514,7 @@ class BatchedSimulator:
             pred = np.clip(pred,
                            self.current_lataccel - MAX_ACC_DELTA,
                            self.current_lataccel + MAX_ACC_DELTA)
+            self.raw_pred = pred
             if step_idx >= CONTROL_START_IDX:
                 self.current_lataccel = pred
             else:

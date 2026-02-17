@@ -22,14 +22,14 @@ if not USE_CUDA:
     torch.set_num_threads(1)
 
 HIST_LEN    = 20
-STATE_DIM   = 350
+STATE_DIM   = 256
 HIDDEN      = 256
 A_LAYERS    = 4
 C_LAYERS    = 4
 DELTA_SCALE = 0.25
 MAX_DELTA   = 0.5
 WARMUP_N    = CONTROL_START_IDX - CONTEXT_LENGTH
-FUTURE_K    = 49
+FUTURE_K    = 50
 
 S_LAT   = 5.0
 S_STEER = 2.0
@@ -177,21 +177,14 @@ class Controller(BaseController):
             max(0.0, 1.0 - fric),
         ], dtype=np.float32)
 
-        fut_lat  = _future_raw(future_plan, 'lataccel', target_lataccel)
-        fut_roll = _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel)
-        diff_lat  = np.diff(np.concatenate([[target_lataccel], fut_lat])) / S_LAT
-        diff_roll = np.diff(np.concatenate([[state.roll_lataccel], fut_roll])) / S_ROLL
-
         obs = np.concatenate([
             core,
             np.array(h_act, np.float32) / S_STEER,
             np.array(h_lat, np.float32) / S_LAT,
-            fut_lat / S_LAT,
-            fut_roll / S_ROLL,
+            _future_raw(future_plan, 'lataccel', target_lataccel) / S_LAT,
+            _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel) / S_ROLL,
             _future_raw(future_plan, 'v_ego', state.v_ego) / S_VEGO,
             _future_raw(future_plan, 'a_ego', state.a_ego) / S_AEGO,
-            diff_lat,
-            diff_roll,
         ])
         return np.clip(obs, -5.0, 5.0)
 
@@ -225,19 +218,12 @@ class Controller(BaseController):
             np.maximum(0.0, 1.0 - fric),
         ]).astype(np.float32)
 
-        fut_lat  = _future_raw(future_plan, 'lataccel', target)
-        fut_roll = _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel)
-        diff_lat  = np.diff(np.concatenate([[target], fut_lat])) / S_LAT
-        diff_roll = np.diff(np.concatenate([[state.roll_lataccel], fut_roll])) / S_ROLL
-
         fp = np.concatenate([
-            fut_lat / S_LAT,
-            fut_roll / S_ROLL,
+            _future_raw(future_plan, 'lataccel', target) / S_LAT,
+            _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel) / S_ROLL,
             _future_raw(future_plan, 'v_ego', state.v_ego) / S_VEGO,
             _future_raw(future_plan, 'a_ego', state.a_ego) / S_AEGO,
-            diff_lat,
-            diff_roll,
-        ])  # (294,) — shared, tile once
+        ])  # (200,) — shared, tile once
         return np.clip(np.concatenate([
             core,
             h_act.astype(np.float32) / S_STEER,
@@ -501,19 +487,12 @@ class Controller(BaseController):
             torch.clamp(1.0 - fric, min=0.0),
         ], dim=1)  # (N, 16)
 
-        fut_lat_np  = _future_raw(future_plan, 'lataccel', target)
-        fut_roll_np = _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel)
-        diff_lat_np  = np.diff(np.concatenate([[target], fut_lat_np])) / S_LAT
-        diff_roll_np = np.diff(np.concatenate([[state.roll_lataccel], fut_roll_np])) / S_ROLL
-
         fp = torch.tensor(np.concatenate([
-            fut_lat_np / S_LAT,
-            fut_roll_np / S_ROLL,
+            _future_raw(future_plan, 'lataccel', target) / S_LAT,
+            _future_raw(future_plan, 'roll_lataccel', state.roll_lataccel) / S_ROLL,
             _future_raw(future_plan, 'v_ego', state.v_ego) / S_VEGO,
             _future_raw(future_plan, 'a_ego', state.a_ego) / S_AEGO,
-            diff_lat_np,
-            diff_roll_np,
-        ]), dtype=torch.float32, device=DEV).unsqueeze(0).expand(N, -1)  # (N, 294)
+        ]), dtype=torch.float32, device=DEV).unsqueeze(0).expand(N, -1)  # (N, 200)
 
         obs = torch.cat([core, h_act / S_STEER, h_lat / S_LAT, fp], dim=1)
         return obs.clamp(-5.0, 5.0)
