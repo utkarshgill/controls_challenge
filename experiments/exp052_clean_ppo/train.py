@@ -22,7 +22,7 @@ HIST_LEN, FUTURE_K = 20, 50
 STATE_DIM, HIDDEN   = 256, 256
 A_LAYERS, C_LAYERS  = 4, 4
 DELTA_SCALE         = 0.25
-MAX_STEER           = 1.5
+MAX_STEER           = 1.0
 
 # ── scaling ───────────────────────────────────────────────────
 S_LAT, S_STEER = 5.0, 2.0
