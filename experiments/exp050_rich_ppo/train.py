@@ -946,14 +946,14 @@ def _remote_request(idx, ckpt_path, csv_list, mode='train', _retries=1):
 
 
 def batched_bc_rollout(csv_files, mdl_path, ort_session, csv_cache):
-    """Replay expert steer through BatchedSimulator on GPU.
+    """Run sim through warmup only, collect obs+physics with ONNX current_lataccel.
+
+    Expert steer is forced by the sim during warmup (steps 20-99).
+    No controller runs. We just observe and collect.
 
     Returns dict with GPU tensors:
-      obs:  (N*S, OBS_DIM) observations under expert execution
+      obs:  (N*S, OBS_DIM) observations during warmup
       phys: (N*S, 5)       [target, roll, v_ego, current_la, expert_delta]
-      rew:  (N, S)          per-step rewards
-      done: (N, S)          episode termination flags
-      costs: (N,) numpy     total costs for reference
     """
     if csv_cache is not None:
         data, rng_rows = csv_cache.slice(csv_files)
@@ -963,7 +963,7 @@ def batched_bc_rollout(csv_files, mdl_path, ort_session, csv_cache):
         sim = BatchedSimulator(str(mdl_path), csv_files, ort_session=ort_session)
     N, T = sim.N, sim.T
     dg = sim.data_gpu
-    max_steps = COST_END_IDX - CONTROL_START_IDX
+    max_steps = CONTROL_START_IDX - CONTEXT_LENGTH  # 80 warmup steps
     OBS_DIM = STATE_DIM
 
     h_act   = torch.zeros((N, HIST_LEN), dtype=torch.float64, device='cuda')
@@ -991,6 +991,10 @@ def batched_bc_rollout(csv_files, mdl_path, ort_session, csv_cache):
 
     def controller_fn(step_idx, sim_ref):
         nonlocal step_ctr
+
+        if step_idx >= CONTROL_START_IDX:
+            return torch.zeros(N, dtype=torch.float64, device='cuda')
+
         target     = dg['target_lataccel'][:, step_idx]
         current_la = sim_ref.current_lataccel
         roll_la    = dg['roll_lataccel'][:, step_idx]
@@ -1003,15 +1007,6 @@ def batched_bc_rollout(csv_files, mdl_path, ort_session, csv_cache):
         h_error[:, :-1] = h_error[:, 1:]
         h_error[:, -1] = error
         error_integral = h_error.mean(dim=1) * DEL_T
-
-        if step_idx < CONTROL_START_IDX:
-            h_act[:, :-1] = h_act[:, 1:]
-            h_act[:, -1] = 0.0
-            h_act32[:, :-1] = h_act32[:, 1:]
-            h_act32[:, -1] = 0.0
-            h_lat[:, :-1] = h_lat[:, 1:]
-            h_lat[:, -1] = cla32
-            return expert_steer
 
         # --- build obs (same layout as _batched_rollout_gpu) ---
         v2 = torch.clamp(v_ego * v_ego, min=1.0)
@@ -1092,9 +1087,9 @@ def batched_bc_rollout(csv_files, mdl_path, ort_session, csv_cache):
         h_lat[:, :-1] = h_lat[:, 1:]
         h_lat[:, -1] = cla32
 
-        return expert_steer
+        return expert_steer  # ignored by sim — control_step forces expert during warmup
 
-    cost_dict = sim.rollout(controller_fn)
+    sim.rollout(controller_fn)
     S = step_ctr
 
     tgt_arr = tgt_hist[:S].T
@@ -1104,14 +1099,11 @@ def batched_bc_rollout(csv_files, mdl_path, ort_session, csv_cache):
     jerk_r = torch.diff(cur_arr, dim=1, prepend=cur_arr[:, :1]) / DEL_T
     act_dr = torch.diff(act_arr, dim=1, prepend=act_arr[:, :1]) / DEL_T
     rew = (-(lat_r + jerk_r**2 * 100 + act_dr**2 * ACT_SMOOTH) / 500.0).float()
-    dones = torch.zeros((N, S), dtype=torch.float32, device='cuda')
-    dones[:, -1] = 1.0
 
     obs_flat  = all_obs[:S].permute(1, 0, 2).reshape(-1, OBS_DIM)
     phys_flat = all_phys[:S].permute(1, 0, 2).reshape(-1, 5)
 
-    return dict(obs=obs_flat, phys=phys_flat, rew=rew, done=dones,
-                costs=cost_dict['total_cost'])
+    return dict(obs=obs_flat, phys=phys_flat, rew=rew)
 
 
 def pretrain_bc(ctx, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
@@ -1122,37 +1114,32 @@ def pretrain_bc(ctx, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
     chunk_sz = min(N_files, 200)
     print(f"BC pretrain: rolling out {N_files} CSVs in chunks of {chunk_sz} ...")
 
-    all_obs_parts, all_phys_parts = [], []
-    all_rew_parts, all_done_parts = [], []
+    all_obs_parts, all_phys_parts, all_rew_parts = [], [], []
     for i in range(0, N_files, chunk_sz):
         chunk = [str(f) for f in csv_files[i:i+chunk_sz]]
         bc = batched_bc_rollout(chunk, ctx.mdl_path, ctx.ort_session, ctx.csv_cache)
         all_obs_parts.append(bc['obs'])
         all_phys_parts.append(bc['phys'])
         all_rew_parts.append(bc['rew'])
-        all_done_parts.append(bc['done'])
         print(f"  chunk {i//chunk_sz}: {len(chunk)} files, "
-              f"mean cost={bc['costs'].mean():.1f}")
+              f"{bc['obs'].shape[0]} samples")
 
     obs_t  = torch.cat(all_obs_parts, dim=0)
     phys_t = torch.cat(all_phys_parts, dim=0)
-    rew_t  = torch.cat(all_rew_parts, dim=0)
-    done_t = torch.cat(all_done_parts, dim=0)
+    rew_t  = torch.cat(all_rew_parts, dim=0)   # (N_eps, S)
     N_samples = obs_t.shape[0]
-    N_eps = rew_t.shape[0]
-    S = rew_t.shape[1]
+    N_eps, S = rew_t.shape
     print(f"BC pretrain: {N_samples} samples ({N_eps} eps × {S} steps), {epochs} epochs")
 
-    # --- Critic pretrain: compute returns from BC trajectory rewards ---
+    # --- Critic pretrain from BC trajectory returns ---
     with torch.no_grad():
         returns = torch.zeros_like(rew_t)
         R = torch.zeros(N_eps, device='cuda')
         for t in range(S - 1, -1, -1):
-            R = rew_t[:, t] + GAMMA * R * (1.0 - done_t[:, t])
+            R = rew_t[:, t] + GAMMA * R
             returns[:, t] = R
         returns_flat = returns.reshape(-1)
 
-    print(f"  Critic pretrain on BC returns ({N_samples} samples) ...")
     critic_opt = optim.Adam(ac.critic.parameters(), lr=VF_LR)
     for ep in range(10):
         perm = torch.randperm(N_samples, device='cuda')
@@ -1165,7 +1152,7 @@ def pretrain_bc(ctx, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
             critic_opt.step()
             vf_loss_sum += vf_loss.item()
             n_b += 1
-        print(f"    critic ep {ep}: vf_loss={vf_loss_sum/n_b:.6f}")
+        print(f"  critic ep {ep}: vf_loss={vf_loss_sum/n_b:.6f}")
 
     # --- Actor + ff_gain pretrain ---
     opt = optim.AdamW(list(ac.actor.parameters()) + [ac.ff_gain],
