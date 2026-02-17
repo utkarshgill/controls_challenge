@@ -4,7 +4,7 @@ import numpy as np, pandas as pd, sys, os, time, random, json, subprocess, tempf
 import io, pickle, socket, struct, threading
 import torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim
 from pathlib import Path
-from tqdm.contrib.concurrent import process_map
+from tqdm.contrib.concurrent import process_map  # kept for remote workers
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
@@ -29,7 +29,7 @@ K_EPOCHS, EPS_CLIP = 4, 0.2
 VF_COEF, ENT_COEF = 1.0, 0.001
 ACT_SMOOTH        = float(os.getenv('ACT_SMOOTH', '5.0'))  # penalty on |Δaction|²
 MINI_BS           = int(os.getenv('MINI_BS', '100000'))
-CRITIC_WARMUP     = 4
+CRITIC_WARMUP     = 0
 
 # BC
 BC_EPOCHS    = int(os.getenv('BC_EPOCHS', '20'))
@@ -945,77 +945,235 @@ def _remote_request(idx, ckpt_path, csv_list, mode='train', _retries=1):
         return []
 
 
-def _bc_worker(csv_path):
-    df = pd.read_csv(csv_path)
-    data = pd.DataFrame({
-        'roll_lataccel': np.sin(df['roll'].values) * ACC_G,
-        'v_ego': df['vEgo'].values,
-        'a_ego': df['aEgo'].values,
-        'target_lataccel': df['targetLateralAcceleration'].values,
-        'steer_command': -df['steerCommand'].values,
-    })
-    steer = data['steer_command'].values
-    tgt   = data['target_lataccel'].values
-    roll  = data['roll_lataccel'].values
-    vego  = data['v_ego'].values
-    obs_list, phys_list = [], []
-    h_act  = [0.0] * HIST_LEN
-    h_lat  = [0.0] * HIST_LEN
-    h_v    = [0.0] * HIST_LEN
-    h_a    = [0.0] * HIST_LEN
-    h_roll = [0.0] * HIST_LEN
+def batched_bc_rollout(csv_files, mdl_path, ort_session, csv_cache):
+    """Replay expert steer through BatchedSimulator on GPU.
 
-    for step_idx in range(CONTEXT_LENGTH, CONTROL_START_IDX):
-        target_la = tgt[step_idx]
-        current_la = tgt[step_idx]  # BC assumes perfect tracking
+    Returns dict with GPU tensors:
+      obs:  (N*S, OBS_DIM) observations under expert execution
+      phys: (N*S, 5)       [target, roll, v_ego, current_la, expert_delta]
+      rew:  (N, S)          per-step rewards
+      done: (N, S)          episode termination flags
+      costs: (N,) numpy     total costs for reference
+    """
+    if csv_cache is not None:
+        data, rng_rows = csv_cache.slice(csv_files)
+        sim = BatchedSimulator(str(mdl_path), ort_session=ort_session,
+                               cached_data=data, cached_rng=rng_rows)
+    else:
+        sim = BatchedSimulator(str(mdl_path), csv_files, ort_session=ort_session)
+    N, T = sim.N, sim.T
+    dg = sim.data_gpu
+    max_steps = COST_END_IDX - CONTROL_START_IDX
+    OBS_DIM = STATE_DIM
 
-        state = State(
-            roll_lataccel=roll[step_idx],
-            v_ego=vego[step_idx],
-            a_ego=data['a_ego'].values[step_idx])
-        fplan = FuturePlan(
-            lataccel=tgt[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist(),
-            roll_lataccel=roll[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist(),
-            v_ego=vego[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist(),
-            a_ego=data['a_ego'].values[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist())
+    h_act   = torch.zeros((N, HIST_LEN), dtype=torch.float64, device='cuda')
+    h_act32 = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
+    h_lat   = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
+    h_error = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
+    obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device='cuda')
 
-        obs = build_obs(target_la, current_la, state, fplan,
-                        h_act, h_lat, h_v, h_a, h_roll)
+    C  = 16
+    H1 = C + HIST_LEN
+    H2 = H1 + HIST_LEN
+    F_LAT  = H2
+    F_ROLL = F_LAT + FUTURE_K
+    F_V    = F_ROLL + FUTURE_K
+    F_A    = F_V + FUTURE_K
+    D_LAT  = F_A + FUTURE_K
+    D_ROLL = D_LAT + FUTURE_K
 
-        prev_act = h_act[-1]
-        expert_delta = steer[step_idx] - prev_act
-        prev_la = tgt[step_idx - 1]
-        obs_list.append(obs)
-        phys_list.append([target_la, roll[step_idx], vego[step_idx],
-                          prev_la, expert_delta])
+    all_obs  = torch.empty((max_steps, N, OBS_DIM), dtype=torch.float32, device='cuda')
+    all_phys = torch.empty((max_steps, N, 5), dtype=torch.float32, device='cuda')
+    tgt_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
+    cur_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
+    act_hist_buf = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
+    step_ctr = 0
 
-        h_act = h_act[1:] + [steer[step_idx]]
-        h_lat = h_lat[1:] + [tgt[step_idx]]
-        h_v = h_v[1:] + [vego[step_idx]]
-        h_a = h_a[1:] + [data['a_ego'].values[step_idx]]
-        h_roll = h_roll[1:] + [roll[step_idx]]
+    def controller_fn(step_idx, sim_ref):
+        nonlocal step_ctr
+        target     = dg['target_lataccel'][:, step_idx]
+        current_la = sim_ref.current_lataccel
+        roll_la    = dg['roll_lataccel'][:, step_idx]
+        v_ego      = dg['v_ego'][:, step_idx]
+        a_ego      = dg['a_ego'][:, step_idx]
+        expert_steer = dg['steer_command'][:, step_idx]
 
-    return (np.array(obs_list, np.float32),
-            np.array(phys_list, np.float32))
+        cla32 = current_la.float()
+        error = (target - current_la).float()
+        h_error[:, :-1] = h_error[:, 1:]
+        h_error[:, -1] = error
+        error_integral = h_error.mean(dim=1) * DEL_T
+
+        if step_idx < CONTROL_START_IDX:
+            h_act[:, :-1] = h_act[:, 1:]
+            h_act[:, -1] = 0.0
+            h_act32[:, :-1] = h_act32[:, 1:]
+            h_act32[:, -1] = 0.0
+            h_lat[:, :-1] = h_lat[:, 1:]
+            h_lat[:, -1] = cla32
+            return expert_steer
+
+        # --- build obs (same layout as _batched_rollout_gpu) ---
+        v2 = torch.clamp(v_ego * v_ego, min=1.0)
+        k_tgt = (target - roll_la) / v2
+        k_cur = (current_la - roll_la) / v2
+        fplan_lat0 = dg['target_lataccel'][:, min(step_idx + 1, T - 1)]
+        fric = torch.sqrt(current_la**2 + a_ego**2) / 7.0
+
+        obs_buf[:, 0]  = target / S_LAT
+        obs_buf[:, 1]  = current_la / S_LAT
+        obs_buf[:, 2]  = (target - current_la) / S_LAT
+        obs_buf[:, 3]  = k_tgt / S_CURV
+        obs_buf[:, 4]  = k_cur / S_CURV
+        obs_buf[:, 5]  = (k_tgt - k_cur) / S_CURV
+        obs_buf[:, 6]  = v_ego / S_VEGO
+        obs_buf[:, 7]  = a_ego / S_AEGO
+        obs_buf[:, 8]  = roll_la / S_ROLL
+        obs_buf[:, 9]  = h_act32[:, -1] / S_STEER
+        obs_buf[:, 10] = error_integral / S_LAT
+        obs_buf[:, 11] = (fplan_lat0 - target) / DEL_T / S_LAT
+        obs_buf[:, 12] = (current_la - h_lat[:, -1]) / DEL_T / S_LAT
+        obs_buf[:, 13] = (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER
+        obs_buf[:, 14] = fric
+        obs_buf[:, 15] = torch.clamp(1.0 - fric, min=0.0)
+
+        obs_buf[:, C:H1]  = h_act32 / S_STEER
+        obs_buf[:, H1:H2] = h_lat / S_LAT
+
+        end = min(step_idx + FUTURE_PLAN_STEPS, T)
+        for offset, attr, scale in [(F_LAT, 'target_lataccel', S_LAT),
+                                    (F_ROLL, 'roll_lataccel', S_ROLL),
+                                    (F_V, 'v_ego', S_VEGO),
+                                    (F_A, 'a_ego', S_AEGO)]:
+            slc = dg[attr][:, step_idx+1:end]
+            w = slc.shape[1]
+            if w == 0:
+                obs_buf[:, offset:offset+FUTURE_K] = (dg[attr][:, step_idx] / scale).float().unsqueeze(1)
+            elif w < FUTURE_K:
+                obs_buf[:, offset:offset+w] = slc.float() / scale
+                obs_buf[:, offset+w:offset+FUTURE_K] = slc[:, -1:].float() / scale
+            else:
+                obs_buf[:, offset:offset+FUTURE_K] = slc[:, :FUTURE_K].float() / scale
+
+        for offset, attr, scale in [(D_LAT, 'target_lataccel', S_LAT),
+                                    (D_ROLL, 'roll_lataccel', S_ROLL)]:
+            slc = dg[attr][:, step_idx+1:end]
+            anchor = dg[attr][:, step_idx].unsqueeze(1)
+            w = slc.shape[1]
+            if w == 0:
+                obs_buf[:, offset:offset+FUTURE_K] = 0.0
+            else:
+                full = torch.cat([anchor, slc[:, :FUTURE_K].float()], dim=1)
+                d = torch.diff(full, dim=1) / scale
+                dw = d.shape[1]
+                obs_buf[:, offset:offset+dw] = d
+                if dw < FUTURE_K:
+                    obs_buf[:, offset+dw:offset+FUTURE_K] = 0.0
+
+        obs_buf.clamp_(-5.0, 5.0)
+
+        expert_delta = (expert_steer - h_act[:, -1]).float()
+
+        all_obs[step_ctr]        = obs_buf
+        all_phys[step_ctr, :, 0] = target.float()
+        all_phys[step_ctr, :, 1] = roll_la.float()
+        all_phys[step_ctr, :, 2] = v_ego.float()
+        all_phys[step_ctr, :, 3] = current_la.float()
+        all_phys[step_ctr, :, 4] = expert_delta
+        tgt_hist[step_ctr]       = target
+        cur_hist[step_ctr]       = current_la
+        act_hist_buf[step_ctr]   = expert_steer
+        step_ctr += 1
+
+        h_act[:, :-1] = h_act[:, 1:]
+        h_act[:, -1] = expert_steer
+        h_act32[:, :-1] = h_act32[:, 1:]
+        h_act32[:, -1] = expert_steer.float()
+        h_lat[:, :-1] = h_lat[:, 1:]
+        h_lat[:, -1] = cla32
+
+        return expert_steer
+
+    cost_dict = sim.rollout(controller_fn)
+    S = step_ctr
+
+    tgt_arr = tgt_hist[:S].T
+    cur_arr = cur_hist[:S].T
+    act_arr = act_hist_buf[:S].T
+    lat_r = (tgt_arr - cur_arr)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
+    jerk_r = torch.diff(cur_arr, dim=1, prepend=cur_arr[:, :1]) / DEL_T
+    act_dr = torch.diff(act_arr, dim=1, prepend=act_arr[:, :1]) / DEL_T
+    rew = (-(lat_r + jerk_r**2 * 100 + act_dr**2 * ACT_SMOOTH) / 500.0).float()
+    dones = torch.zeros((N, S), dtype=torch.float32, device='cuda')
+    dones[:, -1] = 1.0
+
+    obs_flat  = all_obs[:S].permute(1, 0, 2).reshape(-1, OBS_DIM)
+    phys_flat = all_phys[:S].permute(1, 0, 2).reshape(-1, 5)
+
+    return dict(obs=obs_flat, phys=phys_flat, rew=rew, done=dones,
+                costs=cost_dict['total_cost'])
 
 
-def pretrain_bc(ac, csv_files, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
-    print(f"BC pretrain: extracting from {len(csv_files)} CSVs ...")
-    results = process_map(_bc_worker, [str(f) for f in csv_files],
-                          max_workers=BC_WORKERS, chunksize=50, disable=False)
-    all_obs  = np.concatenate([r[0] for r in results])
-    all_phys = np.concatenate([r[1] for r in results])
-    N = len(all_obs)
-    print(f"BC pretrain: {N} samples, {epochs} epochs")
+def pretrain_bc(ctx, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
+    """BC pretrain with ONNX rollout for realistic current_lataccel."""
+    ac = ctx.ac
+    csv_files = sorted((ROOT / 'data').glob('*.csv'))
+    N_files = len(csv_files)
+    chunk_sz = min(N_files, 200)
+    print(f"BC pretrain: rolling out {N_files} CSVs in chunks of {chunk_sz} ...")
 
-    obs_t  = torch.FloatTensor(all_obs).to(DEV)
-    phys_t = torch.FloatTensor(all_phys).to(DEV)
+    all_obs_parts, all_phys_parts = [], []
+    all_rew_parts, all_done_parts = [], []
+    for i in range(0, N_files, chunk_sz):
+        chunk = [str(f) for f in csv_files[i:i+chunk_sz]]
+        bc = batched_bc_rollout(chunk, ctx.mdl_path, ctx.ort_session, ctx.csv_cache)
+        all_obs_parts.append(bc['obs'])
+        all_phys_parts.append(bc['phys'])
+        all_rew_parts.append(bc['rew'])
+        all_done_parts.append(bc['done'])
+        print(f"  chunk {i//chunk_sz}: {len(chunk)} files, "
+              f"mean cost={bc['costs'].mean():.1f}")
+
+    obs_t  = torch.cat(all_obs_parts, dim=0)
+    phys_t = torch.cat(all_phys_parts, dim=0)
+    rew_t  = torch.cat(all_rew_parts, dim=0)
+    done_t = torch.cat(all_done_parts, dim=0)
+    N_samples = obs_t.shape[0]
+    N_eps = rew_t.shape[0]
+    S = rew_t.shape[1]
+    print(f"BC pretrain: {N_samples} samples ({N_eps} eps × {S} steps), {epochs} epochs")
+
+    # --- Critic pretrain: compute returns from BC trajectory rewards ---
+    with torch.no_grad():
+        returns = torch.zeros_like(rew_t)
+        R = torch.zeros(N_eps, device='cuda')
+        for t in range(S - 1, -1, -1):
+            R = rew_t[:, t] + GAMMA * R * (1.0 - done_t[:, t])
+            returns[:, t] = R
+        returns_flat = returns.reshape(-1)
+
+    print(f"  Critic pretrain on BC returns ({N_samples} samples) ...")
+    critic_opt = optim.Adam(ac.critic.parameters(), lr=VF_LR)
+    for ep in range(10):
+        perm = torch.randperm(N_samples, device='cuda')
+        vf_loss_sum, n_b = 0.0, 0
+        for idx in perm.split(batch_size):
+            v_pred = ac.critic(obs_t[idx]).squeeze(-1)
+            vf_loss = F.mse_loss(v_pred, returns_flat[idx])
+            critic_opt.zero_grad()
+            vf_loss.backward()
+            critic_opt.step()
+            vf_loss_sum += vf_loss.item()
+            n_b += 1
+        print(f"    critic ep {ep}: vf_loss={vf_loss_sum/n_b:.6f}")
+
+    # --- Actor + ff_gain pretrain ---
     opt = optim.AdamW(list(ac.actor.parameters()) + [ac.ff_gain],
                       lr=lr, weight_decay=1e-4)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     for ep in range(epochs):
-        perm = torch.randperm(N)
+        perm = torch.randperm(N_samples, device='cuda')
         total_loss = 0.0
         n_batches = 0
         for idx in perm.split(batch_size):
@@ -1148,9 +1306,9 @@ def _split_files(all_files):
     return local_files, remote_slices
 
 
-def evaluate(ctx, files, n=EVAL_N):
+def evaluate(ctx, files=None, n=EVAL_N):
     ctx.save_ckpt(TMP)
-    all_files = files[:n]
+    all_files = (files or ctx.va_f)[:n]
 
     local_files, remote_slices = _split_files(all_files) if USE_REMOTE else (all_files, [])
 
@@ -1268,7 +1426,7 @@ def train_one_epoch(epoch, ctx, warmup_off=0):
 
     is_val = epoch % EVAL_EVERY == 0
     if is_val:
-        vm, vs = evaluate(ctx, ctx.va_f)
+        vm, vs = evaluate(ctx)
         mk = ""
         if vm < ctx.best:
             ctx.best, ctx.best_ep = vm, epoch
@@ -1311,10 +1469,9 @@ def train():
             print(f"Resumed from best_model.pt (weights only)")
         resumed = True
     else:
-        all_csvs = sorted((ROOT / 'data').glob('*.csv'))
-        pretrain_bc(ctx.ac, all_csvs)
+        pretrain_bc(ctx)
 
-    vm, vs = evaluate(ctx, ctx.va_f)
+    vm, vs = evaluate(ctx)
     ctx.best, ctx.best_ep = vm, 'init'
     print(f"Baseline: {vm:.1f} ± {vs:.1f}")
     ctx.save_best()
