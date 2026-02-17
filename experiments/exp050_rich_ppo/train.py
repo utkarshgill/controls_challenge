@@ -30,11 +30,11 @@ K_EPOCHS, EPS_CLIP = 4, 0.2
 VF_COEF, ENT_COEF = 1.0, 0.001
 ACT_SMOOTH        = float(os.getenv('ACT_SMOOTH', '5.0'))  # penalty on |Δaction|²
 MINI_BS           = int(os.getenv('MINI_BS', '100000'))
-CRITIC_WARMUP     = 0
+CRITIC_WARMUP     = 3
 
 # BC
 BC_EPOCHS    = int(os.getenv('BC_EPOCHS', '20'))
-BC_LR        = float(os.getenv('BC_LR', '0.01'))
+BC_LR        = float(os.getenv('BC_LR', '0.001'))
 BC_BS        = int(os.getenv('BC_BS', '8192'))
 BC_GRAD_CLIP = float(os.getenv('BC_GRAD_CLIP', '2.0'))
 
@@ -930,31 +930,32 @@ def _bc_extract_gpu(csv_cache, mdl_path, ort_session):
 
             si = step_idx - CL
             target     = dg['target_lataccel'][:, step_idx]
-            current_la = sim.raw_pred  # ONNX prediction (NOT the overridden target)
+            onnx_pred  = sim.raw_pred  # for critic reward computation
             roll_la    = dg['roll_lataccel'][:, step_idx]
             v_ego      = dg['v_ego'][:, step_idx]
             a_ego      = dg['a_ego'][:, step_idx]
 
-            cla32 = current_la.float()
+            # Actor obs: current_la = target (matches eval warmup, error=0)
+            obs_cur = target.float()
             v2 = torch.clamp(v_ego * v_ego, min=1.0)
             k_tgt = (target - roll_la) / v2
-            k_cur = (current_la - roll_la) / v2
+            k_cur = (target - roll_la) / v2  # same as k_tgt: error=0
             fplan_lat0 = dg['target_lataccel'][:, min(step_idx + 1, T - 1)]
-            fric = torch.sqrt(current_la**2 + a_ego**2) / 7.0
+            fric = torch.sqrt(target**2 + a_ego**2) / 7.0
 
             obs_buf[:, 0]  = target / S_LAT
-            obs_buf[:, 1]  = cla32 / S_LAT
-            obs_buf[:, 2]  = (target - current_la) / S_LAT
+            obs_buf[:, 1]  = obs_cur / S_LAT
+            obs_buf[:, 2]  = 0.0  # error = target - target = 0
             obs_buf[:, 3]  = k_tgt / S_CURV
             obs_buf[:, 4]  = k_cur / S_CURV
-            obs_buf[:, 5]  = (k_tgt - k_cur) / S_CURV
+            obs_buf[:, 5]  = 0.0  # k_tgt - k_cur = 0
             obs_buf[:, 6]  = v_ego / S_VEGO
             obs_buf[:, 7]  = a_ego / S_AEGO
             obs_buf[:, 8]  = roll_la / S_ROLL
             obs_buf[:, 9]  = h_act[:, -1] / S_STEER
             obs_buf[:, 10] = 0.0  # error integral ≈ 0 in warmup
             obs_buf[:, 11] = (fplan_lat0 - target) / DEL_T / S_LAT
-            obs_buf[:, 12] = (cla32 - h_lat[:, -1]) / DEL_T / S_LAT
+            obs_buf[:, 12] = (obs_cur - h_lat[:, -1]) / DEL_T / S_LAT
             obs_buf[:, 13] = (h_act[:, -1] - h_act[:, -2]) / DEL_T / S_STEER
             obs_buf[:, 14] = fric
             obs_buf[:, 15] = torch.clamp(1.0 - fric, min=0.0)
@@ -984,7 +985,7 @@ def _bc_extract_gpu(csv_cache, mdl_path, ort_session):
             delta = expert_steer - h_act[:, -1]
             chunk_raw[si] = (delta / DELTA_SCALE).clamp(-1.0, 1.0)
             chunk_tgt[si] = target
-            chunk_cur[si] = current_la
+            chunk_cur[si] = onnx_pred  # ONNX prediction for critic rewards
             chunk_act[si] = expert_steer
 
             # Shift histories (h_lat uses target to match eval warmup history)
