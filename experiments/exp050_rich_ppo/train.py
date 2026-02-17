@@ -20,12 +20,12 @@ np.random.seed(42)
 HIST_LEN, FUTURE_K   = 20, 49
 STATE_DIM, HIDDEN     = 350, 256        # 16 core + 40 hist + 294 future (6×49)
 A_LAYERS, C_LAYERS    = 4, 4
-DELTA_SCALE, MAX_DELTA = 0.2, 0.5
+DELTA_SCALE, MAX_DELTA = 0.25, 0.5
 
 # PPO
 PI_LR, VF_LR     = float(os.getenv('PI_LR', '3e-4')), float(os.getenv('VF_LR', '3e-4'))
 GAMMA, LAMDA      = 0.95, 0.9
-K_EPOCHS, EPS_CLIP = 4, 0.3
+K_EPOCHS, EPS_CLIP = 4, 0.2
 VF_COEF, ENT_COEF = 1.0, 0.01
 ACT_SMOOTH        = float(os.getenv('ACT_SMOOTH', '5.0'))  # penalty on |Δaction|²
 MINI_BS           = int(os.getenv('MINI_BS', '100000'))
@@ -53,7 +53,7 @@ DEV        = torch.device('cuda' if USE_CUDA and torch.cuda.is_available() else 
 # observation scaling
 S_LAT, S_STEER = 5.0, 2.0
 S_VEGO, S_AEGO = 40.0, 4.0
-S_ROLL, S_CURV = 2.0, 0.02
+S_ROLL, S_CURV = 2.0, 0.001
 
 EXP_DIR = Path(__file__).parent
 TMP     = EXP_DIR / '.ckpt.pt'
@@ -500,29 +500,6 @@ def batched_rollout(csv_files, ac, mdl_path, deterministic=False,
         return _batched_rollout_cpu(sim, ac, N, T, deterministic)
 
 
-def _pad_future_gpu(data_tensor, step_idx, end, k, scale):
-    """Slice future data from GPU tensor, pad to length k, scale."""
-    slc = data_tensor[:, step_idx+1:end]
-    w = slc.shape[1]
-    if w == 0:
-        return (data_tensor[:, step_idx] / scale).float().unsqueeze(1).expand(-1, k)
-    elif w < k:
-        return torch.cat([slc.float() / scale, (slc[:, -1:].float() / scale).expand(-1, k - w)], dim=1)
-    return slc[:, :k].float() / scale
-
-
-def _pad_future_cpu(data_arr, step_idx, end, k, scale, fallback):
-    """Slice future data from numpy array, pad to length k, scale."""
-    slc = data_arr[:, step_idx+1:end]
-    w = slc.shape[1]
-    if w == 0:
-        return np.repeat((fallback / scale).astype(np.float32)[:, None], k, axis=1)
-    elif w < k:
-        return np.concatenate([slc.astype(np.float32) / scale,
-                               np.repeat(slc[:, -1:].astype(np.float32) / scale, k - w, axis=1)], axis=1)
-    return slc[:, :k].astype(np.float32) / scale
-
-
 def _batched_rollout_gpu(sim, ac, N, T, deterministic):
     """All-GPU rollout: controller builds obs on GPU, no CPU<->GPU per step."""
     OBS_DIM = 16 + HIST_LEN + HIST_LEN + FUTURE_K * 6
@@ -534,9 +511,18 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
     h_act32 = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
     h_lat   = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
     h_error = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
-
-    # GPU obs buffer
     obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device='cuda')
+
+    # Obs layout offsets
+    C = 16
+    H1 = C + HIST_LEN
+    H2 = H1 + HIST_LEN
+    F_LAT  = H2
+    F_ROLL = F_LAT + FUTURE_K
+    F_V    = F_ROLL + FUTURE_K
+    F_A    = F_V + FUTURE_K
+    D_LAT  = F_A + FUTURE_K
+    D_ROLL = D_LAT + FUTURE_K
 
     # GPU training data collection
     if not deterministic:
@@ -573,58 +559,63 @@ def _batched_rollout_gpu(sim, ac, N, T, deterministic):
             h_lat[:, -1] = cla32
             return torch.zeros(N, dtype=torch.float64, device='cuda')
 
-        # === Obs building on GPU ===
+        # === Obs building on GPU (pre-allocated obs_buf) ===
         v2 = torch.clamp(v_ego * v_ego, min=1.0)
         k_tgt = (target - roll_la) / v2
         k_cur = (current_la - roll_la) / v2
         fplan_lat0 = dg['target_lataccel'][:, min(step_idx + 1, T - 1)]
         fric = torch.sqrt(current_la**2 + a_ego**2) / 7.0
 
-        core = torch.stack([
-            target / S_LAT,
-            current_la / S_LAT,
-            (target - current_la) / S_LAT,
-            k_tgt / S_CURV,
-            k_cur / S_CURV,
-            (k_tgt - k_cur) / S_CURV,
-            v_ego / S_VEGO,
-            a_ego / S_AEGO,
-            roll_la / S_ROLL,
-            h_act32[:, -1] / S_STEER,
-            error_integral / S_LAT,
-            (fplan_lat0 - target) / DEL_T / S_LAT,
-            (current_la - h_lat[:, -1]) / DEL_T / S_LAT,
-            (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER,
-            fric,
-            torch.clamp(1.0 - fric, min=0.0),
-        ], dim=1).float()  # (N, 16)
+        obs_buf[:, 0]  = target / S_LAT
+        obs_buf[:, 1]  = current_la / S_LAT
+        obs_buf[:, 2]  = (target - current_la) / S_LAT
+        obs_buf[:, 3]  = k_tgt / S_CURV
+        obs_buf[:, 4]  = k_cur / S_CURV
+        obs_buf[:, 5]  = (k_tgt - k_cur) / S_CURV
+        obs_buf[:, 6]  = v_ego / S_VEGO
+        obs_buf[:, 7]  = a_ego / S_AEGO
+        obs_buf[:, 8]  = roll_la / S_ROLL
+        obs_buf[:, 9]  = h_act32[:, -1] / S_STEER
+        obs_buf[:, 10] = error_integral / S_LAT
+        obs_buf[:, 11] = (fplan_lat0 - target) / DEL_T / S_LAT
+        obs_buf[:, 12] = (current_la - h_lat[:, -1]) / DEL_T / S_LAT
+        obs_buf[:, 13] = (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER
+        obs_buf[:, 14] = fric
+        obs_buf[:, 15] = torch.clamp(1.0 - fric, min=0.0)
 
-        parts = [core, h_act32 / S_STEER, h_lat / S_LAT]
+        obs_buf[:, C:H1]  = h_act32 / S_STEER
+        obs_buf[:, H1:H2] = h_lat / S_LAT
 
         end = min(step_idx + FUTURE_PLAN_STEPS, T)
-        diff_slices = {}
-        for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
-                            ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
-            padded = _pad_future_gpu(dg[attr], step_idx, end, FUTURE_K, scale)
-            parts.append(padded)
-            if attr in ('target_lataccel', 'roll_lataccel'):
-                diff_slices[attr] = (dg[attr][:, step_idx+1:end], scale)
+        for offset, attr, scale in [(F_LAT, 'target_lataccel', S_LAT),
+                                    (F_ROLL, 'roll_lataccel', S_ROLL),
+                                    (F_V, 'v_ego', S_VEGO),
+                                    (F_A, 'a_ego', S_AEGO)]:
+            slc = dg[attr][:, step_idx+1:end]
+            w = slc.shape[1]
+            if w == 0:
+                obs_buf[:, offset:offset+FUTURE_K] = (dg[attr][:, step_idx] / scale).float().unsqueeze(1)
+            elif w < FUTURE_K:
+                obs_buf[:, offset:offset+w] = slc.float() / scale
+                obs_buf[:, offset+w:offset+FUTURE_K] = slc[:, -1:].float() / scale
+            else:
+                obs_buf[:, offset:offset+FUTURE_K] = slc[:, :FUTURE_K].float() / scale
 
-        for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL)]:
-            slc, sc = diff_slices[attr]
+        for offset, attr, scale in [(D_LAT, 'target_lataccel', S_LAT),
+                                    (D_ROLL, 'roll_lataccel', S_ROLL)]:
+            slc = dg[attr][:, step_idx+1:end]
             anchor = dg[attr][:, step_idx].unsqueeze(1)
             w = slc.shape[1]
             if w == 0:
-                parts.append(torch.zeros(N, FUTURE_K, dtype=torch.float32, device='cuda'))
+                obs_buf[:, offset:offset+FUTURE_K] = 0.0
             else:
                 full = torch.cat([anchor, slc[:, :FUTURE_K].float()], dim=1)
-                d = torch.diff(full, dim=1) / sc
+                d = torch.diff(full, dim=1) / scale
                 dw = d.shape[1]
+                obs_buf[:, offset:offset+dw] = d
                 if dw < FUTURE_K:
-                    d = torch.cat([d, torch.zeros(N, FUTURE_K - dw, dtype=torch.float32, device='cuda')], dim=1)
-                parts.append(d[:, :FUTURE_K])
+                    obs_buf[:, offset+dw:offset+FUTURE_K] = 0.0
 
-        torch.cat(parts, dim=1, out=obs_buf)
         obs_buf.clamp_(-5.0, 5.0)
 
         with torch.inference_mode():
@@ -728,52 +719,63 @@ def _batched_rollout_cpu(sim, ac, N, T, deterministic):
         fplan_lat0 = fdata['target_lataccel'][:, min(step_idx + 1, T - 1)]
         fric = np.sqrt(current_la**2 + a_ego**2) / 7.0
 
-        core = np.column_stack([
-            target / S_LAT,
-            current_la / S_LAT,
-            (target - current_la) / S_LAT,
-            k_tgt / S_CURV,
-            k_cur / S_CURV,
-            (k_tgt - k_cur) / S_CURV,
-            v_ego / S_VEGO,
-            a_ego / S_AEGO,
-            roll_la / S_ROLL,
-            h_act32[:, -1] / S_STEER,
-            error_integral / S_LAT,
-            (fplan_lat0 - target) / DEL_T / S_LAT,
-            (current_la - h_lat[:, -1]) / DEL_T / S_LAT,
-            (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER,
-            fric,
-            np.maximum(0.0, 1.0 - fric),
-        ]).astype(np.float32)
+        # Obs layout: [16 core | 20 h_act | 20 h_lat | 49×4 future | 49×2 diff]
+        _C  = 16
+        _H1 = _C + HIST_LEN
+        _H2 = _H1 + HIST_LEN
 
-        end = min(step_idx + FUTURE_PLAN_STEPS, T)
-        fallback_cpu = {'target_lataccel': target, 'roll_lataccel': roll_la,
+        obs_buf[:, 0]  = target / S_LAT
+        obs_buf[:, 1]  = current_la / S_LAT
+        obs_buf[:, 2]  = (target - current_la) / S_LAT
+        obs_buf[:, 3]  = k_tgt / S_CURV
+        obs_buf[:, 4]  = k_cur / S_CURV
+        obs_buf[:, 5]  = (k_tgt - k_cur) / S_CURV
+        obs_buf[:, 6]  = v_ego / S_VEGO
+        obs_buf[:, 7]  = a_ego / S_AEGO
+        obs_buf[:, 8]  = roll_la / S_ROLL
+        obs_buf[:, 9]  = h_act32[:, -1] / S_STEER
+        obs_buf[:, 10] = error_integral / S_LAT
+        obs_buf[:, 11] = (fplan_lat0 - target) / DEL_T / S_LAT
+        obs_buf[:, 12] = (current_la - h_lat[:, -1]) / DEL_T / S_LAT
+        obs_buf[:, 13] = (h_act32[:, -1] - h_act32[:, -2]) / DEL_T / S_STEER
+        obs_buf[:, 14] = fric
+        obs_buf[:, 15] = np.maximum(0.0, 1.0 - fric)
+
+        obs_buf[:, _C:_H1]  = h_act32 / S_STEER
+        obs_buf[:, _H1:_H2] = h_lat / S_LAT
+
+        fallback_map = {'target_lataccel': target, 'roll_lataccel': roll_la,
                         'v_ego': v_ego, 'a_ego': a_ego}
-        parts = [core, h_act32 / S_STEER, h_lat / S_LAT]
-        diff_slices_cpu = {}
+        end = min(step_idx + FUTURE_PLAN_STEPS, T)
+        off = _H2
         for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL),
                             ('v_ego', S_VEGO), ('a_ego', S_AEGO)]:
-            padded = _pad_future_cpu(fdata[attr], step_idx, end, FUTURE_K, scale, fallback_cpu[attr])
-            parts.append(padded)
-            if attr in ('target_lataccel', 'roll_lataccel'):
-                diff_slices_cpu[attr] = (fdata[attr][:, step_idx+1:end], scale)
-
-        for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL)]:
-            slc, sc = diff_slices_cpu[attr]
-            anchor_val = fallback_cpu[attr]
+            slc = fdata[attr][:, step_idx+1:end]
             w = slc.shape[1]
             if w == 0:
-                parts.append(np.zeros((N, FUTURE_K), np.float32))
+                obs_buf[:, off:off+FUTURE_K] = fallback_map[attr][:, None].astype(np.float32) / scale
+            elif w < FUTURE_K:
+                obs_buf[:, off:off+w] = slc.astype(np.float32) / scale
+                obs_buf[:, off+w:off+FUTURE_K] = slc[:, -1:].astype(np.float32) / scale
+            else:
+                obs_buf[:, off:off+FUTURE_K] = slc[:, :FUTURE_K].astype(np.float32) / scale
+            off += FUTURE_K
+
+        for attr, scale in [('target_lataccel', S_LAT), ('roll_lataccel', S_ROLL)]:
+            slc = fdata[attr][:, step_idx+1:end]
+            anchor_val = fallback_map[attr]
+            w = slc.shape[1]
+            if w == 0:
+                obs_buf[:, off:off+FUTURE_K] = 0.0
             else:
                 full = np.concatenate([anchor_val[:, None], slc[:, :FUTURE_K].astype(np.float32)], axis=1)
-                d = np.diff(full, axis=1) / sc
+                d = np.diff(full, axis=1) / scale
                 dw = d.shape[1]
+                obs_buf[:, off:off+dw] = d
                 if dw < FUTURE_K:
-                    d = np.concatenate([d, np.zeros((N, FUTURE_K - dw), np.float32)], axis=1)
-                parts.append(d[:, :FUTURE_K])
+                    obs_buf[:, off+dw:off+FUTURE_K] = 0.0
+            off += FUTURE_K
 
-        obs_buf[:] = np.concatenate(parts, axis=1)
         np.clip(obs_buf, -5.0, 5.0, out=obs_buf)
         obs_t = torch.from_numpy(obs_buf).to(_dev)
         with torch.inference_mode():
