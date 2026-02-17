@@ -161,65 +161,28 @@ def fill_obs(buf, target, current, roll_la, v_ego, a_ego,
 #  GPU Rollout
 # ══════════════════════════════════════════════════════════════
 
-class RolloutBuffers:
-    """Pre-allocated GPU tensors reused across epochs to avoid repeated cudaMalloc."""
-    def __init__(self, N, max_steps):
-        self.N, self.max_steps = N, max_steps
-        self.h_act   = torch.zeros((N, HIST_LEN), dtype=torch.float64, device='cuda')
-        self.h_act32 = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
-        self.h_lat   = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
-        self.h_error = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
-        self.obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device='cuda')
-        self.all_obs  = torch.empty((max_steps, N, OBS_DIM), dtype=torch.float32, device='cuda')
-        self.all_raw  = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
-        self.tgt_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
-        self.cur_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
-        self.act_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
-        self.zeros_N  = torch.zeros(N, dtype=torch.float64, device='cuda')
-        self.sim = None
-
-    def reset(self):
-        self.h_act.zero_(); self.h_act32.zero_()
-        self.h_lat.zero_(); self.h_error.zero_()
-
-
 def rollout(csv_files, ac, mdl_path, ort_session, csv_cache,
-            deterministic=False, bufs=None):
+            deterministic=False):
     data, rng = csv_cache.slice(csv_files)
-    N = data['N']
-    if bufs is not None and bufs.sim is not None and bufs.sim.N == N:
-        sim = bufs.sim
-        sim.reload_data(data, rng)
-    else:
-        sim = BatchedSimulator(str(mdl_path), ort_session=ort_session,
-                               cached_data=data, cached_rng=rng)
-        if bufs is not None:
-            bufs.sim = sim
+    sim = BatchedSimulator(str(mdl_path), ort_session=ort_session,
+                           cached_data=data, cached_rng=rng)
     N, T = sim.N, sim.T
     dg = sim.data_gpu
     max_steps = COST_END_IDX - CONTROL_START_IDX
 
-    if bufs is not None and bufs.N == N:
-        bufs.reset()
-        h_act, h_act32 = bufs.h_act, bufs.h_act32
-        h_lat, h_error = bufs.h_lat, bufs.h_error
-        obs_buf = bufs.obs_buf
-        all_obs, all_raw = bufs.all_obs, bufs.all_raw
-        tgt_hist, cur_hist, act_hist = bufs.tgt_hist, bufs.cur_hist, bufs.act_hist
-        zeros_N = bufs.zeros_N
-    else:
-        h_act   = torch.zeros((N, HIST_LEN), dtype=torch.float64, device='cuda')
-        h_act32 = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
-        h_lat   = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
-        h_error = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
-        obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device='cuda')
-        if not deterministic:
-            all_obs = torch.empty((max_steps, N, OBS_DIM), dtype=torch.float32, device='cuda')
-            all_raw = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
-            tgt_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
-            cur_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
-            act_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
-        zeros_N = torch.zeros(N, dtype=torch.float64, device='cuda')
+    h_act   = torch.zeros((N, HIST_LEN), dtype=torch.float64, device='cuda')
+    h_act32 = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
+    h_lat   = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
+    h_error = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
+    obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device='cuda')
+    zeros_N = torch.zeros(N, dtype=torch.float64, device='cuda')
+
+    if not deterministic:
+        all_obs = torch.empty((max_steps, N, OBS_DIM), dtype=torch.float32, device='cuda')
+        all_raw = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
+        tgt_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
+        cur_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
+        act_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
     si = 0
 
     def ctrl(step_idx, sim_ref):
@@ -507,8 +470,6 @@ class TrainingContext:
         self.csv_cache = csv_cache
         self.warmup_off = warmup_off
         self.best, self.best_ep = float('inf'), 'init'
-        N = min(CSVS_EPOCH, len(tr_f))
-        self.bufs = RolloutBuffers(N, COST_END_IDX - CONTROL_START_IDX)
 
     def save_best(self):
         torch.save({
@@ -528,8 +489,7 @@ def evaluate(ac, files, mdl_path, ort_session, csv_cache):
 def train_one_epoch(epoch, ctx):
     t0 = time.time()
     batch = random.sample(ctx.tr_f, min(CSVS_EPOCH, len(ctx.tr_f)))
-    res = rollout(batch, ctx.ac, ctx.mdl_path, ctx.ort_sess, ctx.csv_cache,
-                  bufs=ctx.bufs)
+    res = rollout(batch, ctx.ac, ctx.mdl_path, ctx.ort_sess, ctx.csv_cache)
     t1 = time.time()
 
     co = epoch < (CRITIC_WARMUP - ctx.warmup_off)
