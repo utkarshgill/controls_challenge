@@ -22,7 +22,7 @@ HIST_LEN, FUTURE_K = 20, 50
 STATE_DIM, HIDDEN   = 256, 256
 A_LAYERS, C_LAYERS  = 4, 4
 DELTA_SCALE         = 0.25
-MAX_DELTA           = 0.5
+MAX_STEER           = 0.5
 
 # ── scaling ───────────────────────────────────────────────────
 S_LAT, S_STEER = 5.0, 2.0
@@ -211,8 +211,8 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
         raw = 2.0 * a_p / (a_p + b_p) - 1.0 if deterministic \
               else 2.0 * torch.distributions.Beta(a_p, b_p).sample() - 1.0
 
-        delta  = (raw.double() * DELTA_SCALE).clamp(-MAX_DELTA, MAX_DELTA)
-        action = (h_act[:, -1] + delta).clamp(STEER_RANGE[0], STEER_RANGE[1])
+        delta  = raw.double() * DELTA_SCALE
+        action = (h_act[:, -1] + delta).clamp(-MAX_STEER, MAX_STEER)
 
         h_act[:, :-1] = h_act[:, 1:]; h_act[:, -1] = action
         h_act32[:, :-1] = h_act32[:, 1:]; h_act32[:, -1] = action.float()

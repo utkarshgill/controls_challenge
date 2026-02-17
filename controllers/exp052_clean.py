@@ -10,7 +10,7 @@ HIST_LEN, FUTURE_K = 20, 50
 STATE_DIM, HIDDEN   = 256, 256
 A_LAYERS            = 4
 DELTA_SCALE         = 0.25
-MAX_DELTA           = 0.5
+MAX_STEER           = 0.5
 
 S_LAT, S_STEER = 5.0, 2.0
 S_VEGO, S_AEGO = 40.0, 4.0
@@ -126,8 +126,8 @@ class Controller(BaseController):
             a_p = F.softplus(out[..., 0]).item() + 1.0
             b_p = F.softplus(out[..., 1]).item() + 1.0
         raw = 2.0 * a_p / (a_p + b_p) - 1.0
-        delta = float(np.clip(raw * DELTA_SCALE, -MAX_DELTA, MAX_DELTA))
-        action = float(np.clip(self._h_act[-1] + delta, *STEER_RANGE))
+        delta = raw * DELTA_SCALE
+        action = float(np.clip(self._h_act[-1] + delta, -MAX_STEER, MAX_STEER))
 
         self._h_act = self._h_act[1:] + [action]
         self._h_lat = self._h_lat[1:] + [current_lataccel]
