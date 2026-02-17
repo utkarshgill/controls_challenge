@@ -46,7 +46,6 @@ def make_ort_session(model_path):
             'trt_engine_cache_enable': True,
             'trt_engine_cache_path': str(Path(model_path).parent),
             'trt_max_workspace_size': str(2 << 30),  # 2 GB
-            'trt_cuda_graph_enable': True,
         }
         providers = [
             ('TensorrtExecutionProvider', trt_opts),
@@ -209,24 +208,23 @@ class BatchedPhysicsModel:
         return self._predict_cpu(input_data, temperature, rng_u, rngs)
 
     def _ensure_gpu_bufs(self, N, CL):
-        """Lazily allocate GPU buffers. Never shrinks (CUDA graph stability)."""
-        alloc_N = max(N, self._cached_N)
-        if alloc_N != self._cached_N:
+        """Lazily allocate / resize GPU buffers when N changes."""
+        if N != self._cached_N:
             torch = self._torch
-            self._out_gpu = torch.empty((alloc_N, CL, VOCAB_SIZE),
+            self._out_gpu = torch.empty((N, CL, VOCAB_SIZE),
                                         dtype=torch.float32, device='cuda')
-            self._states_gpu = torch.empty((alloc_N, CL, 4),
+            self._states_gpu = torch.empty((N, CL, 4),
                                            dtype=torch.float32, device='cuda')
-            self._tokens_gpu = torch.empty((alloc_N, CL),
+            self._tokens_gpu = torch.empty((N, CL),
                                            dtype=torch.int64, device='cuda')
-            self._clamped_buf = torch.empty((alloc_N, CL),
+            self._clamped_buf = torch.empty((N, CL),
                                             dtype=torch.float64, device='cuda')
-            self._cdf_buf = torch.empty((alloc_N, VOCAB_SIZE),
+            self._cdf_buf = torch.empty((N, VOCAB_SIZE),
                                         dtype=torch.float32, device='cuda')
-            self._states_shape = [alloc_N, CL, 4]
-            self._tokens_shape = [alloc_N, CL]
-            self._out_shape = [alloc_N, CL, VOCAB_SIZE]
-            self._cached_N = alloc_N
+            self._states_shape = [N, CL, 4]
+            self._tokens_shape = [N, CL]
+            self._out_shape = [N, CL, VOCAB_SIZE]
+            self._cached_N = N
             self._io_prebound = False  # new buffers → must rebind
 
     def _bind_io_if_needed(self):
@@ -345,36 +343,34 @@ class BatchedPhysicsModel:
     def _get_current_lataccel_gpu(self, sim_states, actions, past_preds,
                                    rng_u, return_expected):
         """All-GPU fast path — inlines model run, cached IOBinding,
-        [:N] slicing for CUDA graph stability, float32 sampling."""
+        zero per-step temp allocations, float32 sampling."""
         torch = self._torch
         N, CL = actions.shape
         self._ensure_gpu_bufs(N, CL)
 
-        # Tokenize into pre-bound buffer (only first N rows)
-        torch.clamp(past_preds, self._lat_lo, self._lat_hi,
-                    out=self._clamped_buf[:N])
-        torch.bucketize(self._clamped_buf[:N], self._bins_gpu, right=False,
-                        out=self._tokens_gpu[:N])
+        # Tokenize directly into pre-bound buffer (no temp allocation)
+        torch.clamp(past_preds, self._lat_lo, self._lat_hi, out=self._clamped_buf)
+        torch.bucketize(self._clamped_buf, self._bins_gpu, right=False,
+                        out=self._tokens_gpu)
 
-        # Build states via direct copy (only first N rows)
-        self._states_gpu[:N, :, 0].copy_(actions)
-        self._states_gpu[:N, :, 1:].copy_(sim_states)
+        # Build states via direct copy (implicit float64→float32, no .float() temp)
+        self._states_gpu[:, :, 0].copy_(actions)
+        self._states_gpu[:, :, 1:].copy_(sim_states)
 
-        # Run ONNX at full cached_N (CUDA graph uses fixed shape)
+        # Run ONNX with cached IOBinding (no clear/rebind per step)
         self._bind_io_if_needed()
         self.ort_session.run_with_iobinding(self._io)
 
-        # Softmax only first N rows of output
-        probs = torch.softmax(self._out_gpu[:N, -1, :] * 1.25, dim=-1)
+        # Softmax on last timestep
+        probs = torch.softmax(self._out_gpu[:, -1, :] * 1.25, dim=-1)
         self._last_probs_gpu = probs
         self._last_probs = None
 
-        # CDF + sampling in float32 (only first N rows)
-        torch.cumsum(probs, dim=1, out=self._cdf_buf[:N])
-        cdf = self._cdf_buf[:N]
-        cdf /= cdf[:, -1:]
+        # CDF into pre-allocated buffer + float32 searchsorted (no .double() cast)
+        torch.cumsum(probs, dim=1, out=self._cdf_buf)
+        self._cdf_buf /= self._cdf_buf[:, -1:]
         u = rng_u.float().unsqueeze(1) if rng_u.dim() == 1 else rng_u.float()
-        samples = torch.searchsorted(cdf, u).squeeze(1).clamp(0, VOCAB_SIZE - 1)
+        samples = torch.searchsorted(self._cdf_buf, u).squeeze(1).clamp(0, VOCAB_SIZE - 1)
         sampled = self._bins_gpu[samples]
 
         if not return_expected:
