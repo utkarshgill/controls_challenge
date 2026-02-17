@@ -14,7 +14,10 @@ from tinyphysics import (CONTROL_START_IDX, COST_END_IDX, CONTEXT_LENGTH,
     FUTURE_PLAN_STEPS, STEER_RANGE, DEL_T, LAT_ACCEL_COST_MULTIPLIER)
 from tinyphysics_batched import BatchedSimulator, CSVCache, make_ort_session
 
-torch.manual_seed(42); np.random.seed(42)
+torch.manual_seed(42); np.random.seed(42); random.seed(42)
+torch.cuda.manual_seed_all(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 DEV = torch.device('cuda')
 
 # ── architecture ──────────────────────────────────────────────
