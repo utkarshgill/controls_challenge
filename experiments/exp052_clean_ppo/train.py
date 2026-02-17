@@ -57,6 +57,7 @@ MAX_EP     = int(os.getenv('EPOCHS', '200'))
 EVAL_EVERY = 5
 EVAL_N     = 100
 RESUME     = os.getenv('RESUME', '0') == '1'
+DECAY_LR   = os.getenv('DECAY_LR', '0') == '1'
 DEBUG      = int(os.getenv('DEBUG', '0'))
 
 EXP_DIR = Path(__file__).parent
@@ -492,6 +493,11 @@ def evaluate(ac, files, mdl_path, ort_session, csv_cache, sim_model=None):
 
 
 def train_one_epoch(epoch, ctx):
+    if DECAY_LR:
+        frac = 1.0 - epoch / MAX_EP
+        lr = PI_LR * frac + 3e-5          # linear decay to 3e-5 floor
+        for pg in ctx.ppo.pi_opt.param_groups: pg['lr'] = lr
+        for pg in ctx.ppo.vf_opt.param_groups: pg['lr'] = lr
     t0 = time.time()
     batch = random.sample(ctx.tr_f, min(CSVS_EPOCH, len(ctx.tr_f)))
     res = rollout(batch, ctx.ac, ctx.mdl_path, ctx.ort_sess, ctx.csv_cache,
