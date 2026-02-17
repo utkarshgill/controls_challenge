@@ -33,10 +33,10 @@ MINI_BS           = int(os.getenv('MINI_BS', '100000'))
 CRITIC_WARMUP     = 3
 
 # BC
-BC_EPOCHS    = int(os.getenv('BC_EPOCHS', '20'))
-BC_LR        = float(os.getenv('BC_LR', '0.001'))
+BC_EPOCHS    = int(os.getenv('BC_EPOCHS', '40'))
+BC_LR        = float(os.getenv('BC_LR', '3e-4'))
 BC_BS        = int(os.getenv('BC_BS', '8192'))
-BC_GRAD_CLIP = float(os.getenv('BC_GRAD_CLIP', '2.0'))
+BC_GRAD_CLIP = float(os.getenv('BC_GRAD_CLIP', '1.0'))
 
 # runtime
 CSVS_EPOCH = int(os.getenv('CSVS',    '500'))
@@ -878,187 +878,122 @@ def _remote_request(idx, ckpt_path, csv_list, mode='train', _retries=1):
         return []
 
 
-def _bc_extract_gpu(csv_cache, mdl_path, ort_session):
-    """GPU-batched BC extraction. Runs ONNX sim to get real current_lataccel predictions.
-    ONNX history uses target (matching eval warmup), but obs uses raw ONNX prediction."""
+def _bc_extract(csv_cache):
+    """Extract (obs, expert_delta) pairs from CSV data. No ONNX, no simulation.
+    During warmup current_la = target_la (simulator override), so obs has error=0."""
     import time as _t
     t0 = _t.time()
 
     all_files = csv_cache._files
-    N_all = len(all_files)
+    N = len(all_files)
     CL = CONTEXT_LENGTH
     CSI = CONTROL_START_IDX
     S = CSI - CL
     OBS_DIM = STATE_DIM
 
-    # Process in chunks to fit GPU memory
-    CHUNK = int(os.getenv('BC_CHUNK', '5000'))
-    obs_chunks, raw_chunks, ret_chunks = [], [], []
+    data, _ = csv_cache.slice(all_files)
+    tgt_all = torch.tensor(data['target_lataccel'], dtype=torch.float32, device=DEV)
+    roll_all = torch.tensor(data['roll_lataccel'], dtype=torch.float32, device=DEV)
+    v_all = torch.tensor(data['v_ego'], dtype=torch.float32, device=DEV)
+    a_all = torch.tensor(data['a_ego'], dtype=torch.float32, device=DEV)
+    steer_all = torch.tensor(data['steer_command'], dtype=torch.float32, device=DEV)
+    T = tgt_all.shape[1]
 
-    for c0 in range(0, N_all, CHUNK):
-        c1 = min(c0 + CHUNK, N_all)
-        chunk_files = all_files[c0:c1]
-        data, rng_rows = csv_cache.slice(chunk_files)
-        sim = BatchedSimulator(str(mdl_path), ort_session=ort_session,
-                               cached_data=data, cached_rng=rng_rows)
-        N = sim.N
-        T = sim.T
-        dg = sim.data_gpu
+    h_act = torch.zeros((N, HIST_LEN), dtype=torch.float32, device=DEV)
+    h_lat = torch.zeros((N, HIST_LEN), dtype=torch.float32, device=DEV)
+    obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device=DEV)
+    all_obs = torch.empty((S, N, OBS_DIM), dtype=torch.float32, device=DEV)
+    all_raw = torch.empty((S, N), dtype=torch.float32, device=DEV)
 
-        # Obs building buffers on GPU
-        h_act   = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
-        h_lat   = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
-        obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device='cuda')
-        chunk_obs = torch.empty((S, N, OBS_DIM), dtype=torch.float32, device='cuda')
-        chunk_raw = torch.empty((S, N), dtype=torch.float32, device='cuda')
-        chunk_tgt = torch.empty((S, N), dtype=torch.float64, device='cuda')
-        chunk_cur = torch.empty((S, N), dtype=torch.float64, device='cuda')
-        chunk_act = torch.empty((S, N), dtype=torch.float32, device='cuda')
+    C = 16; H1 = C + HIST_LEN; H2 = H1 + HIST_LEN
+    F_LAT = H2; F_ROLL = F_LAT + FUTURE_K; F_V = F_ROLL + FUTURE_K; F_A = F_V + FUTURE_K
 
-        C = 16; H1 = C + HIST_LEN; H2 = H1 + HIST_LEN
-        F_LAT = H2; F_ROLL = F_LAT + FUTURE_K; F_V = F_ROLL + FUTURE_K; F_A = F_V + FUTURE_K
+    for step_idx in range(CL, CSI):
+        si = step_idx - CL
+        target = tgt_all[:, step_idx]
+        roll_la = roll_all[:, step_idx]
+        v_ego = v_all[:, step_idx]
+        a_ego = a_all[:, step_idx]
 
-        for step_idx in range(CL, CSI):
-            # Write state
-            sim.state_history[:, sim._hist_len, 0] = dg['roll_lataccel'][:, step_idx]
-            sim.state_history[:, sim._hist_len, 1] = dg['v_ego'][:, step_idx]
-            sim.state_history[:, sim._hist_len, 2] = dg['a_ego'][:, step_idx]
-            # Actions: CSV steer during warmup
-            sim.control_step(step_idx, None)
-            # ONNX prediction + warmup override (stores sim.raw_pred)
-            sim.sim_step(step_idx)
+        v2 = torch.clamp(v_ego * v_ego, min=1.0)
+        k_tgt = (target - roll_la) / v2
+        fplan_lat0 = tgt_all[:, min(step_idx + 1, T - 1)]
+        fric = torch.sqrt(target**2 + a_ego**2) / 7.0
 
-            si = step_idx - CL
-            target     = dg['target_lataccel'][:, step_idx]
-            onnx_pred  = sim.raw_pred  # for critic reward computation
-            roll_la    = dg['roll_lataccel'][:, step_idx]
-            v_ego      = dg['v_ego'][:, step_idx]
-            a_ego      = dg['a_ego'][:, step_idx]
+        obs_buf[:, 0]  = target / S_LAT
+        obs_buf[:, 1]  = target / S_LAT
+        obs_buf[:, 2]  = 0.0
+        obs_buf[:, 3]  = k_tgt / S_CURV
+        obs_buf[:, 4]  = k_tgt / S_CURV
+        obs_buf[:, 5]  = 0.0
+        obs_buf[:, 6]  = v_ego / S_VEGO
+        obs_buf[:, 7]  = a_ego / S_AEGO
+        obs_buf[:, 8]  = roll_la / S_ROLL
+        obs_buf[:, 9]  = h_act[:, -1] / S_STEER
+        obs_buf[:, 10] = 0.0
+        obs_buf[:, 11] = (fplan_lat0 - target) / DEL_T / S_LAT
+        obs_buf[:, 12] = (target - h_lat[:, -1]) / DEL_T / S_LAT
+        obs_buf[:, 13] = (h_act[:, -1] - h_act[:, -2]) / DEL_T / S_STEER
+        obs_buf[:, 14] = fric
+        obs_buf[:, 15] = torch.clamp(1.0 - fric, min=0.0)
 
-            # Actor obs: current_la = target (matches eval warmup, error=0)
-            obs_cur = target.float()
-            v2 = torch.clamp(v_ego * v_ego, min=1.0)
-            k_tgt = (target - roll_la) / v2
-            k_cur = (target - roll_la) / v2  # same as k_tgt: error=0
-            fplan_lat0 = dg['target_lataccel'][:, min(step_idx + 1, T - 1)]
-            fric = torch.sqrt(target**2 + a_ego**2) / 7.0
+        obs_buf[:, C:H1]  = h_act / S_STEER
+        obs_buf[:, H1:H2] = h_lat / S_LAT
 
-            obs_buf[:, 0]  = target / S_LAT
-            obs_buf[:, 1]  = obs_cur / S_LAT
-            obs_buf[:, 2]  = 0.0  # error = target - target = 0
-            obs_buf[:, 3]  = k_tgt / S_CURV
-            obs_buf[:, 4]  = k_cur / S_CURV
-            obs_buf[:, 5]  = 0.0  # k_tgt - k_cur = 0
-            obs_buf[:, 6]  = v_ego / S_VEGO
-            obs_buf[:, 7]  = a_ego / S_AEGO
-            obs_buf[:, 8]  = roll_la / S_ROLL
-            obs_buf[:, 9]  = h_act[:, -1] / S_STEER
-            obs_buf[:, 10] = 0.0  # error integral ≈ 0 in warmup
-            obs_buf[:, 11] = (fplan_lat0 - target) / DEL_T / S_LAT
-            obs_buf[:, 12] = (obs_cur - h_lat[:, -1]) / DEL_T / S_LAT
-            obs_buf[:, 13] = (h_act[:, -1] - h_act[:, -2]) / DEL_T / S_STEER
-            obs_buf[:, 14] = fric
-            obs_buf[:, 15] = torch.clamp(1.0 - fric, min=0.0)
+        end = min(step_idx + FUTURE_PLAN_STEPS, T)
+        for offset, src, scale in [(F_LAT, tgt_all, S_LAT), (F_ROLL, roll_all, S_ROLL),
+                                   (F_V, v_all, S_VEGO), (F_A, a_all, S_AEGO)]:
+            slc = src[:, step_idx+1:end]
+            w = slc.shape[1]
+            if w == 0:
+                obs_buf[:, offset:offset+FUTURE_K] = (src[:, step_idx] / scale).unsqueeze(1)
+            elif w < FUTURE_K:
+                obs_buf[:, offset:offset+w] = slc / scale
+                obs_buf[:, offset+w:offset+FUTURE_K] = slc[:, -1:] / scale
+            else:
+                obs_buf[:, offset:offset+FUTURE_K] = slc[:, :FUTURE_K] / scale
 
-            obs_buf[:, C:H1]  = h_act / S_STEER
-            obs_buf[:, H1:H2] = h_lat / S_LAT
+        obs_buf.clamp_(-5.0, 5.0)
+        all_obs[si] = obs_buf
 
-            end = min(step_idx + FUTURE_PLAN_STEPS, T)
-            for offset, attr, scale in [(F_LAT, 'target_lataccel', S_LAT),
-                                        (F_ROLL, 'roll_lataccel', S_ROLL),
-                                        (F_V, 'v_ego', S_VEGO),
-                                        (F_A, 'a_ego', S_AEGO)]:
-                slc = dg[attr][:, step_idx+1:end]
-                w = slc.shape[1]
-                if w == 0:
-                    obs_buf[:, offset:offset+FUTURE_K] = (dg[attr][:, step_idx] / scale).float().unsqueeze(1)
-                elif w < FUTURE_K:
-                    obs_buf[:, offset:offset+w] = slc.float() / scale
-                    obs_buf[:, offset+w:offset+FUTURE_K] = slc[:, -1:].float() / scale
-                else:
-                    obs_buf[:, offset:offset+FUTURE_K] = slc[:, :FUTURE_K].float() / scale
+        expert_steer = steer_all[:, step_idx]
+        delta = expert_steer - h_act[:, -1]
+        all_raw[si] = (delta / DELTA_SCALE).clamp(-1.0, 1.0)
 
-            obs_buf.clamp_(-5.0, 5.0)
-            chunk_obs[si] = obs_buf
+        h_act[:, :-1] = h_act[:, 1:]
+        h_act[:, -1] = expert_steer
+        h_lat[:, :-1] = h_lat[:, 1:]
+        h_lat[:, -1] = target
 
-            expert_steer = dg['steer_command'][:, step_idx].float()
-            delta = expert_steer - h_act[:, -1]
-            chunk_raw[si] = (delta / DELTA_SCALE).clamp(-1.0, 1.0)
-            chunk_tgt[si] = target
-            chunk_cur[si] = onnx_pred  # ONNX prediction for critic rewards
-            chunk_act[si] = expert_steer
-
-            # Shift histories (h_lat uses target to match eval warmup history)
-            h_act[:, :-1] = h_act[:, 1:]
-            h_act[:, -1] = expert_steer
-            h_lat[:, :-1] = h_lat[:, 1:]
-            h_lat[:, -1] = target.float()  # target, not ONNX pred
-
-        obs_chunks.append(chunk_obs.permute(1, 0, 2).reshape(-1, OBS_DIM))
-        raw_chunks.append(chunk_raw.T.reshape(-1))
-        # Rewards from ONNX predictions vs target
-        tgt_2d = chunk_tgt.T; cur_2d = chunk_cur.T; act_2d = chunk_act.T
-        lat_r = (tgt_2d - cur_2d)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
-        jerk_r = torch.diff(cur_2d, dim=1, prepend=cur_2d[:, :1]) / DEL_T
-        act_dr = torch.diff(act_2d, dim=1, prepend=act_2d[:, :1]) / DEL_T
-        rew = (-(lat_r + jerk_r**2 * 100 + act_dr**2 * ACT_SMOOTH) / 500.0).float()
-        # Discounted returns per episode
-        ret = torch.zeros_like(rew)
-        g = torch.zeros(N, dtype=torch.float32, device='cuda')
-        for t in range(S - 1, -1, -1):
-            g = rew[:, t] + GAMMA * g
-            ret[:, t] = g
-        ret_chunks.append(ret.reshape(-1))
-
-    all_obs = torch.cat(obs_chunks)
-    all_raw = torch.cat(raw_chunks)
-    all_ret = torch.cat(ret_chunks)
-    print(f"  BC extract (GPU): {len(all_obs)} samples in {_t.time()-t0:.1f}s")
-    return all_obs, all_raw, all_ret
+    obs_t = all_obs.permute(1, 0, 2).reshape(-1, OBS_DIM)
+    raw_t = all_raw.T.reshape(-1)
+    print(f"  BC extract: {len(obs_t)} samples in {_t.time()-t0:.1f}s")
+    return obs_t, raw_t
 
 
-def pretrain_bc(ac, csv_files, csv_cache=None, ort_session=None, mdl_path=None,
-                epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
-    if csv_cache is not None and ort_session is not None:
-        obs_t, raw_t, ret_t = _bc_extract_gpu(csv_cache, mdl_path, ort_session)
-    else:
-        raise RuntimeError("BC extraction requires csv_cache + ort_session (GPU path)")
-
+def pretrain_bc(ac, csv_cache, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
+    obs_t, raw_t = _bc_extract(csv_cache)
     N = len(obs_t)
-    print(f"  BC pretrain: {N} samples, {epochs} epochs (actor + critic)")
+    print(f"  BC pretrain: {N} samples, {epochs} epochs")
 
-    pi_opt = optim.AdamW(ac.actor.parameters(), lr=lr, weight_decay=1e-4)
-    vf_opt = optim.AdamW(ac.critic.parameters(), lr=lr, weight_decay=1e-4)
-    pi_sched = optim.lr_scheduler.CosineAnnealingLR(pi_opt, T_max=epochs)
-    vf_sched = optim.lr_scheduler.CosineAnnealingLR(vf_opt, T_max=epochs)
+    opt = optim.Adam(ac.actor.parameters(), lr=lr)
 
     for ep in range(epochs):
         perm = torch.randperm(N, device=DEV)
-        total_pi, total_vf, n_batches = 0.0, 0.0, 0
+        total_loss, n_batches = 0.0, 0
         for idx in perm.split(batch_size):
             a_p, b_p = ac.beta_params(obs_t[idx])
             x_target = ((raw_t[idx] + 1.0) / 2.0).clamp(1e-6, 1 - 1e-6)
-            pi_loss = -torch.distributions.Beta(a_p, b_p).log_prob(x_target).mean()
+            loss = -torch.distributions.Beta(a_p, b_p).log_prob(x_target).mean()
 
-            v_pred = ac.critic(obs_t[idx]).squeeze(-1)
-            vf_loss = F.huber_loss(v_pred, ret_t[idx], delta=10.0)
-
-            pi_opt.zero_grad()
-            vf_opt.zero_grad()
-            pi_loss.backward()
-            vf_loss.backward()
+            opt.zero_grad()
+            loss.backward()
             nn.utils.clip_grad_norm_(ac.actor.parameters(), BC_GRAD_CLIP)
-            nn.utils.clip_grad_norm_(ac.critic.parameters(), 0.5)
-            pi_opt.step()
-            vf_opt.step()
+            opt.step()
 
-            total_pi += pi_loss.item()
-            total_vf += vf_loss.item()
+            total_loss += loss.item()
             n_batches += 1
-        pi_sched.step()
-        vf_sched.step()
-        print(f"  BC epoch {ep}: pi={total_pi/n_batches:.4f}  vf={total_vf/n_batches:.4f}"
-              f"  lr={pi_opt.param_groups[0]['lr']:.1e}")
+        print(f"  BC epoch {ep}: loss={total_loss/n_batches:.4f}")
 
     print("BC pretrain done.\n")
 
@@ -1328,9 +1263,7 @@ def train():
             print(f"Resumed from best_model.pt (weights only)")
         resumed = True
     else:
-        all_csvs = sorted((ROOT / 'data').glob('*.csv'))
-        pretrain_bc(ctx.ac, all_csvs, csv_cache=ctx.csv_cache,
-                    ort_session=ctx.ort_session, mdl_path=ctx.mdl_path)
+        pretrain_bc(ctx.ac, ctx.csv_cache)
 
     vm, vs = evaluate(ctx, ctx.va_f)
     ctx.best, ctx.best_ep = vm, 'init'
