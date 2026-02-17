@@ -1,4 +1,4 @@
-"""exp050: Physics-Aligned PPO controller (350-dim, Beta, ReLU, 4+4 layers, deterministic)
+"""exp050: Physics-Aligned PPO controller (256-dim, Beta, ReLU, 4+4 layers, deterministic)
 With optional N-step MPC correction via ONNX physics model + future_plan lookahead.
 CUDA=1 enables GPU-accelerated MPC (actor + ONNX on GPU, all tensors GPU-resident).
 """
@@ -26,7 +26,7 @@ STATE_DIM   = 350
 HIDDEN      = 256
 A_LAYERS    = 4
 C_LAYERS    = 4
-DELTA_SCALE = 0.5
+DELTA_SCALE = 0.25
 MAX_DELTA   = 0.5
 WARMUP_N    = CONTROL_START_IDX - CONTEXT_LENGTH
 FUTURE_K    = 49
@@ -36,7 +36,7 @@ S_STEER = 2.0
 S_VEGO  = 40.0
 S_AEGO  = 4.0
 S_ROLL  = 2.0
-S_CURV  = 0.001
+S_CURV  = 0.02
 
 MODEL      = os.getenv('MODEL', '')                   # path to controller weights (fallback: best_model.pt)
 LPF_ALPHA  = float(os.getenv('LPF_ALPHA', '0'))      # low-pass: 0=off, 0.15=subtle
@@ -150,7 +150,7 @@ class Controller(BaseController):
         self._h_roll = self._h_roll[1:] + [state.roll_lataccel]
 
     def _build_obs(self, target_lataccel, current_lataccel, state, future_plan, error_integral, h_act, h_lat):
-        """Build the 350-dim observation vector."""
+        """Build the 256-dim observation vector."""
         error = target_lataccel - current_lataccel
         k_tgt = _curv(target_lataccel, state.roll_lataccel, state.v_ego)
         k_cur = _curv(current_lataccel, state.roll_lataccel, state.v_ego)
@@ -196,7 +196,7 @@ class Controller(BaseController):
         return np.clip(obs, -5.0, 5.0)
 
     def _build_obs_batch(self, target, cur_la, state, future_plan, ei, h_act, h_lat):
-        """Vectorised obs for N candidates. cur_la/ei: (N,), h_act/h_lat: (N,20). Returns (N,400)."""
+        """Vectorised obs for N candidates. cur_la/ei: (N,), h_act/h_lat: (N,20). Returns (N,256)."""
         N = len(cur_la)
         k_tgt = _curv(target, state.roll_lataccel, state.v_ego)
         _flat = getattr(future_plan, 'lataccel', None)
@@ -472,7 +472,7 @@ class Controller(BaseController):
 
     def _build_obs_batch_gpu(self, target, cur_la, state, future_plan, ei, h_act, h_lat):
         """GPU vectorised obs for N candidates. cur_la/ei: (N,) GPU, h_act/h_lat: (N,20) GPU.
-        Returns (N, 400) float32 GPU tensor."""
+        Returns (N, 256) float32 GPU tensor."""
         N = cur_la.shape[0]
         k_tgt = _curv(target, state.roll_lataccel, state.v_ego)
         _flat = getattr(future_plan, 'lataccel', None)
