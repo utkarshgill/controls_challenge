@@ -170,6 +170,11 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache,
     dg = sim.data_gpu
     max_steps = COST_END_IDX - CONTROL_START_IDX
 
+    # Pre-cast to float32 once — eliminates per-step .float() casts
+    dg_f = {}
+    for k in ('target_lataccel', 'roll_lataccel', 'v_ego', 'a_ego'):
+        dg_f[k] = dg[k].float()
+
     h_act   = torch.zeros((N, HIST_LEN), dtype=torch.float64, device='cuda')
     h_act32 = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
     h_lat   = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
@@ -178,23 +183,22 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache,
     zeros_N = torch.zeros(N, dtype=torch.float64, device='cuda')
 
     if not deterministic:
-        all_obs = torch.empty((max_steps, N, OBS_DIM), dtype=torch.float32, device='cuda')
-        all_raw = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
-        tgt_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
-        cur_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
-        act_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
+        # (N, S, ...) layout so obs_flat = view, no 700MB copy
+        all_obs = torch.empty((N, max_steps, OBS_DIM), dtype=torch.float32, device='cuda')
+        all_raw = torch.empty((N, max_steps), dtype=torch.float32, device='cuda')
+        tgt_hist = torch.empty((N, max_steps), dtype=torch.float64, device='cuda')
+        cur_hist = torch.empty((N, max_steps), dtype=torch.float64, device='cuda')
+        act_hist = torch.empty((N, max_steps), dtype=torch.float64, device='cuda')
     si = 0
 
     def ctrl(step_idx, sim_ref):
         nonlocal si
         target  = dg['target_lataccel'][:, step_idx]
         current = sim_ref.current_lataccel
-        roll_la = dg['roll_lataccel'][:, step_idx]
-        v_ego   = dg['v_ego'][:, step_idx]
-        a_ego   = dg['a_ego'][:, step_idx]
 
         cur32 = current.float()
-        error = (target - current).float()
+        target_f = dg_f['target_lataccel'][:, step_idx]
+        error = target_f - cur32
         h_error[:, :-1] = h_error[:, 1:]; h_error[:, -1] = error
         ei = h_error.mean(dim=1) * DEL_T
 
@@ -204,8 +208,11 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache,
             h_lat[:, :-1] = h_lat[:, 1:]; h_lat[:, -1] = cur32
             return zeros_N
 
-        fill_obs(obs_buf, target.float(), cur32, roll_la.float(), v_ego.float(),
-                 a_ego.float(), h_act32, h_lat, ei, dg, step_idx, T)
+        fill_obs(obs_buf, target_f, cur32,
+                 dg_f['roll_lataccel'][:, step_idx],
+                 dg_f['v_ego'][:, step_idx],
+                 dg_f['a_ego'][:, step_idx],
+                 h_act32, h_lat, ei, dg_f, step_idx, T)
 
         a_p, b_p = ac.beta_params(obs_buf)
 
@@ -220,8 +227,8 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache,
         h_lat[:, :-1] = h_lat[:, 1:]; h_lat[:, -1] = cur32
 
         if not deterministic and step_idx < COST_END_IDX:
-            all_obs[si] = obs_buf; all_raw[si] = raw
-            tgt_hist[si] = target; cur_hist[si] = current; act_hist[si] = action
+            all_obs[:, si] = obs_buf; all_raw[:, si] = raw
+            tgt_hist[:, si] = target; cur_hist[:, si] = current; act_hist[:, si] = action
             si += 1
         return action
 
@@ -232,21 +239,20 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache,
         return costs.tolist()
 
     S = si
-    obs_flat = all_obs[:S].permute(1, 0, 2).reshape(-1, OBS_DIM)
+    obs_flat = all_obs.reshape(-1, OBS_DIM)
     with torch.inference_mode():
         val_2d = ac.critic(obs_flat).squeeze(-1).reshape(N, S)
 
-    tgt = tgt_hist[:S].T; cur = cur_hist[:S].T; act = act_hist[:S].T
-    lat_r = (tgt - cur)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
-    jerk = torch.diff(cur, dim=1, prepend=cur[:, :1]) / DEL_T
-    act_d = torch.diff(act, dim=1, prepend=act[:, :1]) / DEL_T
+    lat_r = (tgt_hist - cur_hist)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
+    jerk = torch.diff(cur_hist, dim=1, prepend=cur_hist[:, :1]) / DEL_T
+    act_d = torch.diff(act_hist, dim=1, prepend=act_hist[:, :1]) / DEL_T
     rew = (-(lat_r + jerk**2 * 100 + act_d**2 * ACT_SMOOTH) / 500.0).float()
     dones = torch.zeros((N, S), dtype=torch.float32, device='cuda')
     dones[:, -1] = 1.0
 
     return dict(
         obs=obs_flat,
-        raw=all_raw[:S].T.reshape(-1),
+        raw=all_raw.reshape(-1),
         val_2d=val_2d,
         rew=rew, done=dones, costs=costs)
 
@@ -508,6 +514,8 @@ def train_one_epoch(epoch, ctx):
 
 def train():
     ac = ActorCritic().to(DEV)
+    ac.actor = torch.compile(ac.actor)
+    ac.critic = torch.compile(ac.critic)
     ppo = PPO(ac)
     mdl_path = ROOT / 'models' / 'tinyphysics.onnx'
     ort_sess = make_ort_session(mdl_path)
