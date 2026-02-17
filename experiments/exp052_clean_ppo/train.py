@@ -22,7 +22,7 @@ HIST_LEN, FUTURE_K = 20, 50
 STATE_DIM, HIDDEN   = 256, 256
 A_LAYERS, C_LAYERS  = 4, 4
 DELTA_SCALE         = 0.25
-MAX_STEER           = 1.0
+MAX_DELTA           = 0.5
 
 # ── scaling ───────────────────────────────────────────────────
 S_LAT, S_STEER = 5.0, 2.0
@@ -38,15 +38,15 @@ K_EPOCHS    = 4
 EPS_CLIP    = 0.2
 VF_COEF     = 1.0
 ENT_COEF    = float(os.getenv('ENT_COEF', '0.001'))
-ACT_SMOOTH  = float(os.getenv('ACT_SMOOTH', '5.0'))
+ACT_SMOOTH  = float(os.getenv('ACT_SMOOTH', '10.0'))
 MINI_BS     = int(os.getenv('MINI_BS', '100000'))
-CRITIC_WARMUP = 3
+CRITIC_WARMUP = 4
 
 # ── BC ────────────────────────────────────────────────────────
 BC_EPOCHS   = int(os.getenv('BC_EPOCHS', '20'))
-BC_LR       = float(os.getenv('BC_LR', '0.001'))
+BC_LR       = float(os.getenv('BC_LR', '0.01'))
 BC_BS       = int(os.getenv('BC_BS', '8192'))
-BC_GRAD_CLIP = 1.0
+BC_GRAD_CLIP = 2.0
 
 # ── runtime ───────────────────────────────────────────────────
 CSVS_EPOCH = int(os.getenv('CSVS', '500'))
@@ -211,8 +211,8 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
         raw = 2.0 * a_p / (a_p + b_p) - 1.0 if deterministic \
               else 2.0 * torch.distributions.Beta(a_p, b_p).sample() - 1.0
 
-        delta  = raw.double() * DELTA_SCALE
-        action = (h_act[:, -1] + delta).clamp(-MAX_STEER, MAX_STEER)
+        delta  = (raw.double() * DELTA_SCALE).clamp(-MAX_DELTA, MAX_DELTA)
+        action = (h_act[:, -1] + delta).clamp(STEER_RANGE[0], STEER_RANGE[1])
 
         h_act[:, :-1] = h_act[:, 1:]; h_act[:, -1] = action
         h_act32[:, :-1] = h_act32[:, 1:]; h_act32[:, -1] = action.float()
@@ -291,7 +291,8 @@ def bc_extract(csv_cache):
 def pretrain_bc(ac, csv_cache):
     obs, raw = bc_extract(csv_cache)
     N = len(obs)
-    opt = optim.Adam(ac.actor.parameters(), lr=BC_LR)
+    opt = optim.AdamW(ac.actor.parameters(), lr=BC_LR, weight_decay=1e-4)
+    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=BC_EPOCHS)
     print(f"  BC pretrain: {N} samples, {BC_EPOCHS} epochs")
 
     for ep in range(BC_EPOCHS):
@@ -304,7 +305,8 @@ def pretrain_bc(ac, csv_cache):
             nn.utils.clip_grad_norm_(ac.actor.parameters(), BC_GRAD_CLIP)
             opt.step()
             total += loss.item(); nb += 1
-        print(f"  BC epoch {ep}: loss={total/nb:.4f}")
+        sched.step()
+        print(f"  BC epoch {ep}: loss={total/nb:.6f}  lr={opt.param_groups[0]['lr']:.1e}")
     print("BC pretrain done.\n")
 
 
