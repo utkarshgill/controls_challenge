@@ -984,9 +984,10 @@ def _bc_worker(csv_path):
 
         prev_act = h_act[-1]
         expert_delta = steer[step_idx] - prev_act
+        prev_la = tgt[step_idx - 1]
         obs_list.append(obs)
         phys_list.append([target_la, roll[step_idx], vego[step_idx],
-                          current_la, expert_delta])
+                          prev_la, expert_delta])
 
         h_act = h_act[1:] + [steer[step_idx]]
         h_lat = h_lat[1:] + [tgt[step_idx]]
