@@ -10,7 +10,7 @@ HIST_LEN, FUTURE_K = 20, 50
 STATE_DIM, HIDDEN   = 256, 256
 A_LAYERS            = 4
 DELTA_SCALE         = 0.25
-MAX_STEER           = 0.5
+MAX_STEER           = 0.5  # absolute steer bound
 
 S_LAT, S_STEER = 5.0, 2.0
 S_VEGO, S_AEGO = 40.0, 4.0
