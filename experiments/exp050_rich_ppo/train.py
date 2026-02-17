@@ -949,7 +949,7 @@ def _bc_worker(csv_path):
     current_lataccel = current_lataccel_history[-1]
 
     obs_list, raw_list = [], []
-    tgt_list, cur_list, act_list = [], [], []
+    tgt_list, pred_list, act_list = [], [], []
     h_act  = [0.0] * HIST_LEN
     h_lat  = [0.0] * HIST_LEN
     h_v    = [0.0] * HIST_LEN
@@ -957,17 +957,20 @@ def _bc_worker(csv_path):
     h_roll = [0.0] * HIST_LEN
 
     for step_idx in range(CONTEXT_LENGTH, CONTROL_START_IDX):
-        # ONNX forward pass: predict current_lataccel from histories
+        # ONNX forward pass to get real prediction (for critic reward targets)
         pred = mdl.get_current_lataccel(
             sim_states=state_history[-CONTEXT_LENGTH:],
             actions=action_history[-CONTEXT_LENGTH:],
             past_preds=current_lataccel_history[-CONTEXT_LENGTH:])
         pred = np.clip(pred, current_lataccel - MAX_ACC_DELTA,
                        current_lataccel + MAX_ACC_DELTA)
-        current_lataccel = float(pred)
+        onnx_pred = float(pred)
+
+        # Warmup override: current_lataccel = target (matches simulator behavior)
+        target_la = tgt[step_idx]
+        current_lataccel = float(target_la)
         current_lataccel_history.append(current_lataccel)
 
-        target_la = tgt[step_idx]
         state = State(
             roll_lataccel=data['roll_lataccel'].values[step_idx],
             v_ego=data['v_ego'].values[step_idx],
@@ -987,10 +990,9 @@ def _bc_worker(csv_path):
         obs_list.append(obs)
         raw_list.append(raw_target)
         tgt_list.append(target_la)
-        cur_list.append(current_lataccel)
+        pred_list.append(onnx_pred)
         act_list.append(float(steer[step_idx]))
 
-        # Update ONNX histories
         state_history.append(state)
         action_history.append(steer[step_idx])
         h_act = h_act[1:] + [steer[step_idx]]
@@ -999,12 +1001,12 @@ def _bc_worker(csv_path):
         h_a = h_a[1:] + [data['a_ego'].values[step_idx]]
         h_roll = h_roll[1:] + [data['roll_lataccel'].values[step_idx]]
 
-    # Per-step rewards using exact cost function
+    # Critic rewards: ONNX predictions vs target (real tracking error)
     tgt_arr = np.array(tgt_list, np.float32)
-    cur_arr = np.array(cur_list, np.float32)
+    pred_arr = np.array(pred_list, np.float32)
     act_arr = np.array(act_list, np.float32)
-    lat_cost = (tgt_arr - cur_arr)**2 * 100 * LAT_ACCEL_COST_MULTIPLIER
-    jerk = np.diff(cur_arr, prepend=cur_arr[0]) / DEL_T
+    lat_cost = (tgt_arr - pred_arr)**2 * 100 * LAT_ACCEL_COST_MULTIPLIER
+    jerk = np.diff(pred_arr, prepend=pred_arr[0]) / DEL_T
     act_d = np.diff(act_arr, prepend=act_arr[0]) / DEL_T
     rewards = (-(lat_cost + jerk**2 * 100 + act_d**2 * ACT_SMOOTH) / 500.0).astype(np.float32)
 
