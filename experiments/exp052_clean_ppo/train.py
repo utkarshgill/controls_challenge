@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 from tinyphysics import (CONTROL_START_IDX, COST_END_IDX, CONTEXT_LENGTH,
     FUTURE_PLAN_STEPS, STEER_RANGE, DEL_T, LAT_ACCEL_COST_MULTIPLIER,
     ACC_G, State, FuturePlan)
-from tinyphysics_batched import BatchedSimulator, CSVCache, make_ort_session
+from tinyphysics_batched import BatchedSimulator, BatchedPhysicsModel, CSVCache, make_ort_session
 
 torch.manual_seed(42); np.random.seed(42)
 torch.set_float32_matmul_precision('high')
@@ -163,10 +163,11 @@ def fill_obs(buf, target, current, roll_la, v_ego, a_ego,
 # ══════════════════════════════════════════════════════════════
 
 def rollout(csv_files, ac, mdl_path, ort_session, csv_cache,
-            deterministic=False):
+            deterministic=False, sim_model=None):
     data, rng = csv_cache.slice(csv_files)
     sim = BatchedSimulator(str(mdl_path), ort_session=ort_session,
-                           cached_data=data, cached_rng=rng)
+                           cached_data=data, cached_rng=rng,
+                           sim_model=sim_model)
     N, T = sim.N, sim.T
     dg = sim.data_gpu
     max_steps = COST_END_IDX - CONTROL_START_IDX
@@ -464,12 +465,13 @@ class PPO:
 # ══════════════════════════════════════════════════════════════
 
 class TrainingContext:
-    def __init__(self, ac, ppo, mdl_path, ort_sess, tr_f, va_f, csv_cache, warmup_off):
+    def __init__(self, ac, ppo, mdl_path, ort_sess, tr_f, va_f, csv_cache, warmup_off, sim_model):
         self.ac, self.ppo = ac, ppo
         self.mdl_path, self.ort_sess = mdl_path, ort_sess
         self.tr_f, self.va_f = tr_f, va_f
         self.csv_cache = csv_cache
         self.warmup_off = warmup_off
+        self.sim_model = sim_model
         self.best, self.best_ep = float('inf'), 'init'
 
     def save_best(self):
@@ -483,15 +485,17 @@ class TrainingContext:
         }, BEST_PT)
 
 
-def evaluate(ac, files, mdl_path, ort_session, csv_cache):
-    costs = rollout(files, ac, mdl_path, ort_session, csv_cache, deterministic=True)
+def evaluate(ac, files, mdl_path, ort_session, csv_cache, sim_model=None):
+    costs = rollout(files, ac, mdl_path, ort_session, csv_cache,
+                    deterministic=True, sim_model=sim_model)
     return float(np.mean(costs)), float(np.std(costs))
 
 
 def train_one_epoch(epoch, ctx):
     t0 = time.time()
     batch = random.sample(ctx.tr_f, min(CSVS_EPOCH, len(ctx.tr_f)))
-    res = rollout(batch, ctx.ac, ctx.mdl_path, ctx.ort_sess, ctx.csv_cache)
+    res = rollout(batch, ctx.ac, ctx.mdl_path, ctx.ort_sess, ctx.csv_cache,
+                  sim_model=ctx.sim_model)
     t1 = time.time()
 
     co = epoch < (CRITIC_WARMUP - ctx.warmup_off)
@@ -504,7 +508,8 @@ def train_one_epoch(epoch, ctx):
             f"  lr={info['lr']:.1e}  ⏱{t1-t0:.0f}+{tu:.0f}s{phase}")
 
     if epoch % EVAL_EVERY == 0:
-        vm, vs = evaluate(ctx.ac, ctx.va_f, ctx.mdl_path, ctx.ort_sess, ctx.csv_cache)
+        vm, vs = evaluate(ctx.ac, ctx.va_f, ctx.mdl_path, ctx.ort_sess,
+                          ctx.csv_cache, sim_model=ctx.sim_model)
         mk = ""
         if vm < ctx.best:
             ctx.best, ctx.best_ep = vm, epoch
@@ -548,9 +553,12 @@ def train():
             r = ckpt['ret_rms']
             ppo._rms.mean, ppo._rms.var, ppo._rms.count = r['mean'], r['var'], r['count']
 
-    ctx = TrainingContext(ac, ppo, mdl_path, ort_sess, tr_f, va_f, csv_cache, warmup_off)
+    sim_model = BatchedPhysicsModel(str(mdl_path), ort_session=ort_sess)
+    sim_model.warmup_cuda_graph(CSVS_EPOCH, CONTEXT_LENGTH)
 
-    vm, vs = evaluate(ac, va_f, mdl_path, ort_sess, csv_cache)
+    ctx = TrainingContext(ac, ppo, mdl_path, ort_sess, tr_f, va_f, csv_cache, warmup_off, sim_model)
+
+    vm, vs = evaluate(ac, va_f, mdl_path, ort_sess, csv_cache, sim_model=sim_model)
     ctx.best, ctx.best_ep = vm, 'init'
     print(f"Baseline: {vm:.1f} ± {vs:.1f}")
     ctx.save_best()
