@@ -4,20 +4,19 @@
 # Delta actions: steer = prev + delta * DELTA_SCALE
 # All tensors GPU-resident.  No CPU fallback.  No remote.  No workers.
 
-import numpy as np, os, sys, time, random
+import numpy as np, pandas as pd, os, sys, time, random
 import torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim
 from pathlib import Path
+from tqdm.contrib.concurrent import process_map
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 from tinyphysics import (CONTROL_START_IDX, COST_END_IDX, CONTEXT_LENGTH,
-    FUTURE_PLAN_STEPS, STEER_RANGE, DEL_T, LAT_ACCEL_COST_MULTIPLIER)
+    FUTURE_PLAN_STEPS, STEER_RANGE, DEL_T, LAT_ACCEL_COST_MULTIPLIER,
+    ACC_G, State, FuturePlan)
 from tinyphysics_batched import BatchedSimulator, CSVCache, make_ort_session
 
-torch.manual_seed(42); np.random.seed(42); random.seed(42)
-torch.cuda.manual_seed_all(42)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+torch.manual_seed(42); np.random.seed(42)
 DEV = torch.device('cuda')
 
 # ── architecture ──────────────────────────────────────────────
@@ -249,60 +248,102 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
 
 
 # ══════════════════════════════════════════════════════════════
-#  BC Pretrain (actor-only NLL, pure CSV tensors, no ONNX)
+#  BC Pretrain (actor-only NLL, CPU extraction — proven 83.3 path)
 # ══════════════════════════════════════════════════════════════
 
-def bc_extract(csv_cache):
-    t0 = time.time()
-    data, _ = csv_cache.slice(csv_cache._files)
-    N = len(csv_cache._files)
-    CL, CSI, S = CONTEXT_LENGTH, CONTROL_START_IDX, CONTROL_START_IDX - CONTEXT_LENGTH
-    T = data['T']
-
-    tgt  = torch.tensor(data['target_lataccel'], dtype=torch.float32, device=DEV)
-    roll = torch.tensor(data['roll_lataccel'],    dtype=torch.float32, device=DEV)
-    v    = torch.tensor(data['v_ego'],            dtype=torch.float32, device=DEV)
-    a    = torch.tensor(data['a_ego'],            dtype=torch.float32, device=DEV)
-    steer = torch.tensor(data['steer_command'],   dtype=torch.float32, device=DEV)
-
-    h_act = torch.zeros((N, HIST_LEN), dtype=torch.float32, device=DEV)
-    h_lat = torch.zeros((N, HIST_LEN), dtype=torch.float32, device=DEV)
-    buf   = torch.empty((N, OBS_DIM),  dtype=torch.float32, device=DEV)
-    obs_all = torch.empty((S, N, OBS_DIM), dtype=torch.float32, device=DEV)
-    raw_all = torch.empty((S, N),          dtype=torch.float32, device=DEV)
-
-    dg = {'target_lataccel': tgt, 'roll_lataccel': roll, 'v_ego': v, 'a_ego': a}
-
-    for step_idx in range(CL, CSI):
-        si = step_idx - CL
-        t_i, r_i, v_i, a_i = tgt[:, step_idx], roll[:, step_idx], v[:, step_idx], a[:, step_idx]
-        # warmup: current = target, error_integral ≈ 0
-        fill_obs(buf, t_i, t_i, r_i, v_i, a_i, h_act, h_lat,
-                 torch.zeros(N, device=DEV), dg, step_idx, T)
-        obs_all[si] = buf
-        raw_all[si] = ((steer[:, step_idx] - h_act[:, -1]) / DELTA_SCALE).clamp(-1, 1)
-
-        h_act[:, :-1] = h_act[:, 1:]; h_act[:, -1] = steer[:, step_idx]
-        h_lat[:, :-1] = h_lat[:, 1:]; h_lat[:, -1] = t_i
-
-    obs = obs_all.permute(1, 0, 2).reshape(-1, OBS_DIM)
-    raw = raw_all.T.reshape(-1)
-    print(f"  BC extract: {len(obs)} samples in {time.time()-t0:.1f}s")
-    return obs, raw
+def _future_raw(fplan, attr, fallback, k=FUTURE_K):
+    vals = getattr(fplan, attr, None) if fplan else None
+    if vals is not None and len(vals) >= k:
+        return np.asarray(vals[:k], np.float32)
+    elif vals is not None and len(vals) > 0:
+        a = np.array(vals, np.float32)
+        return np.pad(a, (0, k - len(a)), 'edge')
+    return np.full(k, fallback, dtype=np.float32)
 
 
-def pretrain_bc(ac, csv_cache):
-    obs, raw = bc_extract(csv_cache)
-    N = len(obs)
+def _build_obs_bc(target, current, state, fplan,
+                  hist_act, hist_lat):
+    k_tgt = (target - state.roll_lataccel) / max(state.v_ego ** 2, 1.0)
+    k_cur = (current - state.roll_lataccel) / max(state.v_ego ** 2, 1.0)
+    _flat = getattr(fplan, 'lataccel', None)
+    fp0 = _flat[0] if (_flat and len(_flat) > 0) else target
+    fric = np.sqrt(current**2 + state.a_ego**2) / 7.0
+
+    core = np.array([
+        target / S_LAT, current / S_LAT, (target - current) / S_LAT,
+        k_tgt / S_CURV, k_cur / S_CURV, (k_tgt - k_cur) / S_CURV,
+        state.v_ego / S_VEGO, state.a_ego / S_AEGO,
+        state.roll_lataccel / S_ROLL, hist_act[-1] / S_STEER,
+        0.0,
+        (fp0 - target) / DEL_T / S_LAT,
+        (current - hist_lat[-1]) / DEL_T / S_LAT,
+        (hist_act[-1] - hist_act[-2]) / DEL_T / S_STEER,
+        fric, max(0.0, 1.0 - fric),
+    ], dtype=np.float32)
+
+    obs = np.concatenate([
+        core,
+        np.array(hist_act, np.float32) / S_STEER,
+        np.array(hist_lat, np.float32) / S_LAT,
+        _future_raw(fplan, 'lataccel', target) / S_LAT,
+        _future_raw(fplan, 'roll_lataccel', state.roll_lataccel) / S_ROLL,
+        _future_raw(fplan, 'v_ego', state.v_ego) / S_VEGO,
+        _future_raw(fplan, 'a_ego', state.a_ego) / S_AEGO,
+    ])
+    return np.clip(obs, -5.0, 5.0)
+
+
+def _bc_worker(csv_path):
+    df = pd.read_csv(csv_path)
+    roll_la = np.sin(df['roll'].values) * ACC_G
+    v_ego   = df['vEgo'].values
+    a_ego   = df['aEgo'].values
+    tgt     = df['targetLateralAcceleration'].values
+    steer   = -df['steerCommand'].values
+
+    obs_list, raw_list = [], []
+    h_act = [0.0] * HIST_LEN
+    h_lat = [0.0] * HIST_LEN
+
+    for step_idx in range(CONTEXT_LENGTH, CONTROL_START_IDX):
+        target_la = tgt[step_idx]
+        state = State(roll_lataccel=roll_la[step_idx],
+                      v_ego=v_ego[step_idx], a_ego=a_ego[step_idx])
+        fplan = FuturePlan(
+            lataccel=tgt[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist(),
+            roll_lataccel=roll_la[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist(),
+            v_ego=v_ego[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist(),
+            a_ego=a_ego[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist())
+
+        obs = _build_obs_bc(target_la, target_la, state, fplan, h_act, h_lat)
+        raw_target = np.clip((steer[step_idx] - h_act[-1]) / DELTA_SCALE, -1.0, 1.0)
+        obs_list.append(obs)
+        raw_list.append(raw_target)
+        h_act = h_act[1:] + [steer[step_idx]]
+        h_lat = h_lat[1:] + [tgt[step_idx]]
+
+    return (np.array(obs_list, np.float32), np.array(raw_list, np.float32))
+
+
+def pretrain_bc(ac, all_csvs):
+    print(f"BC pretrain: extracting from {len(all_csvs)} CSVs ...")
+    results = process_map(_bc_worker, [str(f) for f in all_csvs],
+                          max_workers=10, chunksize=50, disable=False)
+    all_obs = np.concatenate([r[0] for r in results])
+    all_raw = np.concatenate([r[1] for r in results])
+    N = len(all_obs)
+    print(f"BC pretrain: {N} samples, {BC_EPOCHS} epochs")
+
+    obs_t = torch.FloatTensor(all_obs).to(DEV)
+    raw_t = torch.FloatTensor(all_raw).to(DEV)
     opt = optim.AdamW(ac.actor.parameters(), lr=BC_LR, weight_decay=1e-4)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=BC_EPOCHS)
-    print(f"  BC pretrain: {N} samples, {BC_EPOCHS} epochs")
 
     for ep in range(BC_EPOCHS):
         total, nb = 0.0, 0
-        for idx in torch.randperm(N, device=DEV).split(BC_BS):
-            a_p, b_p = ac.beta_params(obs[idx])
-            x = ((raw[idx] + 1) / 2).clamp(1e-6, 1 - 1e-6)
+        for idx in torch.randperm(N).split(BC_BS):
+            a_p, b_p = ac.beta_params(obs_t[idx])
+            x = ((raw_t[idx] + 1) / 2).clamp(1e-6, 1 - 1e-6)
             loss = -torch.distributions.Beta(a_p, b_p).log_prob(x).mean()
             opt.zero_grad(); loss.backward()
             nn.utils.clip_grad_norm_(ac.actor.parameters(), BC_GRAD_CLIP)
@@ -443,7 +484,8 @@ def train():
         warmup_off = CRITIC_WARMUP
         print(f"Resumed from {BEST_PT.name}")
     else:
-        pretrain_bc(ac, csv_cache)
+        all_csvs = sorted((ROOT / 'data').glob('*.csv'))
+        pretrain_bc(ac, all_csvs)
 
     vm, vs = evaluate(ac, va_f, mdl_path, ort_sess, csv_cache)
     best, best_ep = vm, 'init'
