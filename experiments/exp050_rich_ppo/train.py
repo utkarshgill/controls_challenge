@@ -10,7 +10,8 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 from tinyphysics import (TinyPhysicsModel, TinyPhysicsSimulator, BaseController,
     CONTROL_START_IDX, COST_END_IDX, CONTEXT_LENGTH, FUTURE_PLAN_STEPS,
-    STEER_RANGE, DEL_T, LAT_ACCEL_COST_MULTIPLIER, ACC_G, State, FuturePlan)
+    STEER_RANGE, DEL_T, LAT_ACCEL_COST_MULTIPLIER, MAX_ACC_DELTA, ACC_G,
+    State, FuturePlan)
 from tinyphysics_batched import BatchedSimulator, CSVCache, pool_init, get_pool_cache, run_parallel_chunked
 
 torch.manual_seed(42)
@@ -29,7 +30,7 @@ K_EPOCHS, EPS_CLIP = 4, 0.2
 VF_COEF, ENT_COEF = 1.0, 0.001
 ACT_SMOOTH        = float(os.getenv('ACT_SMOOTH', '5.0'))  # penalty on |Δaction|²
 MINI_BS           = int(os.getenv('MINI_BS', '100000'))
-CRITIC_WARMUP     = 4
+CRITIC_WARMUP     = 0
 
 # BC
 BC_EPOCHS    = int(os.getenv('BC_EPOCHS', '20'))
@@ -916,7 +917,13 @@ def _remote_request(idx, ckpt_path, csv_list, mode='train', _retries=1):
         return []
 
 
+_BC_MDL = {}
+
 def _bc_worker(csv_path):
+    if 'mdl' not in _BC_MDL:
+        _BC_MDL['mdl'] = TinyPhysicsModel(str(ROOT / 'models' / 'tinyphysics.onnx'), debug=False)
+    mdl = _BC_MDL['mdl']
+
     df = pd.read_csv(csv_path)
     data = pd.DataFrame({
         'roll_lataccel': np.sin(df['roll'].values) * ACC_G,
@@ -927,7 +934,22 @@ def _bc_worker(csv_path):
     })
     steer = data['steer_command'].values
     tgt   = data['target_lataccel'].values
+
+    from hashlib import md5
+    seed = int(md5(csv_path.encode()).hexdigest(), 16) % 10**4
+    np.random.seed(seed)
+
+    # Initialize ONNX histories from CSV (same as TinyPhysicsSimulator.reset)
+    state_history = [State(
+        roll_lataccel=data['roll_lataccel'].values[i],
+        v_ego=data['v_ego'].values[i],
+        a_ego=data['a_ego'].values[i]) for i in range(CONTEXT_LENGTH)]
+    action_history = steer[:CONTEXT_LENGTH].tolist()
+    current_lataccel_history = tgt[:CONTEXT_LENGTH].tolist()
+    current_lataccel = current_lataccel_history[-1]
+
     obs_list, raw_list = [], []
+    tgt_list, cur_list, act_list = [], [], []
     h_act  = [0.0] * HIST_LEN
     h_lat  = [0.0] * HIST_LEN
     h_v    = [0.0] * HIST_LEN
@@ -935,9 +957,17 @@ def _bc_worker(csv_path):
     h_roll = [0.0] * HIST_LEN
 
     for step_idx in range(CONTEXT_LENGTH, CONTROL_START_IDX):
-        target_la = tgt[step_idx]
-        current_la = tgt[step_idx]  # BC assumes perfect tracking
+        # ONNX forward pass: predict current_lataccel from histories
+        pred = mdl.get_current_lataccel(
+            sim_states=state_history[-CONTEXT_LENGTH:],
+            actions=action_history[-CONTEXT_LENGTH:],
+            past_preds=current_lataccel_history[-CONTEXT_LENGTH:])
+        pred = np.clip(pred, current_lataccel - MAX_ACC_DELTA,
+                       current_lataccel + MAX_ACC_DELTA)
+        current_lataccel = float(pred)
+        current_lataccel_history.append(current_lataccel)
 
+        target_la = tgt[step_idx]
         state = State(
             roll_lataccel=data['roll_lataccel'].values[step_idx],
             v_ego=data['v_ego'].values[step_idx],
@@ -948,54 +978,100 @@ def _bc_worker(csv_path):
             v_ego=data['v_ego'].values[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist(),
             a_ego=data['a_ego'].values[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist())
 
-        obs = build_obs(target_la, current_la, state, fplan,
+        obs = build_obs(target_la, current_lataccel, state, fplan,
                         h_act, h_lat, h_v, h_a, h_roll)
 
         prev_act = h_act[-1]
         delta = steer[step_idx] - prev_act
-        raw_target = np.clip(delta / DELTA_SCALE, -1.0, 1.0)  # Beta support
+        raw_target = np.clip(delta / DELTA_SCALE, -1.0, 1.0)
         obs_list.append(obs)
         raw_list.append(raw_target)
+        tgt_list.append(target_la)
+        cur_list.append(current_lataccel)
+        act_list.append(float(steer[step_idx]))
+
+        # Update ONNX histories
+        state_history.append(state)
+        action_history.append(steer[step_idx])
         h_act = h_act[1:] + [steer[step_idx]]
-        h_lat = h_lat[1:] + [tgt[step_idx]]
+        h_lat = h_lat[1:] + [current_lataccel]
         h_v = h_v[1:] + [data['v_ego'].values[step_idx]]
         h_a = h_a[1:] + [data['a_ego'].values[step_idx]]
         h_roll = h_roll[1:] + [data['roll_lataccel'].values[step_idx]]
 
+    # Per-step rewards using exact cost function
+    tgt_arr = np.array(tgt_list, np.float32)
+    cur_arr = np.array(cur_list, np.float32)
+    act_arr = np.array(act_list, np.float32)
+    lat_cost = (tgt_arr - cur_arr)**2 * 100 * LAT_ACCEL_COST_MULTIPLIER
+    jerk = np.diff(cur_arr, prepend=cur_arr[0]) / DEL_T
+    act_d = np.diff(act_arr, prepend=act_arr[0]) / DEL_T
+    rewards = (-(lat_cost + jerk**2 * 100 + act_d**2 * ACT_SMOOTH) / 500.0).astype(np.float32)
+
     return (np.array(obs_list, np.float32),
-            np.array(raw_list, np.float32))
+            np.array(raw_list, np.float32),
+            rewards)
 
 
 def pretrain_bc(ac, csv_files, epochs=BC_EPOCHS, lr=BC_LR, batch_size=BC_BS):
-    print(f"BC pretrain: extracting from {len(csv_files)} CSVs ...")
+    print(f"BC pretrain: extracting from {len(csv_files)} CSVs (with ONNX sim) ...")
     results = process_map(_bc_worker, [str(f) for f in csv_files],
                           max_workers=BC_WORKERS, chunksize=50, disable=False)
     all_obs = np.concatenate([r[0] for r in results])
     all_raw = np.concatenate([r[1] for r in results])
+
+    # Compute discounted returns per episode for critic targets
+    all_returns = []
+    for r in results:
+        rew = r[2]
+        T = len(rew)
+        ret = np.zeros(T, np.float32)
+        g = 0.0
+        for t in range(T - 1, -1, -1):
+            g = rew[t] + GAMMA * g
+            ret[t] = g
+        all_returns.append(ret)
+    all_ret = np.concatenate(all_returns)
+
     N = len(all_obs)
-    print(f"BC pretrain: {N} samples, {epochs} epochs")
+    print(f"BC pretrain: {N} samples, {epochs} epochs (actor + critic)")
 
     obs_t = torch.FloatTensor(all_obs).to(DEV)
     raw_t = torch.FloatTensor(all_raw).to(DEV)
-    opt = optim.AdamW(ac.actor.parameters(), lr=lr, weight_decay=1e-4)
-    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    ret_t = torch.FloatTensor(all_ret).to(DEV)
+
+    pi_opt = optim.AdamW(ac.actor.parameters(), lr=lr, weight_decay=1e-4)
+    vf_opt = optim.AdamW(ac.critic.parameters(), lr=lr, weight_decay=1e-4)
+    pi_sched = optim.lr_scheduler.CosineAnnealingLR(pi_opt, T_max=epochs)
+    vf_sched = optim.lr_scheduler.CosineAnnealingLR(vf_opt, T_max=epochs)
 
     for ep in range(epochs):
         perm = torch.randperm(N)
-        total_loss = 0.0
-        n_batches = 0
+        total_pi, total_vf, n_batches = 0.0, 0.0, 0
         for idx in perm.split(batch_size):
             a_p, b_p = ac.beta_params(obs_t[idx])
             x_target = ((raw_t[idx] + 1.0) / 2.0).clamp(1e-6, 1 - 1e-6)
-            loss = -torch.distributions.Beta(a_p, b_p).log_prob(x_target).mean()
-            opt.zero_grad()
-            loss.backward()
+            pi_loss = -torch.distributions.Beta(a_p, b_p).log_prob(x_target).mean()
+
+            v_pred = ac.critic(obs_t[idx]).squeeze(-1)
+            vf_loss = F.huber_loss(v_pred, ret_t[idx], delta=10.0)
+
+            pi_opt.zero_grad()
+            vf_opt.zero_grad()
+            pi_loss.backward()
+            vf_loss.backward()
             nn.utils.clip_grad_norm_(ac.actor.parameters(), BC_GRAD_CLIP)
-            opt.step()
-            total_loss += loss.item()
+            nn.utils.clip_grad_norm_(ac.critic.parameters(), 0.5)
+            pi_opt.step()
+            vf_opt.step()
+
+            total_pi += pi_loss.item()
+            total_vf += vf_loss.item()
             n_batches += 1
-        sched.step()
-        print(f"  BC epoch {ep}: loss={total_loss/n_batches:.6f}  lr={opt.param_groups[0]['lr']:.1e}")
+        pi_sched.step()
+        vf_sched.step()
+        print(f"  BC epoch {ep}: pi={total_pi/n_batches:.4f}  vf={total_vf/n_batches:.4f}"
+              f"  lr={pi_opt.param_groups[0]['lr']:.1e}")
 
     print("BC pretrain done.\n")
 
