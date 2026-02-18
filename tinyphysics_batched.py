@@ -194,8 +194,6 @@ class BatchedPhysicsModel:
             self._bins_f32_gpu = self._bins_gpu.float()
             self._lat_lo = float(LATACCEL_RANGE[0])
             self._lat_hi = float(LATACCEL_RANGE[1])
-            self._io_prebound = False
-            self._bound_N = 0
 
     def softmax(self, x, axis=-1):
         """Mirrors TinyPhysicsModel.softmax."""
@@ -209,8 +207,8 @@ class BatchedPhysicsModel:
         return self._predict_cpu(input_data, temperature, rng_u, rngs)
 
     def _ensure_gpu_bufs(self, N, CL):
-        """Lazily allocate GPU buffers. Never shrinks — avoids realloc churn."""
-        if N > self._cached_N:
+        """Lazily allocate / resize GPU buffers when N changes."""
+        if N != self._cached_N:
             torch = self._torch
             self._out_gpu = torch.empty((N, CL, VOCAB_SIZE),
                                         dtype=torch.float32, device='cuda')
@@ -220,40 +218,27 @@ class BatchedPhysicsModel:
                                            dtype=torch.int64, device='cuda')
             self._clamped_buf = torch.empty((N, CL),
                                             dtype=torch.float64, device='cuda')
-            self._cdf_buf = torch.empty((N, VOCAB_SIZE),
-                                        dtype=torch.float32, device='cuda')
+            # Cache shape lists for IOBinding (avoid per-step list() calls)
+            self._states_shape = [N, CL, 4]
+            self._tokens_shape = [N, CL]
+            self._out_shape = [N, CL, VOCAB_SIZE]
             self._cached_N = N
-            self._cached_CL = CL
-            self._bound_N = 0  # force rebind
-
-    def _bind_io_if_needed(self, N):
-        """Bind IOBinding with actual N (may be < cached_N). Rebinds only when N changes."""
-        if N != self._bound_N:
-            CL = self._cached_CL
-            io = self._io
-            io.clear_binding_inputs()
-            io.clear_binding_outputs()
-            io.bind_input('states', 'cuda', 0, np.float32,
-                          [N, CL, 4], self._states_gpu.data_ptr())
-            io.bind_input('tokens', 'cuda', 0, np.int64,
-                          [N, CL], self._tokens_gpu.data_ptr())
-            io.bind_output(self._out_name, 'cuda', 0, np.float32,
-                           [N, CL, VOCAB_SIZE], self._out_gpu.data_ptr())
-            self._bound_N = N
 
     def _predict_gpu(self, input_data, temperature, rng_u):
-        """All-GPU IOBinding path (general, supports arbitrary tensors).
-        The fast training path bypasses this — see _get_current_lataccel_gpu."""
+        """All-GPU IOBinding path.  Accepts either numpy or torch GPU tensors
+        for states/tokens.  If torch GPU tensors, zero CPU→GPU transfer."""
         torch = self._torch
         states = input_data['states']
         tokens = input_data['tokens']
 
         if isinstance(states, torch.Tensor):
+            # Already on GPU — use directly
             states_gpu = states
             tokens_gpu = tokens
             N, CL = states.shape[:2]
             self._ensure_gpu_bufs(N, CL)
         else:
+            # Numpy path — copy to GPU
             N, CL = states.shape[:2]
             self._ensure_gpu_bufs(N, CL)
             self._states_gpu.copy_(torch.from_numpy(states))
@@ -261,7 +246,6 @@ class BatchedPhysicsModel:
             states_gpu = self._states_gpu
             tokens_gpu = self._tokens_gpu
 
-        self._bound_N = 0  # we rebind with possibly different ptrs
         io = self._io
         io.clear_binding_inputs()
         io.clear_binding_outputs()
@@ -274,12 +258,14 @@ class BatchedPhysicsModel:
 
         self.ort_session.run_with_iobinding(io)
 
+        # Softmax on GPU (only last timestep)
         probs = torch.softmax(self._out_gpu[:, -1, :] / temperature, dim=-1)
-        self._last_probs_gpu = probs
-        self._last_probs = None
+        self._last_probs_gpu = probs                   # keep on GPU
+        self._last_probs = None                         # lazy CPU copy
 
+        # Sampling on GPU — match np.random.choice: normalize CDF, searchsorted right
         cdf = torch.cumsum(probs, dim=1)
-        cdf = cdf / cdf[:, -1:]
+        cdf = cdf / cdf[:, -1:]  # normalize like np.random.choice
         if rng_u is not None:
             u = rng_u.unsqueeze(1) if rng_u.dim() == 1 else rng_u
         else:
@@ -334,49 +320,30 @@ class BatchedPhysicsModel:
         expected = np.sum(self._last_probs * self.tokenizer.bins[None, :], axis=-1)
         return sampled, expected
 
-    def warmup_cuda_graph(self, N, CL):
-        """Pre-allocate for max batch size and capture the TRT CUDA graph."""
-        self._ensure_gpu_bufs(N, CL)
-        self._bind_io_if_needed()
-        self.ort_session.run_with_iobinding(self._io)
-
     def _get_current_lataccel_gpu(self, sim_states, actions, past_preds,
                                    rng_u, return_expected):
-        """All-GPU fast path — inlines model run, cached IOBinding,
-        zero per-step temp allocations, float32 sampling."""
+        """All-GPU path: tokenize via torch.bucketize, build states,
+        predict, decode — all on GPU.  Returns GPU tensor.
+        Reuses pre-allocated buffers (zero per-step CUDA mallocs)."""
         torch = self._torch
         N, CL = actions.shape
         self._ensure_gpu_bufs(N, CL)
 
-        # Tokenize directly into pre-bound buffer (only first N rows)
-        torch.clamp(past_preds, self._lat_lo, self._lat_hi,
-                    out=self._clamped_buf[:N])
-        torch.bucketize(self._clamped_buf[:N], self._bins_gpu, right=False,
-                        out=self._tokens_gpu[:N])
+        # Tokenize on GPU: clamp in-place, bucketize
+        torch.clamp(past_preds, self._lat_lo, self._lat_hi, out=self._clamped_buf)
+        tokens = torch.bucketize(self._clamped_buf, self._bins_gpu, right=False)
 
-        # Build states via direct copy (only first N rows)
-        self._states_gpu[:N, :, 0].copy_(actions)
-        self._states_gpu[:N, :, 1:].copy_(sim_states)
+        # Build states in pre-allocated buffer
+        self._states_gpu[:, :, 0] = actions.float()
+        self._states_gpu[:, :, 1:] = sim_states.float()
 
-        # Run ONNX — IOBinding uses actual N, buffers may be larger
-        self._bind_io_if_needed(N)
-        self.ort_session.run_with_iobinding(self._io)
-
-        # Softmax on last timestep (only first N rows of output)
-        probs = torch.softmax(self._out_gpu[:N, -1, :] * 1.25, dim=-1)
-        self._last_probs_gpu = probs
-        self._last_probs = None
-
-        # CDF into pre-allocated buffer + float32 searchsorted
-        torch.cumsum(probs, dim=1, out=self._cdf_buf[:N])
-        cdf = self._cdf_buf[:N]
-        cdf /= cdf[:, -1:]
-        u = rng_u.float().unsqueeze(1) if rng_u.dim() == 1 else rng_u.float()
-        samples = torch.searchsorted(cdf, u).squeeze(1).clamp(0, VOCAB_SIZE - 1)
-        sampled = self._bins_gpu[samples]
+        input_data = {'states': self._states_gpu, 'tokens': tokens}
+        sample_tokens = self.predict(input_data, temperature=0.8, rng_u=rng_u)
+        sampled = self._bins_gpu[sample_tokens]
 
         if not return_expected:
             return sampled
+        probs = self._last_probs_gpu
         expected = (probs * self._bins_f32_gpu.unsqueeze(0)).sum(dim=-1).double()
         return sampled, expected
 
@@ -391,9 +358,8 @@ class BatchedSimulator:
     """
 
     def __init__(self, model_path: str, csv_files: list = None,
-                 ort_session=None, cached_data=None, cached_rng=None,
-                 sim_model=None) -> None:
-        self.sim_model = sim_model or BatchedPhysicsModel(model_path, ort_session=ort_session)
+                 ort_session=None, cached_data=None, cached_rng=None) -> None:
+        self.sim_model = BatchedPhysicsModel(model_path, ort_session=ort_session)
         self.csv_files = csv_files or []
         if cached_data is not None:
             self.data = cached_data
@@ -464,32 +430,6 @@ class BatchedSimulator:
             self.current_lataccel_history[:, :CL] = self.data['target_lataccel'][:, :CL]
             self.current_lataccel = self.current_lataccel_history[:, CL - 1].copy()
             self._rng_all_gpu = None
-
-    # ── reload_data (persistent simulator, zero-alloc) ─────────
-
-    def reload_data(self, cached_data, cached_rng):
-        """Swap episode data into existing GPU buffers without re-allocation.
-        Requires N and T to be unchanged."""
-        assert cached_data['N'] == self.N and cached_data['T'] == self.T
-        self.data = cached_data
-        self._cached_rng = cached_rng
-        _torch = self._torch
-        for k in ('roll_lataccel', 'v_ego', 'a_ego', 'target_lataccel', 'steer_command'):
-            self.data_gpu[k].copy_(
-                _torch.from_numpy(np.ascontiguousarray(cached_data[k], dtype=np.float64)))
-        CL = CONTEXT_LENGTH
-        self._hist_len = CL
-        self._rng_all = cached_rng.T.copy()
-        self._rng_all_gpu.copy_(_torch.from_numpy(self._rng_all))
-        self.action_history.zero_()
-        self.action_history[:, :CL] = self.data_gpu['steer_command'][:, :CL]
-        self.state_history.zero_()
-        self.state_history[:, :CL, 0] = self.data_gpu['roll_lataccel'][:, :CL]
-        self.state_history[:, :CL, 1] = self.data_gpu['v_ego'][:, :CL]
-        self.state_history[:, :CL, 2] = self.data_gpu['a_ego'][:, :CL]
-        self.current_lataccel_history.zero_()
-        self.current_lataccel_history[:, :CL] = self.data_gpu['target_lataccel'][:, :CL]
-        self.current_lataccel = self.current_lataccel_history[:, CL - 1].clone()
 
     # ── get_state_target_futureplan  (mirrors lines 154-165) ─
 

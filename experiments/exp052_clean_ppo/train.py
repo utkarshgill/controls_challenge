@@ -14,10 +14,9 @@ sys.path.insert(0, str(ROOT))
 from tinyphysics import (CONTROL_START_IDX, COST_END_IDX, CONTEXT_LENGTH,
     FUTURE_PLAN_STEPS, STEER_RANGE, DEL_T, LAT_ACCEL_COST_MULTIPLIER,
     ACC_G, State, FuturePlan)
-from tinyphysics_batched import BatchedSimulator, BatchedPhysicsModel, CSVCache, make_ort_session
+from tinyphysics_batched import BatchedSimulator, CSVCache, make_ort_session
 
 torch.manual_seed(42); np.random.seed(42)
-torch.set_float32_matmul_precision('high')
 DEV = torch.device('cuda')
 
 # ── architecture ──────────────────────────────────────────────
@@ -57,7 +56,6 @@ MAX_EP     = int(os.getenv('EPOCHS', '200'))
 EVAL_EVERY = 5
 EVAL_N     = 100
 RESUME     = os.getenv('RESUME', '0') == '1'
-DECAY_LR   = os.getenv('DECAY_LR', '0') == '1'
 DEBUG      = int(os.getenv('DEBUG', '0'))
 
 EXP_DIR = Path(__file__).parent
@@ -163,45 +161,39 @@ def fill_obs(buf, target, current, roll_la, v_ego, a_ego,
 #  GPU Rollout
 # ══════════════════════════════════════════════════════════════
 
-def rollout(csv_files, ac, mdl_path, ort_session, csv_cache,
-            deterministic=False, sim_model=None):
+def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False):
     data, rng = csv_cache.slice(csv_files)
     sim = BatchedSimulator(str(mdl_path), ort_session=ort_session,
-                           cached_data=data, cached_rng=rng,
-                           sim_model=sim_model)
+                           cached_data=data, cached_rng=rng)
     N, T = sim.N, sim.T
     dg = sim.data_gpu
     max_steps = COST_END_IDX - CONTROL_START_IDX
-
-    # Pre-cast to float32 once — eliminates per-step .float() casts
-    dg_f = {}
-    for k in ('target_lataccel', 'roll_lataccel', 'v_ego', 'a_ego'):
-        dg_f[k] = dg[k].float()
 
     h_act   = torch.zeros((N, HIST_LEN), dtype=torch.float64, device='cuda')
     h_act32 = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
     h_lat   = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
     h_error = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
     obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device='cuda')
-    zeros_N = torch.zeros(N, dtype=torch.float64, device='cuda')
 
     if not deterministic:
-        # (N, S, ...) layout so obs_flat = view, no 700MB copy
-        all_obs = torch.empty((N, max_steps, OBS_DIM), dtype=torch.float32, device='cuda')
-        all_raw = torch.empty((N, max_steps), dtype=torch.float32, device='cuda')
-        tgt_hist = torch.empty((N, max_steps), dtype=torch.float64, device='cuda')
-        cur_hist = torch.empty((N, max_steps), dtype=torch.float64, device='cuda')
-        act_hist = torch.empty((N, max_steps), dtype=torch.float64, device='cuda')
+        all_obs = torch.empty((max_steps, N, OBS_DIM), dtype=torch.float32, device='cuda')
+        all_raw = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
+        all_val = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
+        tgt_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
+        cur_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
+        act_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
     si = 0
 
     def ctrl(step_idx, sim_ref):
         nonlocal si
         target  = dg['target_lataccel'][:, step_idx]
         current = sim_ref.current_lataccel
+        roll_la = dg['roll_lataccel'][:, step_idx]
+        v_ego   = dg['v_ego'][:, step_idx]
+        a_ego   = dg['a_ego'][:, step_idx]
 
         cur32 = current.float()
-        target_f = dg_f['target_lataccel'][:, step_idx]
-        error = target_f - cur32
+        error = (target - current).float()
         h_error[:, :-1] = h_error[:, 1:]; h_error[:, -1] = error
         ei = h_error.mean(dim=1) * DEL_T
 
@@ -209,15 +201,14 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache,
             h_act[:, :-1] = h_act[:, 1:]; h_act[:, -1] = 0.0
             h_act32[:, :-1] = h_act32[:, 1:]; h_act32[:, -1] = 0.0
             h_lat[:, :-1] = h_lat[:, 1:]; h_lat[:, -1] = cur32
-            return zeros_N
+            return torch.zeros(N, dtype=torch.float64, device='cuda')
 
-        fill_obs(obs_buf, target_f, cur32,
-                 dg_f['roll_lataccel'][:, step_idx],
-                 dg_f['v_ego'][:, step_idx],
-                 dg_f['a_ego'][:, step_idx],
-                 h_act32, h_lat, ei, dg_f, step_idx, T)
+        fill_obs(obs_buf, target.float(), cur32, roll_la.float(), v_ego.float(),
+                 a_ego.float(), h_act32, h_lat, ei, dg, step_idx, T)
 
-        a_p, b_p = ac.beta_params(obs_buf)
+        with torch.inference_mode():
+            a_p, b_p = ac.beta_params(obs_buf)
+            val = ac.critic(obs_buf).squeeze(-1)
 
         raw = 2.0 * a_p / (a_p + b_p) - 1.0 if deterministic \
               else 2.0 * torch.distributions.Beta(a_p, b_p).sample() - 1.0
@@ -230,33 +221,29 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache,
         h_lat[:, :-1] = h_lat[:, 1:]; h_lat[:, -1] = cur32
 
         if not deterministic and step_idx < COST_END_IDX:
-            all_obs[:, si] = obs_buf; all_raw[:, si] = raw
-            tgt_hist[:, si] = target; cur_hist[:, si] = current; act_hist[:, si] = action
+            all_obs[si] = obs_buf; all_raw[si] = raw; all_val[si] = val
+            tgt_hist[si] = target; cur_hist[si] = current; act_hist[si] = action
             si += 1
         return action
 
-    with torch.inference_mode():
-        costs = sim.rollout(ctrl)['total_cost']
+    costs = sim.rollout(ctrl)['total_cost']
 
     if deterministic:
         return costs.tolist()
 
     S = si
-    obs_flat = all_obs.reshape(-1, OBS_DIM)
-    with torch.inference_mode():
-        val_2d = ac.critic(obs_flat).squeeze(-1).reshape(N, S)
-
-    lat_r = (tgt_hist - cur_hist)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
-    jerk = torch.diff(cur_hist, dim=1, prepend=cur_hist[:, :1]) / DEL_T
-    act_d = torch.diff(act_hist, dim=1, prepend=act_hist[:, :1]) / DEL_T
+    tgt = tgt_hist[:S].T; cur = cur_hist[:S].T; act = act_hist[:S].T
+    lat_r = (tgt - cur)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
+    jerk = torch.diff(cur, dim=1, prepend=cur[:, :1]) / DEL_T
+    act_d = torch.diff(act, dim=1, prepend=act[:, :1]) / DEL_T
     rew = (-(lat_r + jerk**2 * 100 + act_d**2 * ACT_SMOOTH) / 500.0).float()
     dones = torch.zeros((N, S), dtype=torch.float32, device='cuda')
     dones[:, -1] = 1.0
 
     return dict(
-        obs=obs_flat,
-        raw=all_raw.reshape(-1),
-        val_2d=val_2d,
+        obs=all_obs[:S].permute(1, 0, 2).reshape(-1, OBS_DIM),
+        raw=all_raw[:S].T.reshape(-1),
+        val_2d=all_val[:S].T,
         rew=rew, done=dones, costs=costs)
 
 
@@ -411,17 +398,17 @@ class PPO:
         obs = gd['obs']
         raw = gd['raw'].unsqueeze(-1)
         adv_t, ret_t = self._gae(gd['rew'], gd['val_2d'], gd['done'])
+        adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
         x_t = ((raw + 1) / 2).clamp(1e-6, 1 - 1e-6)
 
         with torch.no_grad():
             a_old, b_old = self.ac.beta_params(obs)
             old_lp = torch.distributions.Beta(a_old, b_old).log_prob(x_t.squeeze(-1))
-        old_val = gd['val_2d'].reshape(-1)
+            old_val = self.ac.critic(obs).squeeze(-1)
 
         for _ in range(K_EPOCHS):
             for idx in torch.randperm(len(obs), device='cuda').split(MINI_BS):
                 mb_adv = adv_t[idx]
-                mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
                 val = self.ac.critic(obs[idx]).squeeze(-1)
                 vc = old_val[idx] + (val - old_val[idx]).clamp(-10, 10)
@@ -465,68 +452,14 @@ class PPO:
 #  Train loop
 # ══════════════════════════════════════════════════════════════
 
-class TrainingContext:
-    def __init__(self, ac, ppo, mdl_path, ort_sess, tr_f, va_f, csv_cache, warmup_off, sim_model):
-        self.ac, self.ppo = ac, ppo
-        self.mdl_path, self.ort_sess = mdl_path, ort_sess
-        self.tr_f, self.va_f = tr_f, va_f
-        self.csv_cache = csv_cache
-        self.warmup_off = warmup_off
-        self.sim_model = sim_model
-        self.best, self.best_ep = float('inf'), 'init'
-
-    def save_best(self):
-        ac_sd = {k.replace('._orig_mod', ''): v for k, v in self.ac.state_dict().items()}
-        torch.save({
-            'ac': ac_sd,
-            'pi_opt': self.ppo.pi_opt.state_dict(),
-            'vf_opt': self.ppo.vf_opt.state_dict(),
-            'ret_rms': {'mean': self.ppo._rms.mean, 'var': self.ppo._rms.var,
-                        'count': self.ppo._rms.count},
-        }, BEST_PT)
-
-
-def evaluate(ac, files, mdl_path, ort_session, csv_cache, sim_model=None):
-    costs = rollout(files, ac, mdl_path, ort_session, csv_cache,
-                    deterministic=True, sim_model=sim_model)
+def evaluate(ac, files, mdl_path, ort_session, csv_cache):
+    costs = rollout(files, ac, mdl_path, ort_session, csv_cache, deterministic=True)
     return float(np.mean(costs)), float(np.std(costs))
-
-
-def train_one_epoch(epoch, ctx):
-    if DECAY_LR:
-        frac = 1.0 - epoch / MAX_EP
-        lr = PI_LR * frac + 3e-5          # linear decay to 3e-5 floor
-        for pg in ctx.ppo.pi_opt.param_groups: pg['lr'] = lr
-        for pg in ctx.ppo.vf_opt.param_groups: pg['lr'] = lr
-    t0 = time.time()
-    batch = random.sample(ctx.tr_f, min(CSVS_EPOCH, len(ctx.tr_f)))
-    res = rollout(batch, ctx.ac, ctx.mdl_path, ctx.ort_sess, ctx.csv_cache,
-                  sim_model=ctx.sim_model)
-    t1 = time.time()
-
-    co = epoch < (CRITIC_WARMUP - ctx.warmup_off)
-    info = ctx.ppo.update(res, critic_only=co)
-    tu = time.time() - t1
-
-    phase = "  [critic warmup]" if co else ""
-    line = (f"E{epoch:3d}  train={np.mean(res['costs']):6.1f}  σ={info['σ']:.4f}"
-            f"  π={info['pi']:+.4f}  vf={info['vf']:.1f}  H={info['ent']:.2f}"
-            f"  lr={info['lr']:.1e}  ⏱{t1-t0:.0f}+{tu:.0f}s{phase}")
-
-    if epoch % EVAL_EVERY == 0:
-        vm, vs = evaluate(ctx.ac, ctx.va_f, ctx.mdl_path, ctx.ort_sess,
-                          ctx.csv_cache, sim_model=ctx.sim_model)
-        mk = ""
-        if vm < ctx.best:
-            ctx.best, ctx.best_ep = vm, epoch
-            ctx.save_best()
-            mk = " ★"
-        line += f"  val={vm:6.1f}±{vs:4.1f}{mk}"
-    print(line)
 
 
 def train():
     ac = ActorCritic().to(DEV)
+    ppo = PPO(ac)
     mdl_path = ROOT / 'models' / 'tinyphysics.onnx'
     ort_sess = make_ort_session(mdl_path)
 
@@ -541,43 +474,63 @@ def train():
         ckpt = torch.load(BEST_PT, weights_only=False, map_location=DEV)
         ac.load_state_dict(ckpt['ac'])
         if 'pi_opt' in ckpt:
-            warmup_off = CRITIC_WARMUP
+            ppo.pi_opt.load_state_dict(ckpt['pi_opt'])
+            ppo.vf_opt.load_state_dict(ckpt['vf_opt'])
+            for pg in ppo.pi_opt.param_groups: pg['lr'] = PI_LR; pg['eps'] = 1e-5
+            for pg in ppo.vf_opt.param_groups: pg['lr'] = VF_LR; pg['eps'] = 1e-5
+            if 'ret_rms' in ckpt:
+                r = ckpt['ret_rms']
+                ppo._rms.mean, ppo._rms.var, ppo._rms.count = r['mean'], r['var'], r['count']
+        warmup_off = CRITIC_WARMUP
         print(f"Resumed from {BEST_PT.name}")
     else:
         all_csvs = sorted((ROOT / 'data').glob('*.csv'))
         pretrain_bc(ac, all_csvs)
 
-    ac.actor = torch.compile(ac.actor)
-    ac.critic = torch.compile(ac.critic)
-    ppo = PPO(ac)
-    if RESUME and BEST_PT.exists() and 'pi_opt' in ckpt:
-        ppo.pi_opt.load_state_dict(ckpt['pi_opt'])
-        ppo.vf_opt.load_state_dict(ckpt['vf_opt'])
-        for pg in ppo.pi_opt.param_groups: pg['lr'] = PI_LR; pg['eps'] = 1e-5
-        for pg in ppo.vf_opt.param_groups: pg['lr'] = VF_LR; pg['eps'] = 1e-5
-        if 'ret_rms' in ckpt:
-            r = ckpt['ret_rms']
-            ppo._rms.mean, ppo._rms.var, ppo._rms.count = r['mean'], r['var'], r['count']
-
-    sim_model = BatchedPhysicsModel(str(mdl_path), ort_session=ort_sess)
-
-    ctx = TrainingContext(ac, ppo, mdl_path, ort_sess, tr_f, va_f, csv_cache, warmup_off, sim_model)
-
-    vm, vs = evaluate(ac, va_f, mdl_path, ort_sess, csv_cache, sim_model=sim_model)
-    ctx.best, ctx.best_ep = vm, 'init'
+    vm, vs = evaluate(ac, va_f, mdl_path, ort_sess, csv_cache)
+    best, best_ep = vm, 'init'
     print(f"Baseline: {vm:.1f} ± {vs:.1f}")
-    ctx.save_best()
+
+    def save_best():
+        torch.save({
+            'ac': ac.state_dict(),
+            'pi_opt': ppo.pi_opt.state_dict(),
+            'vf_opt': ppo.vf_opt.state_dict(),
+            'ret_rms': {'mean': ppo._rms.mean, 'var': ppo._rms.var, 'count': ppo._rms.count},
+        }, BEST_PT)
+    save_best()
 
     print(f"\nPPO  csvs={CSVS_EPOCH}  epochs={MAX_EP}  dev={DEV}")
     print(f"  π_lr={PI_LR}  vf_lr={VF_LR}  ent={ENT_COEF}  act_smooth={ACT_SMOOTH}"
           f"  Δscale={DELTA_SCALE}  K={K_EPOCHS}  dim={STATE_DIM}\n")
 
     for epoch in range(MAX_EP):
-        train_one_epoch(epoch, ctx)
+        t0 = time.time()
+        batch = random.sample(tr_f, min(CSVS_EPOCH, len(tr_f)))
+        res = rollout(batch, ac, mdl_path, ort_sess, csv_cache, deterministic=False)
 
-    print(f"\nDone. Best: {ctx.best:.1f} (epoch {ctx.best_ep})")
-    ac_sd = {k.replace('._orig_mod', ''): v for k, v in ac.state_dict().items()}
-    torch.save({'ac': ac_sd}, EXP_DIR / 'final_model.pt')
+        t1 = time.time()
+        co = epoch < (CRITIC_WARMUP - warmup_off)
+        info = ppo.update(res, critic_only=co)
+        tu = time.time() - t1
+
+        phase = "  [critic warmup]" if co else ""
+        line = (f"E{epoch:3d}  train={np.mean(res['costs']):6.1f}  σ={info['σ']:.4f}"
+                f"  π={info['pi']:+.4f}  vf={info['vf']:.1f}  H={info['ent']:.2f}"
+                f"  lr={info['lr']:.1e}  ⏱{t1-t0:.0f}+{tu:.0f}s{phase}")
+
+        if epoch % EVAL_EVERY == 0:
+            vm, vs = evaluate(ac, va_f, mdl_path, ort_sess, csv_cache)
+            mk = ""
+            if vm < best:
+                best, best_ep = vm, epoch
+                save_best()
+                mk = " ★"
+            line += f"  val={vm:6.1f}±{vs:4.1f}{mk}"
+        print(line)
+
+    print(f"\nDone. Best: {best:.1f} (epoch {best_ep})")
+    torch.save({'ac': ac.state_dict()}, EXP_DIR / 'final_model.pt')
     if TMP.exists(): TMP.unlink()
 
 
