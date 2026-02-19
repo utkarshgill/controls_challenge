@@ -9,7 +9,7 @@ from tinyphysics import CONTROL_START_IDX, CONTEXT_LENGTH, STEER_RANGE, DEL_T
 HIST_LEN, FUTURE_K = 20, 50
 STATE_DIM, HIDDEN   = 256, 256
 A_LAYERS            = 4
-DELTA_SCALE         = 0.25
+DELTA_SCALE_DEFAULT = 0.25
 MAX_DELTA           = 0.5
 
 S_LAT, S_STEER = 5.0, 2.0
@@ -62,6 +62,7 @@ class Controller(BaseController):
         data = torch.load(ckpt, weights_only=False, map_location='cpu')
         self.ac.load_state_dict(data['ac'], strict=False)
         self.ac.eval()
+        self.delta_scale = data.get('delta_scale', DELTA_SCALE_DEFAULT)
         self.n = 0
         self._h_act = [0.0] * HIST_LEN
         self._h_lat = [0.0] * HIST_LEN
@@ -126,7 +127,7 @@ class Controller(BaseController):
             a_p = F.softplus(out[..., 0]).item() + 1.0
             b_p = F.softplus(out[..., 1]).item() + 1.0
         raw = 2.0 * a_p / (a_p + b_p) - 1.0
-        delta = float(np.clip(raw * DELTA_SCALE, -MAX_DELTA, MAX_DELTA))
+        delta = float(np.clip(raw * self.delta_scale, -MAX_DELTA, MAX_DELTA))
         action = float(np.clip(self._h_act[-1] + delta, *STEER_RANGE))
 
         self._h_act = self._h_act[1:] + [action]

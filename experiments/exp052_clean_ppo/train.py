@@ -23,7 +23,8 @@ DEV = torch.device('cuda')
 HIST_LEN, FUTURE_K = 20, 50
 STATE_DIM, HIDDEN   = 256, 256
 A_LAYERS, C_LAYERS  = 4, 4
-DELTA_SCALE         = 0.25
+DELTA_SCALE_MAX     = 0.25
+DELTA_SCALE_MIN     = 0.03
 MAX_DELTA           = 0.5
 
 # ── scaling ───────────────────────────────────────────────────
@@ -34,6 +35,7 @@ S_ROLL, S_CURV = 2.0, 0.02
 # ── PPO ───────────────────────────────────────────────────────
 PI_LR      = float(os.getenv('PI_LR', '3e-4'))
 VF_LR      = float(os.getenv('VF_LR', '3e-4'))
+LR_MIN     = 3e-5
 GAMMA       = 0.95
 LAMDA       = 0.9
 K_EPOCHS    = 4
@@ -42,7 +44,7 @@ VF_COEF     = 1.0
 ENT_COEF    = float(os.getenv('ENT_COEF', '0.001'))
 ACT_SMOOTH  = float(os.getenv('ACT_SMOOTH', '10.0'))
 MINI_BS     = int(os.getenv('MINI_BS', '100000'))
-CRITIC_WARMUP = 4
+CRITIC_WARMUP = 3
 
 # ── BC ────────────────────────────────────────────────────────
 BC_EPOCHS   = int(os.getenv('BC_EPOCHS', '20'))
@@ -57,6 +59,12 @@ EVAL_EVERY = 5
 EVAL_N     = 100
 RESUME     = os.getenv('RESUME', '0') == '1'
 DEBUG      = int(os.getenv('DEBUG', '0'))
+
+def delta_scale(epoch, max_ep):
+    return DELTA_SCALE_MIN + 0.5 * (DELTA_SCALE_MAX - DELTA_SCALE_MIN) * (1 + np.cos(np.pi * epoch / max_ep))
+
+def lr_schedule(epoch, max_ep, lr_max):
+    return LR_MIN + 0.5 * (lr_max - LR_MIN) * (1 + np.cos(np.pi * epoch / max_ep))
 
 EXP_DIR = Path(__file__).parent
 TMP     = EXP_DIR / '.ckpt.pt'
@@ -161,7 +169,7 @@ def fill_obs(buf, target, current, roll_la, v_ego, a_ego,
 #  GPU Rollout
 # ══════════════════════════════════════════════════════════════
 
-def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False):
+def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False, ds=DELTA_SCALE_MAX):
     data, rng = csv_cache.slice(csv_files)
     sim = BatchedSimulator(str(mdl_path), ort_session=ort_session,
                            cached_data=data, cached_rng=rng)
@@ -213,7 +221,7 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
         raw = 2.0 * a_p / (a_p + b_p) - 1.0 if deterministic \
               else 2.0 * torch.distributions.Beta(a_p, b_p).sample() - 1.0
 
-        delta  = (raw.double() * DELTA_SCALE).clamp(-MAX_DELTA, MAX_DELTA)
+        delta  = (raw.double() * ds).clamp(-MAX_DELTA, MAX_DELTA)
         action = (h_act[:, -1] + delta).clamp(STEER_RANGE[0], STEER_RANGE[1])
 
         h_act[:, :-1] = h_act[:, 1:]; h_act[:, -1] = action
@@ -316,7 +324,7 @@ def _bc_worker(csv_path):
             a_ego=a_ego[step_idx+1:step_idx+FUTURE_PLAN_STEPS].tolist())
 
         obs = _build_obs_bc(target_la, target_la, state, fplan, h_act, h_lat)
-        raw_target = np.clip((steer[step_idx] - h_act[-1]) / DELTA_SCALE, -1.0, 1.0)
+        raw_target = np.clip((steer[step_idx] - h_act[-1]) / DELTA_SCALE_MAX, -1.0, 1.0)
         obs_list.append(obs)
         raw_list.append(raw_target)
         h_act = h_act[1:] + [steer[step_idx]]
@@ -452,8 +460,8 @@ class PPO:
 #  Train loop
 # ══════════════════════════════════════════════════════════════
 
-def evaluate(ac, files, mdl_path, ort_session, csv_cache):
-    costs = rollout(files, ac, mdl_path, ort_session, csv_cache, deterministic=True)
+def evaluate(ac, files, mdl_path, ort_session, csv_cache, ds=DELTA_SCALE_MAX):
+    costs = rollout(files, ac, mdl_path, ort_session, csv_cache, deterministic=True, ds=ds)
     return float(np.mean(costs)), float(np.std(costs))
 
 
@@ -491,23 +499,31 @@ def train():
     best, best_ep = vm, 'init'
     print(f"Baseline: {vm:.1f} ± {vs:.1f}")
 
+    cur_ds = DELTA_SCALE_MAX
     def save_best():
         torch.save({
             'ac': ac.state_dict(),
             'pi_opt': ppo.pi_opt.state_dict(),
             'vf_opt': ppo.vf_opt.state_dict(),
             'ret_rms': {'mean': ppo._rms.mean, 'var': ppo._rms.var, 'count': ppo._rms.count},
+            'delta_scale': cur_ds,
         }, BEST_PT)
     save_best()
 
     print(f"\nPPO  csvs={CSVS_EPOCH}  epochs={MAX_EP}  dev={DEV}")
     print(f"  π_lr={PI_LR}  vf_lr={VF_LR}  ent={ENT_COEF}  act_smooth={ACT_SMOOTH}"
-          f"  Δscale={DELTA_SCALE}  K={K_EPOCHS}  dim={STATE_DIM}\n")
+          f"  Δscale={DELTA_SCALE_MAX}→{DELTA_SCALE_MIN}  K={K_EPOCHS}  dim={STATE_DIM}\n")
 
     for epoch in range(MAX_EP):
+        ds = delta_scale(epoch, MAX_EP)
+        cur_ds = ds
+        pi_lr = lr_schedule(epoch, MAX_EP, PI_LR)
+        vf_lr = lr_schedule(epoch, MAX_EP, VF_LR)
+        for pg in ppo.pi_opt.param_groups: pg['lr'] = pi_lr
+        for pg in ppo.vf_opt.param_groups: pg['lr'] = vf_lr
         t0 = time.time()
         batch = random.sample(tr_f, min(CSVS_EPOCH, len(tr_f)))
-        res = rollout(batch, ac, mdl_path, ort_sess, csv_cache, deterministic=False)
+        res = rollout(batch, ac, mdl_path, ort_sess, csv_cache, deterministic=False, ds=ds)
 
         t1 = time.time()
         co = epoch < (CRITIC_WARMUP - warmup_off)
@@ -517,10 +533,10 @@ def train():
         phase = "  [critic warmup]" if co else ""
         line = (f"E{epoch:3d}  train={np.mean(res['costs']):6.1f}  σ={info['σ']:.4f}"
                 f"  π={info['pi']:+.4f}  vf={info['vf']:.1f}  H={info['ent']:.2f}"
-                f"  lr={info['lr']:.1e}  ⏱{t1-t0:.0f}+{tu:.0f}s{phase}")
+                f"  Δs={ds:.4f}  lr={info['lr']:.1e}  ⏱{t1-t0:.0f}+{tu:.0f}s{phase}")
 
         if epoch % EVAL_EVERY == 0:
-            vm, vs = evaluate(ac, va_f, mdl_path, ort_sess, csv_cache)
+            vm, vs = evaluate(ac, va_f, mdl_path, ort_sess, csv_cache, ds=ds)
             mk = ""
             if vm < best:
                 best, best_ep = vm, epoch
