@@ -23,8 +23,8 @@ DEV = torch.device('cuda')
 HIST_LEN, FUTURE_K = 20, 50
 STATE_DIM, HIDDEN   = 256, 256
 A_LAYERS, C_LAYERS  = 4, 4
-DELTA_SCALE_MAX     = 0.25
-DELTA_SCALE_MIN     = 0.03
+DELTA_SCALE_MAX     = 1.0
+DELTA_SCALE_MIN     = 0.25
 MAX_DELTA           = 0.5
 
 # ── scaling ───────────────────────────────────────────────────
@@ -59,6 +59,7 @@ EVAL_EVERY = 5
 EVAL_N     = 100
 RESUME     = os.getenv('RESUME', '0') == '1'
 DEBUG      = int(os.getenv('DEBUG', '0'))
+DELTA_SCALE_DECAY = os.getenv('DELTA_SCALE_DECAY', '1') == '1'
 
 def delta_scale(epoch, max_ep):
     return DELTA_SCALE_MIN + 0.5 * (DELTA_SCALE_MAX - DELTA_SCALE_MIN) * (1 + np.cos(np.pi * epoch / max_ep))
@@ -512,10 +513,10 @@ def train():
 
     print(f"\nPPO  csvs={CSVS_EPOCH}  epochs={MAX_EP}  dev={DEV}")
     print(f"  π_lr={PI_LR}  vf_lr={VF_LR}  ent={ENT_COEF}  act_smooth={ACT_SMOOTH}"
-          f"  Δscale={DELTA_SCALE_MAX}→{DELTA_SCALE_MIN}  K={K_EPOCHS}  dim={STATE_DIM}\n")
+          f"  Δscale={'decay' if DELTA_SCALE_DECAY else 'fixed'} {DELTA_SCALE_MAX}→{DELTA_SCALE_MIN}  K={K_EPOCHS}  dim={STATE_DIM}\n")
 
     for epoch in range(MAX_EP):
-        ds = delta_scale(epoch, MAX_EP)
+        ds = delta_scale(epoch, MAX_EP) if DELTA_SCALE_DECAY else DELTA_SCALE_MAX
         cur_ds = ds
         pi_lr = lr_schedule(epoch, MAX_EP, PI_LR)
         vf_lr = lr_schedule(epoch, MAX_EP, VF_LR)

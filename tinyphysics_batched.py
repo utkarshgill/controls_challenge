@@ -270,7 +270,7 @@ class BatchedPhysicsModel:
             u = rng_u.unsqueeze(1) if rng_u.dim() == 1 else rng_u
         else:
             u = torch.rand(N, 1, device='cuda', dtype=torch.float64)
-        samples = torch.searchsorted(cdf.double(), u.double()).squeeze(1).clamp(0, VOCAB_SIZE - 1)
+        samples = torch.searchsorted(cdf.double(), u.double(), right=True).squeeze(1).clamp(0, VOCAB_SIZE - 1)
         return samples
 
     def _predict_cpu(self, input_data, temperature, rng_u, rngs):
