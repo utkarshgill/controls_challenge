@@ -16,15 +16,15 @@ from tinyphysics import (CONTROL_START_IDX, COST_END_IDX, CONTEXT_LENGTH,
     ACC_G, State, FuturePlan)
 from tinyphysics_batched import BatchedSimulator, CSVCache, make_ort_session
 
-torch.manual_seed(42); np.random.seed(42)
+torch.manual_seed(42); np.random.seed(42); random.seed(42)
 DEV = torch.device('cuda')
 
 # ── architecture ──────────────────────────────────────────────
 HIST_LEN, FUTURE_K = 20, 50
 STATE_DIM, HIDDEN   = 256, 256
 A_LAYERS, C_LAYERS  = 4, 4
-DELTA_SCALE_MAX     = 1.0
-DELTA_SCALE_MIN     = 0.25
+DELTA_SCALE_MAX     = float(os.getenv('DELTA_SCALE_MAX', '0.25'))
+DELTA_SCALE_MIN     = float(os.getenv('DELTA_SCALE_MIN', '0.25'))
 MAX_DELTA           = 0.5
 
 # ── scaling ───────────────────────────────────────────────────
@@ -33,17 +33,17 @@ S_VEGO, S_AEGO = 40.0, 4.0
 S_ROLL, S_CURV = 2.0, 0.02
 
 # ── PPO ───────────────────────────────────────────────────────
-PI_LR      = float(os.getenv('PI_LR', '3e-4'))
-VF_LR      = float(os.getenv('VF_LR', '3e-4'))
+PI_LR      = float(os.getenv('PI_LR', '1e-3'))
+VF_LR      = float(os.getenv('VF_LR', '1e-3'))
 LR_MIN     = 3e-5
 GAMMA       = 0.95
 LAMDA       = 0.9
-K_EPOCHS    = 4
+K_EPOCHS    = 2
 EPS_CLIP    = 0.2
 VF_COEF     = 1.0
 ENT_COEF    = float(os.getenv('ENT_COEF', '0.001'))
-ACT_SMOOTH  = float(os.getenv('ACT_SMOOTH', '10.0'))
-MINI_BS     = int(os.getenv('MINI_BS', '100000'))
+ACT_SMOOTH  = float(os.getenv('ACT_SMOOTH', '20.0'))
+MINI_BS     = int(os.getenv('MINI_BS', '100_000'))
 CRITIC_WARMUP = 3
 
 # ── BC ────────────────────────────────────────────────────────
@@ -56,7 +56,7 @@ BC_GRAD_CLIP = 2.0
 CSVS_EPOCH = int(os.getenv('CSVS', '500'))
 MAX_EP     = int(os.getenv('EPOCHS', '200'))
 EVAL_EVERY = 5
-EVAL_N     = 100
+EVAL_N     = 100  # files to use for val metrics (subset of full, not held out)
 RESUME     = os.getenv('RESUME', '0') == '1'
 DEBUG      = int(os.getenv('DEBUG', '0'))
 DELTA_SCALE_DECAY = os.getenv('DELTA_SCALE_DECAY', '1') == '1'
@@ -473,10 +473,9 @@ def train():
     ort_sess = make_ort_session(mdl_path)
 
     all_csv = sorted((ROOT / 'data').glob('*.csv'))
-    va_f = all_csv[:EVAL_N]
-    tr_f = all_csv[EVAL_N:]
-    random.seed(42); random.shuffle(tr_f)
-    csv_cache = CSVCache(sorted(set(str(f) for f in tr_f + va_f)))
+    tr_f = all_csv  # use all for training
+    va_f = all_csv[:EVAL_N]  # eval on first 100 (sorted order)
+    csv_cache = CSVCache([str(f) for f in all_csv])
 
     warmup_off = 0
     if RESUME and BEST_PT.exists():
