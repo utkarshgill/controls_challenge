@@ -33,33 +33,33 @@ S_VEGO, S_AEGO = 40.0, 4.0
 S_ROLL, S_CURV = 2.0, 0.02
 
 # ── PPO ───────────────────────────────────────────────────────
-PI_LR      = float(os.getenv('PI_LR', '1e-3'))
-VF_LR      = float(os.getenv('VF_LR', '1e-3'))
+PI_LR      = float(os.getenv('PI_LR', '3e-4'))
+VF_LR      = float(os.getenv('VF_LR', '3e-4'))
 LR_MIN     = 3e-5
 GAMMA       = 0.95
 LAMDA       = 0.9
-K_EPOCHS    = 2
+K_EPOCHS    = 4
 EPS_CLIP    = 0.2
 VF_COEF     = 1.0
-ENT_COEF    = float(os.getenv('ENT_COEF', '0.001'))
-ACT_SMOOTH  = float(os.getenv('ACT_SMOOTH', '20.0'))
+ENT_COEF    = float(os.getenv('ENT_COEF', '0.003'))
+ACT_SMOOTH  = float(os.getenv('ACT_SMOOTH', '5.0'))
 MINI_BS     = int(os.getenv('MINI_BS', '100_000'))
 CRITIC_WARMUP = 3
 
 # ── BC ────────────────────────────────────────────────────────
 BC_EPOCHS   = int(os.getenv('BC_EPOCHS', '20'))
 BC_LR       = float(os.getenv('BC_LR', '0.01'))
-BC_BS       = int(os.getenv('BC_BS', '8192'))
+BC_BS       = int(os.getenv('BC_BS', '2048'))
 BC_GRAD_CLIP = 2.0
 
 # ── runtime ───────────────────────────────────────────────────
-CSVS_EPOCH = int(os.getenv('CSVS', '500'))
-MAX_EP     = int(os.getenv('EPOCHS', '200'))
+CSVS_EPOCH = int(os.getenv('CSVS', '4000'))
+MAX_EP     = int(os.getenv('EPOCHS', '5000'))
 EVAL_EVERY = 5
 EVAL_N     = 100  # files to use for val metrics (subset of full, not held out)
 RESUME     = os.getenv('RESUME', '0') == '1'
 DEBUG      = int(os.getenv('DEBUG', '0'))
-DELTA_SCALE_DECAY = os.getenv('DELTA_SCALE_DECAY', '1') == '1'
+DELTA_SCALE_DECAY = os.getenv('DELTA_SCALE_DECAY', '0') == '1'
 
 def delta_scale(epoch, max_ep):
     return DELTA_SCALE_MIN + 0.5 * (DELTA_SCALE_MAX - DELTA_SCALE_MIN) * (1 + np.cos(np.pi * epoch / max_ep))
@@ -162,6 +162,8 @@ def fill_obs(buf, target, current, roll_la, v_ego, a_ego,
             buf[:, off+w:off+FUTURE_K] = slc[:, -1:].float() / sc
         else:
             buf[:, off:off+FUTURE_K] = slc[:, :FUTURE_K].float() / sc
+
+    buf.clamp_(-5.0, 5.0)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -297,7 +299,7 @@ def _build_obs_bc(target, current, state, fplan,
         _future_raw(fplan, 'v_ego', state.v_ego) / S_VEGO,
         _future_raw(fplan, 'a_ego', state.a_ego) / S_AEGO,
     ])
-    return obs
+    return np.clip(obs, -5.0, 5.0)
 
 
 def _bc_worker(csv_path):
@@ -405,7 +407,6 @@ class PPO:
         obs = gd['obs']
         raw = gd['raw'].unsqueeze(-1)
         adv_t, ret_t = self._gae(gd['rew'], gd['val_2d'], gd['done'])
-        adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
         x_t = ((raw + 1) / 2).clamp(1e-6, 1 - 1e-6)
 
         with torch.no_grad():
@@ -416,6 +417,7 @@ class PPO:
         for _ in range(K_EPOCHS):
             for idx in torch.randperm(len(obs), device='cuda').split(MINI_BS):
                 mb_adv = adv_t[idx]
+                mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
                 val = self.ac.critic(obs[idx]).squeeze(-1)
                 vc = old_val[idx] + (val - old_val[idx]).clamp(-10, 10)
