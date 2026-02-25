@@ -60,7 +60,6 @@ EVAL_N     = 100  # files to use for val metrics (subset of full, not held out)
 RESUME     = os.getenv('RESUME', '0') == '1'
 DEBUG      = int(os.getenv('DEBUG', '0'))
 DELTA_SCALE_DECAY = os.getenv('DELTA_SCALE_DECAY', '1') == '1'
-DETERMINISTIC_TRAIN = os.getenv('DETERMINISTIC_TRAIN', '0') == '1'
 
 def delta_scale(epoch, max_ep):
     return DELTA_SCALE_MIN + 0.5 * (DELTA_SCALE_MAX - DELTA_SCALE_MIN) * (1 + np.cos(np.pi * epoch / max_ep))
@@ -169,9 +168,7 @@ def fill_obs(buf, target, current, roll_la, v_ego, a_ego,
 #  GPU Rollout
 # ══════════════════════════════════════════════════════════════
 
-def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False, ds=DELTA_SCALE_MAX, collect_for_ppo=None):
-    if collect_for_ppo is None:
-        collect_for_ppo = not deterministic
+def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False, ds=DELTA_SCALE_MAX):
     data, rng = csv_cache.slice(csv_files)
     sim = BatchedSimulator(str(mdl_path), ort_session=ort_session,
                            cached_data=data, cached_rng=rng)
@@ -185,7 +182,7 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
     h_error = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
     obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device='cuda')
 
-    if collect_for_ppo:
+    if not deterministic:
         all_obs = torch.empty((max_steps, N, OBS_DIM), dtype=torch.float32, device='cuda')
         all_raw = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
         all_val = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
@@ -230,7 +227,7 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
         h_act32[:, :-1] = h_act32[:, 1:]; h_act32[:, -1] = action.float()
         h_lat[:, :-1] = h_lat[:, 1:]; h_lat[:, -1] = cur32
 
-        if collect_for_ppo and step_idx < COST_END_IDX:
+        if not deterministic and step_idx < COST_END_IDX:
             all_obs[si] = obs_buf; all_raw[si] = raw; all_val[si] = val
             tgt_hist[si] = target; cur_hist[si] = current; act_hist[si] = action
             si += 1
@@ -238,7 +235,7 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
 
     costs = sim.rollout(ctrl)['total_cost']
 
-    if deterministic and not collect_for_ppo:
+    if deterministic:
         return costs.tolist()
 
     S = si
@@ -524,8 +521,7 @@ def train():
         for pg in ppo.vf_opt.param_groups: pg['lr'] = vf_lr
         t0 = time.time()
         batch = random.sample(tr_f, min(CSVS_EPOCH, len(tr_f)))
-        det = DETERMINISTIC_TRAIN
-        res = rollout(batch, ac, mdl_path, ort_sess, csv_cache, deterministic=det, ds=ds, collect_for_ppo=True)
+        res = rollout(batch, ac, mdl_path, ort_sess, csv_cache, deterministic=False, ds=ds)
 
         t1 = time.time()
         co = epoch < (CRITIC_WARMUP - warmup_off)
