@@ -163,8 +163,6 @@ def fill_obs(buf, target, current, roll_la, v_ego, a_ego,
         else:
             buf[:, off:off+FUTURE_K] = slc[:, :FUTURE_K].float() / sc
 
-    buf.clamp_(-5.0, 5.0)
-
 
 # ══════════════════════════════════════════════════════════════
 #  GPU Rollout
@@ -299,7 +297,7 @@ def _build_obs_bc(target, current, state, fplan,
         _future_raw(fplan, 'v_ego', state.v_ego) / S_VEGO,
         _future_raw(fplan, 'a_ego', state.a_ego) / S_AEGO,
     ])
-    return np.clip(obs, -5.0, 5.0)
+    return obs
 
 
 def _bc_worker(csv_path):

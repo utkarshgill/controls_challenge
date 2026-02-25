@@ -1,7 +1,9 @@
+--extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/
+--pre
 numpy
 torch
-onnxruntime
 onnxruntime-gpu
+tensorrt-cu13
 pandas==2.1.2
 matplotlib==3.8.1
 seaborn==0.13.2

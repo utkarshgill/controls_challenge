@@ -119,7 +119,6 @@ class Controller(BaseController):
             _future(future_plan, 'v_ego', state.v_ego) / S_VEGO,
             _future(future_plan, 'a_ego', state.a_ego) / S_AEGO,
         ])
-        obs = np.clip(obs, -5.0, 5.0)
 
         with torch.inference_mode():
             t = torch.from_numpy(obs).unsqueeze(0)
