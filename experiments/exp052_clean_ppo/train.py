@@ -25,7 +25,6 @@ STATE_DIM, HIDDEN   = 256, 256
 A_LAYERS, C_LAYERS  = 4, 4
 DELTA_SCALE_MAX     = float(os.getenv('DELTA_SCALE_MAX', '0.25'))
 DELTA_SCALE_MIN     = float(os.getenv('DELTA_SCALE_MIN', '0.25'))
-MAX_DELTA           = 0.5
 
 # ── scaling ───────────────────────────────────────────────────
 S_LAT, S_STEER = 5.0, 2.0
@@ -35,15 +34,18 @@ S_ROLL, S_CURV = 2.0, 0.02
 # ── PPO ───────────────────────────────────────────────────────
 PI_LR      = float(os.getenv('PI_LR', '3e-4'))
 VF_LR      = float(os.getenv('VF_LR', '3e-4'))
-LR_MIN     = 3e-5
+LR_MIN     = 5e-5
 GAMMA       = 0.95
 LAMDA       = 0.9
 K_EPOCHS    = 4
 EPS_CLIP    = 0.2
 VF_COEF     = 1.0
 ENT_COEF    = float(os.getenv('ENT_COEF', '0.003'))
-ACT_SMOOTH  = float(os.getenv('ACT_SMOOTH', '5.0'))
-MINI_BS     = int(os.getenv('MINI_BS', '100_000'))
+# Floor is enforced on effective delta-action sigma (post DELTA_SCALE).
+SIGMA_FLOOR = float(os.getenv('SIGMA_FLOOR', '0.005'))
+SIGMA_FLOOR_COEF = float(os.getenv('SIGMA_FLOOR_COEF', '0.1'))
+ACT_SMOOTH  = float(os.getenv('ACT_SMOOTH', '0.0'))
+MINI_BS     = int(os.getenv('MINI_BS', '20_000'))
 CRITIC_WARMUP = 3
 
 # ── BC ────────────────────────────────────────────────────────
@@ -53,12 +55,11 @@ BC_BS       = int(os.getenv('BC_BS', '2048'))
 BC_GRAD_CLIP = 2.0
 
 # ── runtime ───────────────────────────────────────────────────
-CSVS_EPOCH = int(os.getenv('CSVS', '4000'))
+CSVS_EPOCH = int(os.getenv('CSVS', '5000'))
 MAX_EP     = int(os.getenv('EPOCHS', '5000'))
 EVAL_EVERY = 5
 EVAL_N     = 100  # files to use for val metrics (subset of full, not held out)
 RESUME     = os.getenv('RESUME', '0') == '1'
-DEBUG      = int(os.getenv('DEBUG', '0'))
 DELTA_SCALE_DECAY = os.getenv('DELTA_SCALE_DECAY', '0') == '1'
 
 def delta_scale(epoch, max_ep):
@@ -68,7 +69,6 @@ def lr_schedule(epoch, max_ep, lr_max):
     return LR_MIN + 0.5 * (lr_max - LR_MIN) * (1 + np.cos(np.pi * epoch / max_ep))
 
 EXP_DIR = Path(__file__).parent
-TMP     = EXP_DIR / '.ckpt.pt'
 BEST_PT = EXP_DIR / 'best_model.pt'
 
 # ── obs layout offsets ────────────────────────────────────────
@@ -222,7 +222,7 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
         raw = 2.0 * a_p / (a_p + b_p) - 1.0 if deterministic \
               else 2.0 * torch.distributions.Beta(a_p, b_p).sample() - 1.0
 
-        delta  = (raw.double() * ds).clamp(-MAX_DELTA, MAX_DELTA)
+        delta  = raw.double() * ds
         action = (h_act[:, -1] + delta).clamp(STEER_RANGE[0], STEER_RANGE[1])
 
         h_act[:, :-1] = h_act[:, 1:]; h_act[:, -1] = action
@@ -388,6 +388,11 @@ class PPO:
         self.vf_opt = optim.Adam(ac.critic.parameters(), lr=VF_LR, eps=1e-5)
         self._rms = RunningMeanStd()
 
+    @staticmethod
+    def _beta_sigma_raw(alpha, beta):
+        # Beta std in [0,1] mapped to raw action space [-1,1]
+        return 2.0 * torch.sqrt(alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1)))
+
     def _gae(self, rew, val, done):
         with torch.no_grad():
             flat = rew.reshape(-1)
@@ -403,11 +408,21 @@ class PPO:
             adv[:, t] = g
         return adv.reshape(-1), (adv + val).reshape(-1)
 
-    def update(self, gd, critic_only=False):
+    def update(self, gd, critic_only=False, ds=DELTA_SCALE_MAX):
         obs = gd['obs']
         raw = gd['raw'].unsqueeze(-1)
         adv_t, ret_t = self._gae(gd['rew'], gd['val_2d'], gd['done'])
         x_t = ((raw + 1) / 2).clamp(1e-6, 1 - 1e-6)
+        ds = float(ds)
+        sigma_pen = torch.tensor(0.0, device='cuda')
+
+        # Weighted means over all optimizer minibatches for stable diagnostics.
+        n_vf = 0
+        n_actor = 0
+        vf_sum = 0.0
+        pi_sum = 0.0
+        ent_sum = 0.0
+        sigma_pen_sum = 0.0
 
         with torch.no_grad():
             a_old, b_old = self.ac.beta_params(obs)
@@ -424,6 +439,9 @@ class PPO:
                 vf_loss = torch.max(
                     F.huber_loss(val, ret_t[idx], delta=10.0, reduction='none'),
                     F.huber_loss(vc,  ret_t[idx], delta=10.0, reduction='none')).mean()
+                bs = int(idx.numel())
+                vf_sum += vf_loss.detach().item() * bs
+                n_vf += bs
 
                 if critic_only:
                     self.vf_opt.zero_grad(set_to_none=True)
@@ -439,22 +457,32 @@ class PPO:
                         ratio * mb_adv,
                         ratio.clamp(1 - EPS_CLIP, 1 + EPS_CLIP) * mb_adv).mean()
                     ent = dist.entropy().mean()
-                    loss = pi_loss + VF_COEF * vf_loss - ENT_COEF * ent
+                    sigma_raw_mb = self._beta_sigma_raw(a_c, b_c).mean()
+                    sigma_eff_mb = sigma_raw_mb * ds
+                    sigma_pen = F.relu(SIGMA_FLOOR - sigma_eff_mb)
+                    loss = pi_loss + VF_COEF * vf_loss - ENT_COEF * ent + SIGMA_FLOOR_COEF * sigma_pen
                     self.pi_opt.zero_grad(set_to_none=True)
                     self.vf_opt.zero_grad(set_to_none=True)
                     loss.backward()
                     nn.utils.clip_grad_norm_(self.ac.actor.parameters(), 0.5)
                     nn.utils.clip_grad_norm_(self.ac.critic.parameters(), 0.5)
                     self.pi_opt.step(); self.vf_opt.step()
+                    pi_sum += pi_loss.detach().item() * bs
+                    ent_sum += ent.detach().item() * bs
+                    sigma_pen_sum += sigma_pen.detach().item() * bs
+                    n_actor += bs
 
         with torch.no_grad():
             a_d, b_d = self.ac.beta_params(obs[:1000])
-            sigma = (2.0 * torch.sqrt(a_d*b_d / ((a_d+b_d)**2 * (a_d+b_d+1)))).mean().item()
+            sigma_raw = self._beta_sigma_raw(a_d, b_d).mean().item()
+            sigma_eff = sigma_raw * ds
         return dict(
-            pi=pi_loss.item() if not critic_only else 0.0,
-            vf=vf_loss.item(),
-            ent=ent.item() if not critic_only else 0.0,
-            σ=sigma, lr=self.pi_opt.param_groups[0]['lr'])
+            pi=(pi_sum / max(1, n_actor)) if not critic_only else 0.0,
+            vf=(vf_sum / max(1, n_vf)),
+            ent=(ent_sum / max(1, n_actor)) if not critic_only else 0.0,
+            σ=sigma_eff, σraw=sigma_raw,
+            σpen=(sigma_pen_sum / max(1, n_actor)) if not critic_only else 0.0,
+            lr=self.pi_opt.param_groups[0]['lr'])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -492,8 +520,7 @@ def train():
         warmup_off = CRITIC_WARMUP
         print(f"Resumed from {BEST_PT.name}")
     else:
-        all_csvs = sorted((ROOT / 'data').glob('*.csv'))
-        pretrain_bc(ac, all_csvs)
+        pretrain_bc(ac, all_csv)
 
     vm, vs = evaluate(ac, va_f, mdl_path, ort_sess, csv_cache)
     best, best_ep = vm, 'init'
@@ -512,6 +539,7 @@ def train():
 
     print(f"\nPPO  csvs={CSVS_EPOCH}  epochs={MAX_EP}  dev={DEV}")
     print(f"  π_lr={PI_LR}  vf_lr={VF_LR}  ent={ENT_COEF}  act_smooth={ACT_SMOOTH}"
+          f"  σfloor_eff={SIGMA_FLOOR} coef={SIGMA_FLOOR_COEF}"
           f"  Δscale={'decay' if DELTA_SCALE_DECAY else 'fixed'} {DELTA_SCALE_MAX}→{DELTA_SCALE_MIN}  K={K_EPOCHS}  dim={STATE_DIM}\n")
 
     for epoch in range(MAX_EP):
@@ -527,12 +555,12 @@ def train():
 
         t1 = time.time()
         co = epoch < (CRITIC_WARMUP - warmup_off)
-        info = ppo.update(res, critic_only=co)
+        info = ppo.update(res, critic_only=co, ds=ds)
         tu = time.time() - t1
 
         phase = "  [critic warmup]" if co else ""
-        line = (f"E{epoch:3d}  train={np.mean(res['costs']):6.1f}  σ={info['σ']:.4f}"
-                f"  π={info['pi']:+.4f}  vf={info['vf']:.1f}  H={info['ent']:.2f}"
+        line = (f"E{epoch:3d}  train={np.mean(res['costs']):6.1f}  σ={info['σ']:.4f}  σraw={info['σraw']:.4f}"
+                f"  σpen={info['σpen']:.4f}  π={info['pi']:+.4f}  vf={info['vf']:.1f}  H={info['ent']:.2f}"
                 f"  Δs={ds:.4f}  lr={info['lr']:.1e}  ⏱{t1-t0:.0f}+{tu:.0f}s{phase}")
 
         if epoch % EVAL_EVERY == 0:
@@ -547,7 +575,6 @@ def train():
 
     print(f"\nDone. Best: {best:.1f} (epoch {best_ep})")
     torch.save({'ac': ac.state_dict()}, EXP_DIR / 'final_model.pt')
-    if TMP.exists(): TMP.unlink()
 
 
 if __name__ == '__main__':
