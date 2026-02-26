@@ -35,18 +35,19 @@ S_ROLL, S_CURV = 2.0, 0.02
 PI_LR      = float(os.getenv('PI_LR', '3e-4'))
 VF_LR      = float(os.getenv('VF_LR', '3e-4'))
 LR_MIN     = 5e-5
-GAMMA       = 0.95
-LAMDA       = 0.9
+GAMMA       = float(os.getenv('GAMMA', '0.95'))
+LAMDA       = float(os.getenv('LAMDA', '0.9'))
 K_EPOCHS    = 4
 EPS_CLIP    = 0.2
 VF_COEF     = 1.0
 ENT_COEF    = float(os.getenv('ENT_COEF', '0.003'))
 # Floor is enforced on effective delta-action sigma (post DELTA_SCALE).
 SIGMA_FLOOR = float(os.getenv('SIGMA_FLOOR', '0.005'))
-SIGMA_FLOOR_COEF = float(os.getenv('SIGMA_FLOOR_COEF', '0.1'))
+SIGMA_FLOOR_COEF = float(os.getenv('SIGMA_FLOOR_COEF', '0.60'))
 ACT_SMOOTH  = float(os.getenv('ACT_SMOOTH', '0.0'))
-MINI_BS     = int(os.getenv('MINI_BS', '20_000'))
-CRITIC_WARMUP = 3
+REWARD_SCALE = float(os.getenv('REWARD_SCALE', '1.0'))
+MINI_BS     = int(os.getenv('MINI_BS', '25_000'))
+CRITIC_WARMUP = int(os.getenv('CRITIC_WARMUP', '3'))
 
 # ── BC ────────────────────────────────────────────────────────
 BC_EPOCHS   = int(os.getenv('BC_EPOCHS', '20'))
@@ -60,7 +61,19 @@ MAX_EP     = int(os.getenv('EPOCHS', '5000'))
 EVAL_EVERY = 5
 EVAL_N     = 100  # files to use for val metrics (subset of full, not held out)
 RESUME     = os.getenv('RESUME', '0') == '1'
+RESUME_OPT = os.getenv('RESUME_OPT', '1') == '1'
+RESUME_DS  = os.getenv('RESUME_DS', '0') == '1'
+RESET_CRITIC = os.getenv('RESET_CRITIC', '0') == '1'
+RESUME_WARMUP = os.getenv('RESUME_WARMUP', '0') == '1'
+LR_DECAY = os.getenv('LR_DECAY', '1') == '1'
 DELTA_SCALE_DECAY = os.getenv('DELTA_SCALE_DECAY', '0') == '1'
+REWARD_RMS_NORM = os.getenv('REWARD_RMS_NORM', '1') == '1'
+ADV_NORM = os.getenv('ADV_NORM', '1') == '1'
+# Optional temporally-correlated exploration noise (AR(1)) in raw action space.
+# Disabled by default to preserve exact current behavior.
+CORR_NOISE = os.getenv('CORR_NOISE', '0') == '1'
+CORR_RHO   = float(os.getenv('CORR_RHO', '0.90'))
+CORR_SIGMA = float(os.getenv('CORR_SIGMA', '0.04'))
 
 def delta_scale(epoch, max_ep):
     return DELTA_SCALE_MIN + 0.5 * (DELTA_SCALE_MAX - DELTA_SCALE_MIN) * (1 + np.cos(np.pi * epoch / max_ep))
@@ -187,10 +200,13 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
     if not deterministic:
         all_obs = torch.empty((max_steps, N, OBS_DIM), dtype=torch.float32, device='cuda')
         all_raw = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
+        all_logp = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
         all_val = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
         tgt_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
         cur_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
         act_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
+        corr_state = torch.zeros((N, 2), dtype=torch.float32, device='cuda') if CORR_NOISE else None
+        corr_eps_scale = float(np.sqrt(max(1.0 - CORR_RHO * CORR_RHO, 1e-8)))
     si = 0
 
     def ctrl(step_idx, sim_ref):
@@ -216,13 +232,25 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
                  a_ego.float(), h_act32, h_lat, ei, dg, step_idx, T)
 
         with torch.inference_mode():
-            a_p, b_p = ac.beta_params(obs_buf)
+            logits = ac.actor(obs_buf)
+            if not deterministic and CORR_NOISE:
+                # Policy-native colored noise: perturb Beta logits before sampling.
+                corr_state.mul_(CORR_RHO).add_(torch.randn_like(corr_state) * corr_eps_scale)
+                logits = logits + CORR_SIGMA * corr_state
+            a_p = F.softplus(logits[..., 0]) + 1.0
+            b_p = F.softplus(logits[..., 1]) + 1.0
             val = ac.critic(obs_buf).squeeze(-1)
 
-        raw = 2.0 * a_p / (a_p + b_p) - 1.0 if deterministic \
-              else 2.0 * torch.distributions.Beta(a_p, b_p).sample() - 1.0
+        if deterministic:
+            raw_policy = 2.0 * a_p / (a_p + b_p) - 1.0
+            logp = None
+        else:
+            dist = torch.distributions.Beta(a_p, b_p)
+            x = dist.sample()
+            raw_policy = 2.0 * x - 1.0
+            logp = dist.log_prob(x)
 
-        delta  = raw.double() * ds
+        delta  = raw_policy.double() * ds
         action = (h_act[:, -1] + delta).clamp(STEER_RANGE[0], STEER_RANGE[1])
 
         h_act[:, :-1] = h_act[:, 1:]; h_act[:, -1] = action
@@ -230,7 +258,7 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
         h_lat[:, :-1] = h_lat[:, 1:]; h_lat[:, -1] = cur32
 
         if not deterministic and step_idx < COST_END_IDX:
-            all_obs[si] = obs_buf; all_raw[si] = raw; all_val[si] = val
+            all_obs[si] = obs_buf; all_raw[si] = raw_policy; all_logp[si] = logp; all_val[si] = val
             tgt_hist[si] = target; cur_hist[si] = current; act_hist[si] = action
             si += 1
         return action
@@ -245,13 +273,14 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
     lat_r = (tgt - cur)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
     jerk = torch.diff(cur, dim=1, prepend=cur[:, :1]) / DEL_T
     act_d = torch.diff(act, dim=1, prepend=act[:, :1]) / DEL_T
-    rew = (-(lat_r + jerk**2 * 100 + act_d**2 * ACT_SMOOTH) / 500.0).float()
+    rew = (-(lat_r + jerk**2 * 100 + act_d**2 * ACT_SMOOTH) / max(REWARD_SCALE, 1e-8)).float()
     dones = torch.zeros((N, S), dtype=torch.float32, device='cuda')
     dones[:, -1] = 1.0
 
     return dict(
         obs=all_obs[:S].permute(1, 0, 2).reshape(-1, OBS_DIM),
         raw=all_raw[:S].T.reshape(-1),
+        old_logp=all_logp[:S].T.reshape(-1),
         val_2d=all_val[:S].T,
         rew=rew, done=dones, costs=costs)
 
@@ -394,10 +423,11 @@ class PPO:
         return 2.0 * torch.sqrt(alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1)))
 
     def _gae(self, rew, val, done):
-        with torch.no_grad():
-            flat = rew.reshape(-1)
-            self._rms.update(flat.mean().item(), flat.var().item(), flat.numel())
-        rew = rew / max(self._rms.std, 1e-8)
+        if REWARD_RMS_NORM:
+            with torch.no_grad():
+                flat = rew.reshape(-1)
+                self._rms.update(flat.mean().item(), flat.var().item(), flat.numel())
+            rew = rew / max(self._rms.std, 1e-8)
         N, S = rew.shape
         adv = torch.empty_like(rew)
         g = torch.zeros(N, dtype=torch.float32, device='cuda')
@@ -425,20 +455,20 @@ class PPO:
         sigma_pen_sum = 0.0
 
         with torch.no_grad():
-            a_old, b_old = self.ac.beta_params(obs)
-            old_lp = torch.distributions.Beta(a_old, b_old).log_prob(x_t.squeeze(-1))
-            old_val = self.ac.critic(obs).squeeze(-1)
+            if 'old_logp' in gd:
+                old_lp = gd['old_logp']
+            else:
+                a_old, b_old = self.ac.beta_params(obs)
+                old_lp = torch.distributions.Beta(a_old, b_old).log_prob(x_t.squeeze(-1))
 
         for _ in range(K_EPOCHS):
             for idx in torch.randperm(len(obs), device='cuda').split(MINI_BS):
                 mb_adv = adv_t[idx]
-                mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+                if ADV_NORM:
+                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
                 val = self.ac.critic(obs[idx]).squeeze(-1)
-                vc = old_val[idx] + (val - old_val[idx]).clamp(-10, 10)
-                vf_loss = torch.max(
-                    F.huber_loss(val, ret_t[idx], delta=10.0, reduction='none'),
-                    F.huber_loss(vc,  ret_t[idx], delta=10.0, reduction='none')).mean()
+                vf_loss = F.mse_loss(val, ret_t[idx], reduction='mean')
                 bs = int(idx.numel())
                 vf_sum += vf_loss.detach().item() * bs
                 n_vf += bs
@@ -446,7 +476,7 @@ class PPO:
                 if critic_only:
                     self.vf_opt.zero_grad(set_to_none=True)
                     vf_loss.backward()
-                    nn.utils.clip_grad_norm_(self.ac.critic.parameters(), 0.5)
+                    nn.utils.clip_grad_norm_(self.ac.critic.parameters(), 1.0)
                     self.vf_opt.step()
                 else:
                     a_c, b_c = self.ac.beta_params(obs[idx])
@@ -465,7 +495,7 @@ class PPO:
                     self.vf_opt.zero_grad(set_to_none=True)
                     loss.backward()
                     nn.utils.clip_grad_norm_(self.ac.actor.parameters(), 0.5)
-                    nn.utils.clip_grad_norm_(self.ac.critic.parameters(), 0.5)
+                    nn.utils.clip_grad_norm_(self.ac.critic.parameters(), 1.0)
                     self.pi_opt.step(); self.vf_opt.step()
                     pi_sum += pi_loss.detach().item() * bs
                     ent_sum += ent.detach().item() * bs
@@ -506,27 +536,57 @@ def train():
     csv_cache = CSVCache([str(f) for f in all_csv])
 
     warmup_off = 0
+    resumed_ds = None
     if RESUME and BEST_PT.exists():
         ckpt = torch.load(BEST_PT, weights_only=False, map_location=DEV)
         ac.load_state_dict(ckpt['ac'])
-        if 'pi_opt' in ckpt:
+        if RESUME_OPT and 'pi_opt' in ckpt:
             ppo.pi_opt.load_state_dict(ckpt['pi_opt'])
             ppo.vf_opt.load_state_dict(ckpt['vf_opt'])
-            for pg in ppo.pi_opt.param_groups: pg['lr'] = PI_LR; pg['eps'] = 1e-5
-            for pg in ppo.vf_opt.param_groups: pg['lr'] = VF_LR; pg['eps'] = 1e-5
             if 'ret_rms' in ckpt:
                 r = ckpt['ret_rms']
                 ppo._rms.mean, ppo._rms.var, ppo._rms.count = r['mean'], r['var'], r['count']
-        warmup_off = CRITIC_WARMUP
+        elif RESUME_OPT:
+            print("RESUME_OPT=1 but optimizer state missing in checkpoint; using fresh optimizer/RMS state")
+        warmup_off = 0 if RESUME_WARMUP else CRITIC_WARMUP
         print(f"Resumed from {BEST_PT.name}")
+        if RESUME_OPT:
+            print("RESUME_OPT=1: optimizer state, LR/eps, and RMS restored from checkpoint")
+        else:
+            print("RESUME_OPT=0: resumed weights only; optimizer and RMS use fresh state")
+        if RESUME_DS:
+            ds_ckpt = ckpt.get('delta_scale', None)
+            if ds_ckpt is not None:
+                resumed_ds = float(ds_ckpt)
+                print(f"Resumed delta_scale={resumed_ds:.6f} from checkpoint")
+            else:
+                print("RESUME_DS=1 but checkpoint has no delta_scale; using schedule/env")
+        if RESET_CRITIC:
+            for layer in ac.critic[:-1]:
+                if isinstance(layer, nn.Linear):
+                    _ortho(layer)
+            if isinstance(ac.critic[-1], nn.Linear):
+                _ortho(ac.critic[-1], gain=1.0)
+            ppo.vf_opt = optim.Adam(ac.critic.parameters(), lr=VF_LR, eps=1e-5)
+            ppo._rms = RunningMeanStd()
+            warmup_off = 0
+            print("RESET_CRITIC=1: critic, vf_opt, and ret_rms reset; critic warmup re-enabled")
     else:
         pretrain_bc(ac, all_csv)
 
-    vm, vs = evaluate(ac, va_f, mdl_path, ort_sess, csv_cache)
-    best, best_ep = vm, 'init'
-    print(f"Baseline: {vm:.1f} ± {vs:.1f}")
+    ds_max_run = DELTA_SCALE_MAX
+    ds_min_run = DELTA_SCALE_MIN
+    if RESUME_DS and resumed_ds is not None:
+        ds_max_run = resumed_ds
+        # Keep decay monotonic downward even if env min > resumed max.
+        ds_min_run = min(ds_min_run, ds_max_run)
 
-    cur_ds = DELTA_SCALE_MAX
+    baseline_ds = ds_min_run + 0.5 * (ds_max_run - ds_min_run) * (1 + np.cos(0.0)) if DELTA_SCALE_DECAY else ds_max_run
+    vm, vs = evaluate(ac, va_f, mdl_path, ort_sess, csv_cache, ds=baseline_ds)
+    best, best_ep = vm, 'init'
+    print(f"Baseline: {vm:.1f} ± {vs:.1f}  (Δs={baseline_ds:.4f})")
+
+    cur_ds = ds_max_run
     def save_best():
         torch.save({
             'ac': ac.state_dict(),
@@ -535,18 +595,36 @@ def train():
             'ret_rms': {'mean': ppo._rms.mean, 'var': ppo._rms.var, 'count': ppo._rms.count},
             'delta_scale': cur_ds,
         }, BEST_PT)
-    save_best()
 
     print(f"\nPPO  csvs={CSVS_EPOCH}  epochs={MAX_EP}  dev={DEV}")
     print(f"  π_lr={PI_LR}  vf_lr={VF_LR}  ent={ENT_COEF}  act_smooth={ACT_SMOOTH}"
+          f"  rew_scale={REWARD_SCALE:g}"
+          f"  lr_decay={'on' if LR_DECAY else 'off'}"
+          f"  resume_opt={'on' if RESUME_OPT else 'off'}"
+          f"  reset_critic={'on' if RESET_CRITIC else 'off'}"
+          f"  resume_warmup={'on' if RESUME_WARMUP else 'off'}"
           f"  σfloor_eff={SIGMA_FLOOR} coef={SIGMA_FLOOR_COEF}"
-          f"  Δscale={'decay' if DELTA_SCALE_DECAY else 'fixed'} {DELTA_SCALE_MAX}→{DELTA_SCALE_MIN}  K={K_EPOCHS}  dim={STATE_DIM}\n")
+          f"  rew_rms_norm={'on' if REWARD_RMS_NORM else 'off'}"
+          f"  adv_norm={'on' if ADV_NORM else 'off'}"
+          f"  corr_noise={'on' if CORR_NOISE else 'off'}(rho={CORR_RHO:.2f},sigma={CORR_SIGMA:.3f})"
+          f"  Δscale={'decay' if DELTA_SCALE_DECAY else 'fixed'} {ds_max_run}→{ds_min_run}  K={K_EPOCHS}  dim={STATE_DIM}\n")
 
     for epoch in range(MAX_EP):
-        ds = delta_scale(epoch, MAX_EP) if DELTA_SCALE_DECAY else DELTA_SCALE_MAX
+        if DELTA_SCALE_DECAY:
+            ds = ds_min_run + 0.5 * (ds_max_run - ds_min_run) * (1 + np.cos(np.pi * epoch / MAX_EP))
+        else:
+            ds = ds_max_run
         cur_ds = ds
-        pi_lr = lr_schedule(epoch, MAX_EP, PI_LR)
-        vf_lr = lr_schedule(epoch, MAX_EP, VF_LR)
+        if RESUME and RESUME_OPT and epoch == 0:
+            # Keep checkpoint optimizer LR for first resumed update.
+            pi_lr = ppo.pi_opt.param_groups[0]['lr']
+            vf_lr = ppo.vf_opt.param_groups[0]['lr']
+        elif LR_DECAY:
+            pi_lr = lr_schedule(epoch, MAX_EP, PI_LR)
+            vf_lr = lr_schedule(epoch, MAX_EP, VF_LR)
+        else:
+            pi_lr = PI_LR
+            vf_lr = VF_LR
         for pg in ppo.pi_opt.param_groups: pg['lr'] = pi_lr
         for pg in ppo.vf_opt.param_groups: pg['lr'] = vf_lr
         t0 = time.time()

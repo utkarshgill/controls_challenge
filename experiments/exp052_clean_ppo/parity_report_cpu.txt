@@ -1,0 +1,34 @@
+Comparing 100 files: [00000.csv .. 00099.csv]
+Controller=exp052_clean  Model=/workspace/controls_challenge/models/tinyphysics.onnx
+[ORT] requested=['CPUExecutionProvider']  actual=['CPUExecutionProvider']
+
+=== Aggregate ===
+tiny mean   : 42.4748
+batched mean: 42.4748
+mean diff   : +0.0000 (batched - tiny)
+mae diff    : 0.0000
+max abs diff: 0.0000
+
+=== Worst per-file deltas (top 15 by |diff|) ===
+00000.csv: tiny=73.1642  batched=73.1642  diff=+0.0000
+00001.csv: tiny=21.7259  batched=21.7259  diff=+0.0000
+00002.csv: tiny=87.0543  batched=87.0543  diff=+0.0000
+00003.csv: tiny=31.2178  batched=31.2178  diff=+0.0000
+00004.csv: tiny=18.9311  batched=18.9311  diff=+0.0000
+00005.csv: tiny=23.1853  batched=23.1853  diff=+0.0000
+00006.csv: tiny=62.5060  batched=62.5060  diff=+0.0000
+00007.csv: tiny=8.6773  batched=8.6773  diff=+0.0000
+00008.csv: tiny=40.8695  batched=40.8695  diff=+0.0000
+00009.csv: tiny=41.2220  batched=41.2220  diff=+0.0000
+00010.csv: tiny=58.2812  batched=58.2812  diff=+0.0000
+00011.csv: tiny=19.4832  batched=19.4832  diff=+0.0000
+00012.csv: tiny=65.1455  batched=65.1455  diff=+0.0000
+00013.csv: tiny=49.6812  batched=49.6812  diff=+0.0000
+00014.csv: tiny=52.9538  batched=52.9538  diff=+0.0000
+
+=== Trace parity (top 5) ===
+00000.csv: len_tiny=600 len_batched=601 max|lataccel_diff|=0.00000000 first_diverge_idx=-1
+00001.csv: len_tiny=599 len_batched=601 max|lataccel_diff|=0.00000000 first_diverge_idx=-1
+00002.csv: len_tiny=600 len_batched=601 max|lataccel_diff|=0.00000000 first_diverge_idx=-1
+00003.csv: len_tiny=599 len_batched=601 max|lataccel_diff|=0.00000000 first_diverge_idx=-1
+00004.csv: len_tiny=599 len_batched=601 max|lataccel_diff|=0.00000000 first_diverge_idx=-1
