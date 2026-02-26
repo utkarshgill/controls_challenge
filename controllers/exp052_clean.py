@@ -30,9 +30,6 @@ FUTURE_PLAN_STEPS = 50  # 10 FPS × 5 sec
 MPC_SHOOT = os.getenv("MPC_SHOOT", "0") == "1"
 MPC_SAMPLES = int(os.getenv("MPC_SAMPLES", "8"))
 MPC_HORIZON = int(os.getenv("MPC_HORIZON", "5"))
-# STOCH=1: stochastic shooting (Beta sampling + token sampling)
-# STOCH=0: deterministic shooting (Beta mean + argmax token)
-STOCH = os.getenv("STOCH", "1") == "1"
 
 # obs layout
 C     = 16
@@ -166,36 +163,27 @@ class Controller(BaseController):
         return float(fallback)
 
     def _sample_raw_batch(self, obs_batch):
+        """Stochastic Beta sample for all K candidates; slot 0 = mean (no-regression)."""
         with torch.inference_mode():
             t = torch.from_numpy(obs_batch.astype(np.float32))
             out = self.ac.actor(t)
             a_p = F.softplus(out[..., 0]) + 1.0
             b_p = F.softplus(out[..., 1]) + 1.0
-            if STOCH:
-                x = torch.distributions.Beta(a_p, b_p).sample()
-                raw = 2.0 * x - 1.0
-            else:
-                raw = 2.0 * a_p / (a_p + b_p) - 1.0
+            x = torch.distributions.Beta(a_p, b_p).sample()
+            x[0] = a_p[0] / (a_p[0] + b_p[0])
+            raw = 2.0 * x - 1.0
         return raw.cpu().numpy().astype(np.float64)
 
     def _predict_lataccel_batch(self, sim_states, actions, past_preds):
-        # Batched TinyPhysics forward: (K, 20, 3), (K, 20), (K, 20)
         bins = self.model.tokenizer.bins
         tokens = np.digitize(np.clip(past_preds, LATACCEL_RANGE[0], LATACCEL_RANGE[1]), bins, right=True)
         states = np.concatenate([actions[..., None], sim_states], axis=2).astype(np.float32)
-        inp = {"states": states, "tokens": tokens.astype(np.int64)}
-        # Reuse simulator-provided model/session; avoid extra session creation.
         sess = self.model.ort_session
-        res = sess.run(None, inp)[0]
-        logits = res[:, -1, :]
-        logits = logits - np.max(logits, axis=1, keepdims=True)
-        probs = np.exp(logits / 0.8)
-        probs = probs / np.sum(probs, axis=1, keepdims=True)
-        if STOCH:
-            tok = np.array([np.random.choice(probs.shape[1], p=probs[i]) for i in range(probs.shape[0])], dtype=np.int64)
-        else:
-            tok = np.argmax(probs, axis=1).astype(np.int64)
-        return bins[tok]
+        res = sess.run(None, {"states": states, "tokens": tokens.astype(np.int64)})[0]
+        logits = res[:, -1, :] / 0.8
+        e_x = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+        probs = e_x / np.sum(e_x, axis=1, keepdims=True)
+        return np.sum(probs * bins[None, :], axis=1)
 
     def _mpc_shoot_action(self, target_lataccel, current_lataccel, state, future_plan):
         if self.model is None:
