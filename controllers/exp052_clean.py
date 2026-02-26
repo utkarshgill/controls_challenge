@@ -162,6 +162,50 @@ class Controller(BaseController):
             return float(vals[j])
         return float(fallback)
 
+    def _build_obs_batch(self, target, cur_la, state, future_plan, ei, h_act, h_lat):
+        """Vectorized 256-dim obs for K candidates."""
+        k = len(cur_la)
+        v2 = max(state.v_ego ** 2, 1.0)
+        k_tgt = (target - state.roll_lataccel) / v2
+        k_cur = (cur_la - state.roll_lataccel) / v2
+        flat = getattr(future_plan, "lataccel", None)
+        fp0 = flat[0] if (flat and len(flat) > 0) else target
+        fric = np.sqrt(cur_la ** 2 + state.a_ego ** 2) / 7.0
+        error = target - cur_la
+
+        core = np.column_stack([
+            np.full(k, target / S_LAT, np.float32),
+            cur_la / S_LAT,
+            error / S_LAT,
+            np.full(k, k_tgt / S_CURV, np.float32),
+            k_cur / S_CURV,
+            (k_tgt - k_cur) / S_CURV,
+            np.full(k, state.v_ego / S_VEGO, np.float32),
+            np.full(k, state.a_ego / S_AEGO, np.float32),
+            np.full(k, state.roll_lataccel / S_ROLL, np.float32),
+            h_act[:, -1] / S_STEER,
+            ei / S_LAT,
+            np.full(k, (fp0 - target) / DEL_T / S_LAT, np.float32),
+            (cur_la - h_lat[:, -1]) / DEL_T / S_LAT,
+            (h_act[:, -1] - h_act[:, -2]) / DEL_T / S_STEER,
+            fric,
+            np.maximum(0.0, 1.0 - fric),
+        ]).astype(np.float32)
+
+        fp = np.concatenate([
+            _future(future_plan, "lataccel", target) / S_LAT,
+            _future(future_plan, "roll_lataccel", state.roll_lataccel) / S_ROLL,
+            _future(future_plan, "v_ego", state.v_ego) / S_VEGO,
+            _future(future_plan, "a_ego", state.a_ego) / S_AEGO,
+        ])
+        obs = np.concatenate([
+            core,
+            h_act.astype(np.float32) / S_STEER,
+            h_lat.astype(np.float32) / S_LAT,
+            np.tile(fp, (k, 1)),
+        ], axis=1)
+        return np.clip(obs, -5.0, 5.0)
+
     def _sample_raw_batch(self, obs_batch):
         """Stochastic Beta sample for all K candidates; slot 0 = mean (no-regression)."""
         with torch.inference_mode():
@@ -190,64 +234,94 @@ class Controller(BaseController):
             return None
         k = max(1, MPC_SAMPLES)
         h = max(1, MPC_HORIZON)
+        cl = CONTEXT_LENGTH
 
-        # Candidate trajectory state (K copies of controller memory).
-        h_act = np.repeat(np.array(self._h_act, np.float64)[None, :], k, axis=0)
-        h_lat = np.repeat(np.array(self._h_lat, np.float64)[None, :], k, axis=0)
-        h_err = np.repeat(np.array(self._h_error, np.float64)[None, :], k, axis=0)
-        h_state = np.repeat(
-            np.array([[s.roll_lataccel, s.v_ego, s.a_ego] for s in self._h_state], np.float64)[None, :, :],
-            k,
-            axis=0,
+        # Step-0 candidates from current-policy obs (same as exp050 shooting style).
+        obs0, _ = self._build_obs(
+            target_lataccel, current_lataccel, state, future_plan,
+            self._h_act, self._h_lat, self._h_error,
         )
-        cur = np.full(k, float(current_lataccel), dtype=np.float64)
-        total = np.zeros(k, dtype=np.float64)
-        first_action = None
+        obs0_batch = np.repeat(obs0[None, :], k, axis=0)
+        raw0 = self._sample_raw_batch(obs0_batch)
+        d0 = raw0 * self.delta_scale
+        prev_steer = self._h_act[-1]
+        actions_0 = np.clip(prev_steer + d0, STEER_RANGE[0], STEER_RANGE[1])
 
-        for t in range(h):
-            tgt = self._future_scalar(future_plan, "lataccel", t - 1, target_lataccel) if t > 0 else float(target_lataccel)
-            roll = self._future_scalar(future_plan, "roll_lataccel", t - 1, state.roll_lataccel) if t > 0 else float(state.roll_lataccel)
-            vego = self._future_scalar(future_plan, "v_ego", t - 1, state.v_ego) if t > 0 else float(state.v_ego)
-            aego = self._future_scalar(future_plan, "a_ego", t - 1, state.a_ego) if t > 0 else float(state.a_ego)
-            st = State(roll, vego, aego)
-            fp = FuturePlan(
-                lataccel=list(getattr(future_plan, "lataccel", []) or []),
-                roll_lataccel=list(getattr(future_plan, "roll_lataccel", []) or []),
-                v_ego=list(getattr(future_plan, "v_ego", []) or []),
-                a_ego=list(getattr(future_plan, "a_ego", []) or []),
-            )
+        # ONNX context tiled for K candidates.
+        h_pr = np.array(self._h_lat + [current_lataccel], np.float64)[-cl:]
+        h_st = np.array(
+            list(zip([s.roll_lataccel for s in self._h_state],
+                     [s.v_ego for s in self._h_state],
+                     [s.a_ego for s in self._h_state]))
+            + [(state.roll_lataccel, state.v_ego, state.a_ego)], np.float64
+        )[-cl:]
+        h_ac = np.array(self._h_act, np.float64)[-cl:]
+        all_pr = np.tile(h_pr, (k, 1))
+        all_st = np.tile(h_st, (k, 1, 1))
+        all_ac = np.tile(h_ac, (k, 1))
 
-            obs_batch = np.empty((k, STATE_DIM), dtype=np.float32)
-            for i in range(k):
-                h_err[i, :-1] = h_err[i, 1:]
-                h_err[i, -1] = tgt - cur[i]
-                obs_i, _ = self._build_obs(tgt, cur[i], st, fp, h_act[i], h_lat[i], h_err[i])
-                obs_batch[i] = obs_i
+        fp_lat = np.array(getattr(future_plan, "lataccel", []) or [], np.float64)
+        fp_roll = np.array(getattr(future_plan, "roll_lataccel", []) or [], np.float64)
+        fp_v = np.array(getattr(future_plan, "v_ego", []) or [], np.float64)
+        fp_a = np.array(getattr(future_plan, "a_ego", []) or [], np.float64)
 
-            raw = self._sample_raw_batch(obs_batch)
-            delta = raw * self.delta_scale
-            act = np.clip(h_act[:, -1] + delta, STEER_RANGE[0], STEER_RANGE[1])
-            if t == 0:
-                first_action = act.copy()
+        r_act = np.tile(self._h_act, (k, 1))
+        r_lat = np.tile(self._h_lat, (k, 1))
+        r_err = np.tile(self._h_error, (k, 1))
 
-            # Simulate one step ahead with TinyPhysics model.
-            pred = self._predict_lataccel_batch(h_state[:, -CONTEXT_LENGTH:, :], h_act[:, -CONTEXT_LENGTH:], h_lat[:, -CONTEXT_LENGTH:])
-            pred = np.clip(pred, cur - MAX_ACC_DELTA, cur + MAX_ACC_DELTA)
+        costs = np.zeros(k, np.float64)
+        prev_la = np.full(k, current_lataccel, np.float64)
+        cur = actions_0.copy()
+        first_action = actions_0.copy()
 
-            jerk = (pred - cur) / DEL_T
-            total += (pred - tgt) ** 2 * (100.0 * LAT_ACCEL_COST_MULTIPLIER) + (jerk ** 2) * 100.0
+        for step in range(h):
+            # Use candidate actions in ONNX sequence (fixes stale-action simulation).
+            a_seqs = np.concatenate([all_ac[:, 1:], cur[:, None]], axis=1)
+            pred = self._predict_lataccel_batch(all_st, a_seqs, all_pr)
+            pred = np.clip(pred, prev_la - MAX_ACC_DELTA, prev_la + MAX_ACC_DELTA)
 
-            # shift histories
-            h_act[:, :-1] = h_act[:, 1:]; h_act[:, -1] = act
-            h_lat[:, :-1] = h_lat[:, 1:]; h_lat[:, -1] = pred
-            h_state[:, :-1, :] = h_state[:, 1:, :]
-            h_state[:, -1, 0] = roll
-            h_state[:, -1, 1] = vego
-            h_state[:, -1, 2] = aego
-            cur = pred
+            tgt = fp_lat[step] if step < len(fp_lat) else (fp_lat[-1] if len(fp_lat) > 0 else current_lataccel)
+            costs += (tgt - pred) ** 2 * (100.0 * LAT_ACCEL_COST_MULTIPLIER)
+            costs += ((pred - prev_la) / DEL_T) ** 2 * 100.0
 
-        best = int(np.argmin(total))
-        return float(first_action[best])
+            all_pr = np.concatenate([all_pr[:, 1:], pred[:, None]], axis=1)
+            all_ac = np.concatenate([all_ac[:, 1:], cur[:, None]], axis=1)
+            if step < h - 1:
+                r = fp_roll[step] if step < len(fp_roll) else float(all_st[0, -1, 0])
+                v = fp_v[step] if step < len(fp_v) else float(all_st[0, -1, 1])
+                a = fp_a[step] if step < len(fp_a) else float(all_st[0, -1, 2])
+                ns = np.full((k, 1, 3), [r, v, a], np.float64)
+                all_st = np.concatenate([all_st[:, 1:, :], ns], axis=1)
+
+            r_act = np.concatenate([r_act[:, 1:], cur[:, None]], axis=1)
+            r_lat = np.concatenate([r_lat[:, 1:], pred[:, None]], axis=1)
+            r_err = np.concatenate([r_err[:, 1:], (tgt - pred)[:, None]], axis=1)
+            prev_la = pred.copy()
+
+            if step < h - 1:
+                off = step + 1
+                p_tgt = float(fp_lat[step]) if step < len(fp_lat) else float(tgt)
+                p_st = State(
+                    roll_lataccel=float(fp_roll[step]) if step < len(fp_roll) else float(all_st[0, -1, 0]),
+                    v_ego=float(fp_v[step]) if step < len(fp_v) else float(all_st[0, -1, 1]),
+                    a_ego=float(fp_a[step]) if step < len(fp_a) else float(all_st[0, -1, 2]),
+                )
+                sfp = FuturePlan(
+                    lataccel=list(fp_lat[off:]),
+                    roll_lataccel=list(fp_roll[off:]),
+                    v_ego=list(fp_v[off:]),
+                    a_ego=list(fp_a[off:]),
+                )
+                ei_batch = np.mean(r_err, axis=1).astype(np.float32) * DEL_T
+                obs_batch = self._build_obs_batch(
+                    p_tgt, pred.astype(np.float32), p_st, sfp,
+                    ei_batch, r_act.astype(np.float32), r_lat.astype(np.float32),
+                )
+                raw = self._sample_raw_batch(obs_batch)
+                delta = raw * self.delta_scale
+                cur = np.clip(r_act[:, -1] + delta, STEER_RANGE[0], STEER_RANGE[1])
+
+        return float(first_action[int(np.argmin(costs))])
 
     def update(self, target_lataccel, current_lataccel, state, future_plan):
         self.n += 1

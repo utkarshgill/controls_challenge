@@ -202,9 +202,6 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
         all_raw = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
         all_logp = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
         all_val = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
-        tgt_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
-        cur_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
-        act_hist = torch.empty((max_steps, N), dtype=torch.float64, device='cuda')
         corr_state = torch.zeros((N, 2), dtype=torch.float32, device='cuda') if CORR_NOISE else None
         corr_eps_scale = float(np.sqrt(max(1.0 - CORR_RHO * CORR_RHO, 1e-8)))
     si = 0
@@ -259,7 +256,6 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
 
         if not deterministic and step_idx < COST_END_IDX:
             all_obs[si] = obs_buf; all_raw[si] = raw_policy; all_logp[si] = logp; all_val[si] = val
-            tgt_hist[si] = target; cur_hist[si] = current; act_hist[si] = action
             si += 1
         return action
 
@@ -268,10 +264,22 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
     if deterministic:
         return costs.tolist()
 
+    # Align reward timing with official cost window using post-step simulator histories.
     S = si
-    tgt = tgt_hist[:S].T; cur = cur_hist[:S].T; act = act_hist[:S].T
-    lat_r = (tgt - cur)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
-    jerk = torch.diff(cur, dim=1, prepend=cur[:, :1]) / DEL_T
+    start = CONTROL_START_IDX
+    end = start + S
+    if sim._gpu:
+        pred = sim.current_lataccel_history[:, start:end].float()
+        target = dg['target_lataccel'][:, start:end].float()
+        act = sim.action_history[:, start:end].float()
+    else:
+        pred = torch.from_numpy(sim.current_lataccel_history[:, start:end]).to(device='cuda', dtype=torch.float32)
+        target = torch.from_numpy(sim.data['target_lataccel'][:, start:end]).to(device='cuda', dtype=torch.float32)
+        act = torch.from_numpy(sim.action_history[:, start:end]).to(device='cuda', dtype=torch.float32)
+
+    lat_r = (target - pred)**2 * (100 * LAT_ACCEL_COST_MULTIPLIER)
+    # Keep finite-difference terms strictly within [CONTROL_START_IDX, COST_END_IDX).
+    jerk = torch.diff(pred, dim=1, prepend=pred[:, :1]) / DEL_T
     act_d = torch.diff(act, dim=1, prepend=act[:, :1]) / DEL_T
     rew = (-(lat_r + jerk**2 * 100 + act_d**2 * ACT_SMOOTH) / max(REWARD_SCALE, 1e-8)).float()
     dones = torch.zeros((N, S), dtype=torch.float32, device='cuda')
