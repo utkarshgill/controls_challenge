@@ -69,12 +69,6 @@ LR_DECAY = os.getenv('LR_DECAY', '1') == '1'
 DELTA_SCALE_DECAY = os.getenv('DELTA_SCALE_DECAY', '0') == '1'
 REWARD_RMS_NORM = os.getenv('REWARD_RMS_NORM', '1') == '1'
 ADV_NORM = os.getenv('ADV_NORM', '1') == '1'
-# Optional temporally-correlated exploration noise (AR(1)) in raw action space.
-# Disabled by default to preserve exact current behavior.
-CORR_NOISE = os.getenv('CORR_NOISE', '0') == '1'
-CORR_RHO   = float(os.getenv('CORR_RHO', '0.90'))
-CORR_SIGMA = float(os.getenv('CORR_SIGMA', '0.04'))
-
 def delta_scale(epoch, max_ep):
     return DELTA_SCALE_MIN + 0.5 * (DELTA_SCALE_MAX - DELTA_SCALE_MIN) * (1 + np.cos(np.pi * epoch / max_ep))
 
@@ -202,8 +196,6 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
         all_raw = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
         all_logp = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
         all_val = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
-        corr_state = torch.zeros((N, 2), dtype=torch.float32, device='cuda') if CORR_NOISE else None
-        corr_eps_scale = float(np.sqrt(max(1.0 - CORR_RHO * CORR_RHO, 1e-8)))
     si = 0
 
     def ctrl(step_idx, sim_ref):
@@ -230,10 +222,6 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
 
         with torch.inference_mode():
             logits = ac.actor(obs_buf)
-            if not deterministic and CORR_NOISE:
-                # Policy-native colored noise: perturb Beta logits before sampling.
-                corr_state.mul_(CORR_RHO).add_(torch.randn_like(corr_state) * corr_eps_scale)
-                logits = logits + CORR_SIGMA * corr_state
             a_p = F.softplus(logits[..., 0]) + 1.0
             b_p = F.softplus(logits[..., 1]) + 1.0
             val = ac.critic(obs_buf).squeeze(-1)
@@ -614,7 +602,6 @@ def train():
           f"  σfloor_eff={SIGMA_FLOOR} coef={SIGMA_FLOOR_COEF}"
           f"  rew_rms_norm={'on' if REWARD_RMS_NORM else 'off'}"
           f"  adv_norm={'on' if ADV_NORM else 'off'}"
-          f"  corr_noise={'on' if CORR_NOISE else 'off'}(rho={CORR_RHO:.2f},sigma={CORR_SIGMA:.3f})"
           f"  Δscale={'decay' if DELTA_SCALE_DECAY else 'fixed'} {ds_max_run}→{ds_min_run}  K={K_EPOCHS}  dim={STATE_DIM}\n")
 
     for epoch in range(MAX_EP):
