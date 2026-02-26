@@ -36,6 +36,8 @@ DEL_T = 0.1
 LAT_ACCEL_COST_MULTIPLIER = 50.0
 TP_MAX_WORKERS = int(os.getenv("TP_MAX_WORKERS", "16"))
 TP_CHUNKSIZE = int(os.getenv("TP_CHUNKSIZE", "10"))
+TP_ORT_INTRA = int(os.getenv("TP_ORT_INTRA", "1"))
+TP_ORT_INTER = int(os.getenv("TP_ORT_INTER", "1"))
 
 FUTURE_PLAN_STEPS = FPS * 5  # 5 secs
 
@@ -65,8 +67,8 @@ class TinyPhysicsModel:
   def __init__(self, model_path: str, debug: bool) -> None:
     self.tokenizer = LataccelTokenizer()
     options = ort.SessionOptions()
-    options.intra_op_num_threads = 1
-    options.inter_op_num_threads = 1
+    options.intra_op_num_threads = max(1, TP_ORT_INTRA)
+    options.inter_op_num_threads = max(1, TP_ORT_INTER)
     options.log_severity_level = 3
     provider = 'CPUExecutionProvider'
 
