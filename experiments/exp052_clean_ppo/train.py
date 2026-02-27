@@ -69,9 +69,6 @@ LR_DECAY = os.getenv('LR_DECAY', '1') == '1'
 DELTA_SCALE_DECAY = os.getenv('DELTA_SCALE_DECAY', '0') == '1'
 REWARD_RMS_NORM = os.getenv('REWARD_RMS_NORM', '1') == '1'
 ADV_NORM = os.getenv('ADV_NORM', '1') == '1'
-def delta_scale(epoch, max_ep):
-    return DELTA_SCALE_MIN + 0.5 * (DELTA_SCALE_MAX - DELTA_SCALE_MIN) * (1 + np.cos(np.pi * epoch / max_ep))
-
 def lr_schedule(epoch, max_ep, lr_max):
     return LR_MIN + 0.5 * (lr_max - LR_MIN) * (1 + np.cos(np.pi * epoch / max_ep))
 
