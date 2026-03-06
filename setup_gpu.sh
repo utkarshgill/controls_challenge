@@ -1,22 +1,48 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-# 1. Generic deps first (onnxruntime CPU listed here gets installed then overwritten)
+ORT_NIGHTLY_INDEX="https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/"
+CUDA_LIB_DIR="${CUDA_LIB_DIR:-/usr/local/cuda-13.1/lib64}"
+
+# 1. Generic deps first.
 uv pip install -r requirements.txt
 
-# 2. Nuke any CPU onnxruntime so it can't shadow the GPU build
+# 2. Nuke any existing ORT build so the GPU build is authoritative.
 uv pip uninstall onnxruntime onnxruntime-gpu || true
 
-# 3. GPU-specific: TensorRT libs + nightly onnxruntime-gpu (CUDA 13 + TRT provider)
+# 3. GPU-specific: TensorRT libs + nightly onnxruntime-gpu (CUDA 13 + TRT provider).
 uv pip install tensorrt-cu13
-uv pip install --pre --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu
+uv pip install --pre --extra-index-url "${ORT_NIGHTLY_INDEX}" onnxruntime-gpu
 
-# 4. LD_LIBRARY_PATH for TRT + CUDA (idempotent append)
+TRT_LIB_DIR="$(
+python - <<'PY'
+from pathlib import Path
+import site
+
+for base in site.getsitepackages():
+    p = Path(base) / "tensorrt_libs"
+    if p.exists():
+        print(p)
+        break
+else:
+    raise SystemExit("tensorrt_libs not found in site-packages")
+PY
+)"
+
+# 4. LD_LIBRARY_PATH for TRT + CUDA (idempotent append).
 grep -q 'tensorrt_libs' ~/.bashrc 2>/dev/null || \
-  echo 'export LD_LIBRARY_PATH="/usr/local/cuda-13.1/lib64:/venv/main/lib/python3.12/site-packages/tensorrt_libs:${LD_LIBRARY_PATH}"' >> ~/.bashrc
+  echo "export LD_LIBRARY_PATH=\"${CUDA_LIB_DIR}:${TRT_LIB_DIR}:\${LD_LIBRARY_PATH}\"" >> ~/.bashrc
 
-# 5. Verify
-source ~/.bashrc
-python -c "import onnxruntime as ort; provs = ort.get_available_providers(); print('Providers:', provs); assert 'CUDAExecutionProvider' in provs, 'CUDA provider missing!'"
+export LD_LIBRARY_PATH="${CUDA_LIB_DIR}:${TRT_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 
-echo "Done. All providers available."
+# 5. Verify.
+python - <<'PY'
+import onnxruntime as ort
+
+provs = ort.get_available_providers()
+print("Providers:", provs)
+assert 'CUDAExecutionProvider' in provs, 'CUDA provider missing!'
+assert 'TensorrtExecutionProvider' in provs, 'TensorRT provider missing!'
+PY
+
+echo "Done. CUDA + TensorRT providers available."
