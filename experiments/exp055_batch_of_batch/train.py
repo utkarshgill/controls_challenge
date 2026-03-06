@@ -70,6 +70,7 @@ LR_DECAY = os.getenv('LR_DECAY', '1') == '1'
 DELTA_SCALE_DECAY = os.getenv('DELTA_SCALE_DECAY', '0') == '1'
 REWARD_RMS_NORM = os.getenv('REWARD_RMS_NORM', '1') == '1'
 ADV_NORM = os.getenv('ADV_NORM', '1') == '1'
+COMPILE = os.getenv('COMPILE', '0') == '1'
 def lr_schedule(epoch, max_ep, lr_max):
     return LR_MIN + 0.5 * (lr_max - LR_MIN) * (1 + np.cos(np.pi * epoch / max_ep))
 
@@ -525,6 +526,7 @@ def evaluate(ac, files, mdl_path, ort_session, csv_cache, ds=DELTA_SCALE_MAX):
 
 def train():
     ac = ActorCritic().to(DEV)
+
     ppo = PPO(ac)
     mdl_path = ROOT / 'models' / 'tinyphysics.onnx'
     ort_sess = make_ort_session(mdl_path)
@@ -573,6 +575,10 @@ def train():
     else:
         pretrain_bc(ac, all_csv)
 
+    if COMPILE:
+        ac.actor = torch.compile(ac.actor, mode='reduce-overhead', dynamic=True)
+        ac.critic = torch.compile(ac.critic, mode='reduce-overhead', dynamic=True)
+
     ds_max_run = DELTA_SCALE_MAX
     ds_min_run = DELTA_SCALE_MIN
     if RESUME_DS and resumed_ds is not None:
@@ -607,6 +613,7 @@ def train():
           f"  σfloor_eff={SIGMA_FLOOR} coef={SIGMA_FLOOR_COEF}"
           f"  rew_rms_norm={'on' if REWARD_RMS_NORM else 'off'}"
           f"  adv_norm={'on' if ADV_NORM else 'off'}"
+          f"  compile={'on' if COMPILE else 'off'}"
           f"  Δscale={'decay' if DELTA_SCALE_DECAY else 'fixed'} {ds_max_run}→{ds_min_run}  K={K_EPOCHS}  dim={STATE_DIM}\n")
 
     for epoch in range(MAX_EP):
