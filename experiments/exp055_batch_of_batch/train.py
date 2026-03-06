@@ -576,8 +576,8 @@ def train():
         pretrain_bc(ac, all_csv)
 
     if COMPILE:
-        ac.actor = torch.compile(ac.actor, mode='reduce-overhead', dynamic=True)
-        ac.critic = torch.compile(ac.critic, mode='reduce-overhead', dynamic=True)
+        ac.actor = torch.compile(ac.actor, mode='max-autotune-no-cudagraphs', dynamic=True)
+        ac.critic = torch.compile(ac.critic, mode='max-autotune-no-cudagraphs', dynamic=True)
 
     ds_max_run = DELTA_SCALE_MAX
     ds_min_run = DELTA_SCALE_MIN
