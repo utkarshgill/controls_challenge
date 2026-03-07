@@ -126,13 +126,40 @@ class ActorCritic(nn.Module):
 #  Observation builder (GPU, batched)
 # ══════════════════════════════════════════════════════════════
 
+def _precompute_future_windows(dg):
+    def _windows(x):
+        x = x.float()
+        shifted = torch.cat([x[:, 1:], x[:, -1:].expand(-1, FUTURE_K)], dim=1)
+        return shifted.unfold(1, FUTURE_K, 1).contiguous()
+
+    return {
+        'target_lataccel': _windows(dg['target_lataccel']),
+        'roll_lataccel': _windows(dg['roll_lataccel']),
+        'v_ego': _windows(dg['v_ego']),
+        'a_ego': _windows(dg['a_ego']),
+    }
+
+
+def _write_ring(dest, ring, head, scale):
+    split = head + 1
+    if split >= HIST_LEN:
+        dest[:, :] = ring / scale
+        return
+    tail = HIST_LEN - split
+    dest[:, :tail] = ring[:, split:] / scale
+    dest[:, tail:] = ring[:, :split] / scale
+
+
 def fill_obs(buf, target, current, roll_la, v_ego, a_ego,
-             h_act, h_lat, error_integral, dg, step_idx, T):
+             h_act, h_lat, hist_head, error_integral, future, step_idx):
     v2   = torch.clamp(v_ego * v_ego, min=1.0)
     k_tgt = (target - roll_la) / v2
     k_cur = (current - roll_la) / v2
-    fp0  = dg['target_lataccel'][:, min(step_idx + 1, T - 1)]
+    fp0  = future['target_lataccel'][:, step_idx, 0]
     fric = torch.sqrt(current**2 + a_ego**2) / 7.0
+    prev_act = h_act[:, hist_head]
+    prev_act2 = h_act[:, (hist_head - 1) % HIST_LEN]
+    prev_lat = h_lat[:, hist_head]
 
     buf[:, 0]  = target / S_LAT
     buf[:, 1]  = current / S_LAT
@@ -143,31 +170,21 @@ def fill_obs(buf, target, current, roll_la, v_ego, a_ego,
     buf[:, 6]  = v_ego / S_VEGO
     buf[:, 7]  = a_ego / S_AEGO
     buf[:, 8]  = roll_la / S_ROLL
-    buf[:, 9]  = h_act[:, -1] / S_STEER
+    buf[:, 9]  = prev_act / S_STEER
     buf[:, 10] = error_integral / S_LAT
     buf[:, 11] = (fp0 - target) / DEL_T / S_LAT
-    buf[:, 12] = (current - h_lat[:, -1]) / DEL_T / S_LAT
-    buf[:, 13] = (h_act[:, -1] - h_act[:, -2]) / DEL_T / S_STEER
+    buf[:, 12] = (current - prev_lat) / DEL_T / S_LAT
+    buf[:, 13] = (prev_act - prev_act2) / DEL_T / S_STEER
     buf[:, 14] = fric
     buf[:, 15] = torch.clamp(1.0 - fric, min=0.0)
 
-    buf[:, C:H1]  = h_act / S_STEER
-    buf[:, H1:H2] = h_lat / S_LAT
+    _write_ring(buf[:, C:H1], h_act, hist_head, S_STEER)
+    _write_ring(buf[:, H1:H2], h_lat, hist_head, S_LAT)
 
-    end = min(step_idx + FUTURE_PLAN_STEPS, T)
-    for off, key, sc in [(F_LAT, 'target_lataccel', S_LAT),
-                         (F_ROLL, 'roll_lataccel', S_ROLL),
-                         (F_V, 'v_ego', S_VEGO),
-                         (F_A, 'a_ego', S_AEGO)]:
-        slc = dg[key][:, step_idx+1:end]
-        w = slc.shape[1]
-        if w == 0:
-            buf[:, off:off+FUTURE_K] = (dg[key][:, step_idx] / sc).float().unsqueeze(1)
-        elif w < FUTURE_K:
-            buf[:, off:off+w] = slc.float() / sc
-            buf[:, off+w:off+FUTURE_K] = slc[:, -1:].float() / sc
-        else:
-            buf[:, off:off+FUTURE_K] = slc[:, :FUTURE_K].float() / sc
+    buf[:, F_LAT:F_ROLL] = future['target_lataccel'][:, step_idx] / S_LAT
+    buf[:, F_ROLL:F_V]   = future['roll_lataccel'][:, step_idx] / S_ROLL
+    buf[:, F_V:F_A]      = future['v_ego'][:, step_idx] / S_VEGO
+    buf[:, F_A:OBS_DIM]  = future['a_ego'][:, step_idx] / S_AEGO
 
     buf.clamp_(-5.0, 5.0)
 
@@ -177,17 +194,23 @@ def fill_obs(buf, target, current, roll_la, v_ego, a_ego,
 # ══════════════════════════════════════════════════════════════
 
 def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False, ds=DELTA_SCALE_MAX):
+    t_setup0 = time.perf_counter()
     data, rng = csv_cache.slice(csv_files)
+    t_slice = time.perf_counter()
     sim = BatchedSimulator(str(mdl_path), ort_session=ort_session,
                            cached_data=data, cached_rng=rng)
+    t_sim_init = time.perf_counter()
     N, T = sim.N, sim.T
     dg = sim.data_gpu
     max_steps = COST_END_IDX - CONTROL_START_IDX
+    future = _precompute_future_windows(dg)
+    t_future = time.perf_counter()
 
     h_act   = torch.zeros((N, HIST_LEN), dtype=torch.float64, device='cuda')
     h_act32 = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
     h_lat   = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
     h_error = torch.zeros((N, HIST_LEN), dtype=torch.float32, device='cuda')
+    err_sum = torch.zeros(N, dtype=torch.float32, device='cuda')
     obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device='cuda')
 
     if not deterministic:
@@ -195,10 +218,20 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
         all_raw = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
         all_logp = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
         all_val = torch.empty((max_steps, N), dtype=torch.float32, device='cuda')
+    if int(os.environ.get('DEBUG', '0')) >= 2:
+        torch.cuda.synchronize()
+        t_alloc = time.perf_counter()
+        print(
+            f"  [rollout setup N={N}] slice={t_slice-t_setup0:.3f}s  "
+            f"sim_init={t_sim_init-t_slice:.3f}s  future={t_future-t_sim_init:.3f}s  "
+            f"alloc={t_alloc-t_future:.3f}s",
+            flush=True,
+        )
     si = 0
+    hist_head = HIST_LEN - 1
 
     def ctrl(step_idx, sim_ref):
-        nonlocal si
+        nonlocal si, hist_head, err_sum
         target  = dg['target_lataccel'][:, step_idx]
         current = sim_ref.current_lataccel
         roll_la = dg['roll_lataccel'][:, step_idx]
@@ -207,23 +240,27 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
 
         cur32 = current.float()
         error = (target - current).float()
-        h_error[:, :-1] = h_error[:, 1:]; h_error[:, -1] = error
-        ei = h_error.mean(dim=1) * DEL_T
+        next_head = (hist_head + 1) % HIST_LEN
+        old_error = h_error[:, next_head]
+        h_error[:, next_head] = error
+        err_sum = err_sum + error - old_error
+        ei = err_sum * (DEL_T / HIST_LEN)
 
         if step_idx < CONTROL_START_IDX:
-            h_act[:, :-1] = h_act[:, 1:]; h_act[:, -1] = 0.0
-            h_act32[:, :-1] = h_act32[:, 1:]; h_act32[:, -1] = 0.0
-            h_lat[:, :-1] = h_lat[:, 1:]; h_lat[:, -1] = cur32
-            return torch.zeros(N, dtype=torch.float64, device='cuda')
+            h_act[:, next_head] = 0.0
+            h_act32[:, next_head] = 0.0
+            h_lat[:, next_head] = cur32
+            hist_head = next_head
+            return torch.zeros(N, dtype=h_act.dtype, device='cuda')
 
         fill_obs(obs_buf, target.float(), cur32, roll_la.float(), v_ego.float(),
-                 a_ego.float(), h_act32, h_lat, ei, dg, step_idx, T)
+                 a_ego.float(), h_act32, h_lat, hist_head, ei, future, step_idx)
 
         with torch.inference_mode():
             logits = ac.actor(obs_buf)
-            a_p = F.softplus(logits[..., 0]) + 1.0
-            b_p = F.softplus(logits[..., 1]) + 1.0
             val = ac.critic(obs_buf).squeeze(-1)
+        a_p = F.softplus(logits[..., 0]) + 1.0
+        b_p = F.softplus(logits[..., 1]) + 1.0
 
         if deterministic:
             raw_policy = 2.0 * a_p / (a_p + b_p) - 1.0
@@ -234,12 +271,13 @@ def rollout(csv_files, ac, mdl_path, ort_session, csv_cache, deterministic=False
             raw_policy = 2.0 * x - 1.0
             logp = dist.log_prob(x)
 
-        delta  = raw_policy.double() * ds
-        action = (h_act[:, -1] + delta).clamp(STEER_RANGE[0], STEER_RANGE[1])
+        delta  = raw_policy.to(h_act.dtype) * ds
+        action = (h_act[:, hist_head] + delta).clamp(STEER_RANGE[0], STEER_RANGE[1])
 
-        h_act[:, :-1] = h_act[:, 1:]; h_act[:, -1] = action
-        h_act32[:, :-1] = h_act32[:, 1:]; h_act32[:, -1] = action.float()
-        h_lat[:, :-1] = h_lat[:, 1:]; h_lat[:, -1] = cur32
+        h_act[:, next_head] = action
+        h_act32[:, next_head] = action.float()
+        h_lat[:, next_head] = cur32
+        hist_head = next_head
 
         if not deterministic and step_idx < COST_END_IDX:
             all_obs[si] = obs_buf; all_raw[si] = raw_policy; all_logp[si] = logp; all_val[si] = val
@@ -375,7 +413,9 @@ def pretrain_bc(ac, all_csvs):
     for ep in range(BC_EPOCHS):
         total, nb = 0.0, 0
         for idx in torch.randperm(N).split(BC_BS):
-            a_p, b_p = ac.beta_params(obs_t[idx])
+            a_out = ac.actor(obs_t[idx])
+            a_p = F.softplus(a_out[..., 0]) + 1.0
+            b_p = F.softplus(a_out[..., 1]) + 1.0
             x = ((raw_t[idx] + 1) / 2).clamp(1e-6, 1 - 1e-6)
             loss = -torch.distributions.Beta(a_p, b_p).log_prob(x).mean()
             opt.zero_grad(); loss.backward()
@@ -458,7 +498,9 @@ class PPO:
             if 'old_logp' in gd:
                 old_lp = gd['old_logp']
             else:
-                a_old, b_old = self.ac.beta_params(obs)
+                old_out = self.ac.actor(obs)
+                a_old = F.softplus(old_out[..., 0]) + 1.0
+                b_old = F.softplus(old_out[..., 1]) + 1.0
                 old_lp = torch.distributions.Beta(a_old, b_old).log_prob(x_t.squeeze(-1))
 
         for _ in range(K_EPOCHS):
@@ -479,7 +521,9 @@ class PPO:
                     nn.utils.clip_grad_norm_(self.ac.critic.parameters(), 1.0)
                     self.vf_opt.step()
                 else:
-                    a_c, b_c = self.ac.beta_params(obs[idx])
+                    a_out = self.ac.actor(obs[idx])
+                    a_c = F.softplus(a_out[..., 0]) + 1.0
+                    b_c = F.softplus(a_out[..., 1]) + 1.0
                     dist = torch.distributions.Beta(a_c, b_c)
                     lp = dist.log_prob(x_t[idx].squeeze(-1))
                     ratio = (lp - old_lp[idx]).exp()
@@ -503,7 +547,9 @@ class PPO:
                     n_actor += bs
 
         with torch.no_grad():
-            a_d, b_d = self.ac.beta_params(obs[:1000])
+            diag_out = self.ac.actor(obs[:1000])
+            a_d = F.softplus(diag_out[..., 0]) + 1.0
+            b_d = F.softplus(diag_out[..., 1]) + 1.0
             sigma_raw = self._beta_sigma_raw(a_d, b_d).mean().item()
             sigma_eff = sigma_raw * ds
         return dict(
