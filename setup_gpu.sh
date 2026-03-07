@@ -29,10 +29,34 @@ else:
 PY
 )"
 
-# 4. LD_LIBRARY_PATH for TRT + CUDA (idempotent append).
-grep -q 'tensorrt_libs' ~/.bashrc 2>/dev/null || \
-  echo "export LD_LIBRARY_PATH=\"${CUDA_LIB_DIR}:${TRT_LIB_DIR}:\${LD_LIBRARY_PATH}\"" >> ~/.bashrc
+# 4. Persist CUDA/TRT env for future interactive shells via a managed ~/.bashrc block.
+python - <<PY
+from pathlib import Path
+import re
 
+bashrc = Path.home() / ".bashrc"
+text = bashrc.read_text() if bashrc.exists() else ""
+block = """# >>> controls_challenge trt >>>
+export CUDA=1
+export TRT=1
+export CUDA_LIB_DIR="${CUDA_LIB_DIR}"
+export TRT_LIB_DIR="${TRT_LIB_DIR}"
+export LD_LIBRARY_PATH="${CUDA_LIB_DIR}:${TRT_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+# <<< controls_challenge trt <<<
+"""
+pattern = re.compile(r"\n?# >>> controls_challenge trt >>>.*?# <<< controls_challenge trt <<<\n?", re.S)
+if pattern.search(text):
+    text = pattern.sub("\n" + block, text)
+else:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += block
+bashrc.write_text(text)
+PY
+
+# Export into the current shell running this script too.
+export CUDA=1
+export TRT=1
 export LD_LIBRARY_PATH="${CUDA_LIB_DIR}:${TRT_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 
 # 5. Verify.
