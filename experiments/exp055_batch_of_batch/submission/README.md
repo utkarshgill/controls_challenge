@@ -36,8 +36,7 @@ usage:
   MODEL=controllers/weights.pt python tinyphysics.py --model_path ./models/tinyphysics.onnx --data_path ./data --num_segs 100 --controller exp055_controller
   ```
 
-note:
-training script still has some experimental stuff. to be cleaned up for a single unbroken run with a fixed schedule next.
+trained with: `TRT=1 CUDA=1 CSVS=5000 EPOCHS=5000 python train.py` on a single 5090 for ~10.41 hours (7-8s per epoch) @ $0.301/hr = ~$3.14
 
 included files:
 - `exp055_controller.py`
