@@ -34,10 +34,6 @@ STEER_RANGE = [-2, 2]
 MAX_ACC_DELTA = 0.5
 DEL_T = 0.1
 LAT_ACCEL_COST_MULTIPLIER = 50.0
-TP_MAX_WORKERS = int(os.getenv("TP_MAX_WORKERS", "16"))
-TP_CHUNKSIZE = int(os.getenv("TP_CHUNKSIZE", "10"))
-TP_ORT_INTRA = int(os.getenv("TP_ORT_INTRA", "1"))
-TP_ORT_INTER = int(os.getenv("TP_ORT_INTER", "1"))
 
 FUTURE_PLAN_STEPS = FPS * 5  # 5 secs
 
@@ -67,8 +63,8 @@ class TinyPhysicsModel:
   def __init__(self, model_path: str, debug: bool) -> None:
     self.tokenizer = LataccelTokenizer()
     options = ort.SessionOptions()
-    options.intra_op_num_threads = max(1, TP_ORT_INTRA)
-    options.inter_op_num_threads = max(1, TP_ORT_INTER)
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
     options.log_severity_level = 3
     provider = 'CPUExecutionProvider'
 
@@ -106,9 +102,6 @@ class TinyPhysicsSimulator:
     self.data = self.get_data(data_path)
     self.controller = controller
     self.debug = debug
-    # Give controller access to model if it needs it (for MPC)
-    if hasattr(controller, 'set_model'):
-      controller.set_model(model)
     self.reset()
 
   def reset(self) -> None:
@@ -259,12 +252,7 @@ if __name__ == "__main__":
   elif data_path.is_dir():
     run_rollout_partial = partial(run_rollout, controller_type=args.controller, model_path=args.model_path, debug=False)
     files = sorted(data_path.iterdir())[:args.num_segs]
-    results = process_map(
-      run_rollout_partial,
-      files,
-      max_workers=max(1, TP_MAX_WORKERS),
-      chunksize=max(1, TP_CHUNKSIZE),
-    )
+    results = process_map(run_rollout_partial, files, max_workers=16, chunksize=10)
     costs = [result[0] for result in results]
     costs_df = pd.DataFrame(costs)
     print(f"\nAverage lataccel_cost: {np.mean(costs_df['lataccel_cost']):>6.4}, average jerk_cost: {np.mean(costs_df['jerk_cost']):>6.4}, average total_cost: {np.mean(costs_df['total_cost']):>6.4}")

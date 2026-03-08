@@ -42,7 +42,7 @@ EPS_CLIP    = 0.2
 VF_COEF     = 1.0
 ENT_COEF    = float(os.getenv('ENT_COEF', '0.003'))
 # Floor is enforced on effective delta-action sigma (post DELTA_SCALE).
-SIGMA_FLOOR = float(os.getenv('SIGMA_FLOOR', '0.01'))
+SIGMA_FLOOR = float(os.getenv('SIGMA_FLOOR', '0.015'))
 SIGMA_FLOOR_COEF = float(os.getenv('SIGMA_FLOOR_COEF', '0.60'))
 ACT_SMOOTH  = float(os.getenv('ACT_SMOOTH', '0.0'))
 REWARD_SCALE = float(os.getenv('REWARD_SCALE', '1.0'))
