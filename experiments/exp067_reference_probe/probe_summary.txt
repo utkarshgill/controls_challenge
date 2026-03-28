@@ -1,0 +1,7 @@
+exp067 reference-chunk probe
+routes=32  windows=64  probe_m=32  chunk_k=5  horizon_h=20
+base_episode_cost mean=63.303 std=82.215
+window_improved frac=0.953 count=61/64
+best_improvement mean=495.253 median=341.109 p90=1087.000
+improved_only mean=519.610
+best_h_cost mean=3164.400  base_h_cost mean=3659.653

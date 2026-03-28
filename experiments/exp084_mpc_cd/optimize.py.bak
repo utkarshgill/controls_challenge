@@ -1,0 +1,547 @@
+# exp084 — Coordinate descent MPC with RNG replay
+#
+# Per-step optimization using real sim with exact RNG replay.
+# Warm-started from exp055 policy actions.
+#
+# For each segment:
+#   1. Roll out policy → get warm-start actions
+#   2. For each scored step (100..499), left to right:
+#      a. Save sim state + RNG state
+#      b. Try N candidate perturbations of current action
+#      c. Simulate H steps forward for each candidate
+#      d. Keep the best
+#   3. 2 passes with decreasing search radius
+#   4. Save optimized actions + collect (obs, action) for BC
+#
+# Based on ksd3's approach (39.35 with PID warm start).
+# With our PPO warm start at 42, this should reach ~30.
+
+import numpy as np
+import onnxruntime as ort
+import pandas as pd
+import os, sys, time, copy, json
+from hashlib import md5
+from pathlib import Path
+from multiprocessing import Pool
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT))
+
+ACC_G = 9.81
+CONTROL_START_IDX = 100
+COST_END_IDX = 500
+CONTEXT_LENGTH = 20
+VOCAB_SIZE = 1024
+LATACCEL_RANGE = [-5, 5]
+STEER_RANGE = [-2, 2]
+MAX_ACC_DELTA = 0.5
+DEL_T = 0.1
+LAT_ACCEL_COST_MULTIPLIER = 50.0
+N_SCORED = COST_END_IDX - CONTROL_START_IDX  # 400
+
+# ── Config ────────────────────────────────────────────────────
+N_CANDIDATES = int(os.getenv("N_CAND", "40"))
+HORIZON = int(os.getenv("HORIZON", "20"))
+NUM_PASSES = int(os.getenv("NUM_PASSES", "2"))
+SEARCH_RADII = [float(x) for x in os.getenv("RADII", "0.15,0.075").split(",")]
+N_SEGMENTS = int(os.getenv("N_SEGS", "5000"))
+N_WORKERS = int(os.getenv("WORKERS", "1"))  # CPU parallelism
+
+EXP_DIR = Path(__file__).parent
+OUT_DIR = EXP_DIR / "optimized"
+BASE_PT = os.getenv(
+    "BASE_MODEL", str(ROOT / "experiments" / "exp055_batch_of_batch" / "best_model.pt")
+)
+
+# ── Policy extraction (runs once to get warm-start actions) ───
+DELTA_SCALE = 0.25
+HIST_LEN, FUTURE_K = 20, 50
+STATE_DIM, HIDDEN = 256, 256
+A_LAYERS = 4
+S_LAT, S_STEER = 5.0, 2.0
+S_VEGO, S_AEGO = 40.0, 4.0
+S_ROLL, S_CURV = 2.0, 0.02
+OBS_DIM = 256
+
+
+# ══════════════════════════════════════════════════════════════
+#  RNG helpers
+# ══════════════════════════════════════════════════════════════
+
+
+def save_rng():
+    s = np.random.get_state()
+    return (s[0], s[1].copy(), s[2], s[3], s[4])
+
+
+def restore_rng(s):
+    np.random.set_state((s[0], s[1].copy(), s[2], s[3], s[4]))
+
+
+# ══════════════════════════════════════════════════════════════
+#  Physics step (CPU, matches tinyphysics.py exactly)
+# ══════════════════════════════════════════════════════════════
+
+
+class PhysicsSim:
+    def __init__(self, model_path="models/tinyphysics.onnx"):
+        self.bins = np.linspace(LATACCEL_RANGE[0], LATACCEL_RANGE[1], VOCAB_SIZE)
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        options.log_severity_level = 3
+        self.ort = ort.InferenceSession(
+            str(model_path), options, ["CPUExecutionProvider"]
+        )
+
+    def step(self, state_hist, action_hist, lataccel_hist, data_row, step_idx, action):
+        """One physics step. Consumes one np.random call. Modifies lists in place."""
+        state = (data_row["roll_lataccel"], data_row["v_ego"], data_row["a_ego"])
+        state_hist.append(state)
+        action = np.clip(action, STEER_RANGE[0], STEER_RANGE[1])
+        action_hist.append(action)
+
+        CL = CONTEXT_LENGTH
+        sim_states = state_hist[-CL:]
+        sim_actions = action_hist[-CL:]
+        past_preds = lataccel_hist[-CL:]
+
+        tokenized = np.digitize(np.clip(past_preds, -5, 5), self.bins, right=True)
+        raw = [list(s) for s in sim_states]
+        states_arr = np.column_stack([sim_actions, raw]).astype(np.float32)
+
+        res = self.ort.run(
+            None,
+            {
+                "states": states_arr[np.newaxis],
+                "tokens": tokenized[np.newaxis].astype(np.int64),
+            },
+        )[0]
+
+        logits = res[0, -1, :] / 0.8
+        logits -= logits.max()
+        probs = np.exp(logits)
+        probs /= probs.sum()
+        sample = np.random.choice(VOCAB_SIZE, p=probs)
+        pred = self.bins[sample]
+
+        prev_la = lataccel_hist[-1]
+        pred = np.clip(pred, prev_la - MAX_ACC_DELTA, prev_la + MAX_ACC_DELTA)
+
+        new_la = pred if step_idx >= CONTROL_START_IDX else data_row["target_lataccel"]
+        lataccel_hist.append(new_la)
+        return new_la
+
+
+# ══════════════════════════════════════════════════════════════
+#  Get policy warm-start actions for a segment
+# ══════════════════════════════════════════════════════════════
+
+
+def get_policy_actions(data_path, model_path=None):
+    """Run exp055 policy on a segment, return actions array."""
+    import torch, torch.nn as nn, torch.nn.functional as F
+
+    class PolicyActor(nn.Module):
+        def __init__(self):
+            super().__init__()
+            a = [nn.Linear(STATE_DIM, HIDDEN), nn.ReLU()]
+            for _ in range(A_LAYERS - 1):
+                a += [nn.Linear(HIDDEN, HIDDEN), nn.ReLU()]
+            a.append(nn.Linear(HIDDEN, 2))
+            self.actor = nn.Sequential(*a)
+
+        def get_delta(self, obs):
+            logits = self.actor(obs)
+            a_p = F.softplus(logits[..., 0]) + 1.0
+            b_p = F.softplus(logits[..., 1]) + 1.0
+            return 2.0 * a_p / (a_p + b_p) - 1.0
+
+    # Load policy
+    actor = PolicyActor()
+    ckpt = torch.load(BASE_PT, weights_only=False, map_location="cpu")
+    mapped = {
+        k.replace("actor.", ""): v
+        for k, v in ckpt["ac"].items()
+        if k.startswith("actor.")
+    }
+    actor.actor.load_state_dict(mapped)
+    actor.eval()
+    ds = float(ckpt.get("delta_scale", DELTA_SCALE))
+
+    # Load data
+    df = pd.read_csv(str(data_path))
+    data = pd.DataFrame(
+        {
+            "roll_lataccel": np.sin(df["roll"].values) * ACC_G,
+            "v_ego": df["vEgo"].values,
+            "a_ego": df["aEgo"].values,
+            "target_lataccel": df["targetLateralAcceleration"].values,
+            "steer_command": -df["steerCommand"].values,
+        }
+    )
+
+    # Simulate with policy (expected-value for deterministic warm start)
+    sim = PhysicsSim(str(ROOT / "models" / "tinyphysics.onnx"))
+    seed = int(md5(str(data_path).encode()).hexdigest(), 16) % 10**4
+    np.random.seed(seed)
+
+    state_hist, action_hist, lataccel_hist = [], [], []
+    for i in range(CONTEXT_LENGTH):
+        row = data.iloc[i]
+        state_hist.append((row["roll_lataccel"], row["v_ego"], row["a_ego"]))
+        action_hist.append(row["steer_command"])
+        lataccel_hist.append(row["target_lataccel"])
+
+    # Build simple obs and run policy
+    h_act = [0.0] * HIST_LEN
+    h_lat = [0.0] * HIST_LEN
+    actions = []
+
+    for step_idx in range(CONTEXT_LENGTH, len(data)):
+        row = data.iloc[step_idx]
+
+        if step_idx < CONTROL_START_IDX:
+            action = row["steer_command"]
+            sim.step(state_hist, action_hist, lataccel_hist, row, step_idx, action)
+            h_act = h_act[1:] + [action]
+            h_lat = h_lat[1:] + [row["target_lataccel"]]
+            continue
+
+        # Build obs for policy
+        current_la = lataccel_hist[-1]
+        target_la = row["target_lataccel"]
+        roll_la = row["roll_lataccel"]
+        v_ego = row["v_ego"]
+        a_ego = row["a_ego"]
+
+        v2 = max(v_ego * v_ego, 1.0)
+        k_tgt = (target_la - roll_la) / v2
+        k_cur = (current_la - roll_la) / v2
+
+        fp_idx = min(step_idx + 1, len(data) - 1)
+        fp0 = data.iloc[fp_idx]["target_lataccel"]
+        fric = np.sqrt(current_la**2 + a_ego**2) / 7.0
+        prev_act = h_act[-1]
+        prev_act2 = h_act[-2]
+        prev_lat = h_lat[-1]
+
+        error = target_la - current_la
+        h_error_window = [0.0] * HIST_LEN  # simplified
+        ei = error * DEL_T  # simplified integral
+
+        core = np.array(
+            [
+                target_la / S_LAT,
+                current_la / S_LAT,
+                (target_la - current_la) / S_LAT,
+                k_tgt / S_CURV,
+                k_cur / S_CURV,
+                (k_tgt - k_cur) / S_CURV,
+                v_ego / S_VEGO,
+                a_ego / S_AEGO,
+                roll_la / S_ROLL,
+                prev_act / S_STEER,
+                ei / S_LAT,
+                (fp0 - target_la) / DEL_T / S_LAT,
+                (current_la - prev_lat) / DEL_T / S_LAT,
+                (prev_act - prev_act2) / DEL_T / S_STEER,
+                fric,
+                max(0.0, 1.0 - fric),
+            ],
+            dtype=np.float32,
+        )
+
+        def get_future(attr, fallback):
+            vals = data[attr].values[step_idx + 1 : step_idx + 1 + FUTURE_K]
+            if len(vals) < FUTURE_K:
+                vals = np.pad(vals, (0, FUTURE_K - len(vals)), mode="edge")
+            return vals.astype(np.float32)
+
+        obs = np.concatenate(
+            [
+                core,
+                np.array(h_act, np.float32) / S_STEER,
+                np.array(h_lat, np.float32) / S_LAT,
+                get_future("target_lataccel", target_la) / S_LAT,
+                get_future("roll_lataccel", roll_la) / S_ROLL,
+                get_future("v_ego", v_ego) / S_VEGO,
+                get_future("a_ego", a_ego) / S_AEGO,
+            ]
+        )
+        obs = np.clip(obs, -5.0, 5.0)
+
+        with torch.no_grad():
+            raw = actor.get_delta(torch.from_numpy(obs).unsqueeze(0)).item()
+        delta = raw * ds
+        action = np.clip(h_act[-1] + delta, STEER_RANGE[0], STEER_RANGE[1])
+
+        sim.step(state_hist, action_hist, lataccel_hist, row, step_idx, action)
+
+        if step_idx < COST_END_IDX:
+            actions.append(action)
+
+        h_act = h_act[1:] + [action]
+        h_lat = h_lat[1:] + [current_la]
+
+    return np.array(actions)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Coordinate descent MPC optimizer
+# ══════════════════════════════════════════════════════════════
+
+
+def optimize_segment(args):
+    data_path, warm_actions = args
+    sim = PhysicsSim(str(ROOT / "models" / "tinyphysics.onnx"))
+
+    df = pd.read_csv(str(data_path))
+    data = pd.DataFrame(
+        {
+            "roll_lataccel": np.sin(df["roll"].values) * ACC_G,
+            "v_ego": df["vEgo"].values,
+            "a_ego": df["aEgo"].values,
+            "target_lataccel": df["targetLateralAcceleration"].values,
+            "steer_command": -df["steerCommand"].values,
+        }
+    )
+    n_steps = len(data)
+    seed = int(md5(str(data_path).encode()).hexdigest(), 16) % 10**4
+
+    # Working copy of actions
+    n_ctrl = n_steps - CONTROL_START_IDX
+    actions = np.zeros(n_ctrl)
+    n_copy = min(len(warm_actions), n_ctrl)
+    actions[:n_copy] = warm_actions[:n_copy]
+
+    cand_rng = np.random.RandomState(seed + 99999)
+
+    for pass_num in range(NUM_PASSES):
+        radius = SEARCH_RADII[min(pass_num, len(SEARCH_RADII) - 1)]
+
+        # Init sim from scratch
+        np.random.seed(seed)
+        sh, ah, lh = [], [], []
+        for i in range(CONTEXT_LENGTH):
+            row = data.iloc[i]
+            sh.append((row["roll_lataccel"], row["v_ego"], row["a_ego"]))
+            ah.append(row["steer_command"])
+            lh.append(row["target_lataccel"])
+
+        # Warmup
+        for step_idx in range(CONTEXT_LENGTH, CONTROL_START_IDX):
+            sim.step(
+                sh,
+                ah,
+                lh,
+                data.iloc[step_idx],
+                step_idx,
+                data.iloc[step_idx]["steer_command"],
+            )
+
+        # Optimize scored steps
+        improved = 0
+        for t in range(N_SCORED):
+            step_idx = CONTROL_START_IDX + t
+
+            saved_sh = list(sh)
+            saved_ah = list(ah)
+            saved_lh = list(lh)
+            saved_rng = save_rng()
+
+            base = actions[t]
+            perturbs = cand_rng.randn(N_CANDIDATES) * radius
+            candidates = np.clip(base + perturbs, STEER_RANGE[0], STEER_RANGE[1])
+            candidates = np.append(candidates, base)  # always include current
+
+            best_cost = float("inf")
+            best_action = base
+
+            for cand in candidates:
+                restore_rng(saved_rng)
+                # Evaluate H steps forward
+                tsh = list(saved_sh)
+                tah = list(saved_ah)
+                tlh = list(saved_lh)
+
+                cost_lat, cost_jerk = 0.0, 0.0
+                n_terms = 0
+                prev_la = None
+
+                for h in range(HORIZON):
+                    s = step_idx + h
+                    if s >= n_steps:
+                        break
+                    act = (
+                        cand
+                        if h == 0
+                        else (
+                            actions[s - CONTROL_START_IDX]
+                            if s >= CONTROL_START_IDX
+                            and (s - CONTROL_START_IDX) < len(actions)
+                            else 0.0
+                        )
+                    )
+                    new_la = sim.step(tsh, tah, tlh, data.iloc[s], s, act)
+
+                    if CONTROL_START_IDX <= s < COST_END_IDX:
+                        target = data.iloc[s]["target_lataccel"]
+                        cost_lat += (target - new_la) ** 2
+                        if prev_la is not None:
+                            cost_jerk += ((new_la - prev_la) / DEL_T) ** 2
+                        prev_la = new_la
+                        n_terms += 1
+
+                if n_terms > 0:
+                    cost = (
+                        cost_lat / n_terms * 100 * LAT_ACCEL_COST_MULTIPLIER
+                        + cost_jerk / max(n_terms - 1, 1) * 100
+                    )
+                else:
+                    cost = 0.0
+
+                if cost < best_cost:
+                    best_cost = cost
+                    best_action = cand
+
+            if best_action != base:
+                actions[t] = best_action
+                improved += 1
+
+            # Advance with best action
+            sh = saved_sh
+            ah = saved_ah
+            lh = saved_lh
+            restore_rng(saved_rng)
+            sim.step(sh, ah, lh, data.iloc[step_idx], step_idx, best_action)
+
+        # Steps after scoring window
+        for step_idx in range(COST_END_IDX, n_steps):
+            cidx = step_idx - CONTROL_START_IDX
+            act = actions[cidx] if cidx < len(actions) else 0.0
+            sim.step(sh, ah, lh, data.iloc[step_idx], step_idx, act)
+
+    # Final cost
+    from experiments.exp084_mpc_cd.rng_eval import evaluate_actions
+
+    final_cost = evaluate_actions(str(data_path), actions)
+
+    return str(data_path), actions, final_cost
+
+
+# ══════════════════════════════════════════════════════════════
+#  RNG replay evaluator (inline)
+# ══════════════════════════════════════════════════════════════
+
+
+def evaluate_actions(data_path, actions):
+    sim = PhysicsSim(str(ROOT / "models" / "tinyphysics.onnx"))
+    df = pd.read_csv(str(data_path))
+    data = pd.DataFrame(
+        {
+            "roll_lataccel": np.sin(df["roll"].values) * ACC_G,
+            "v_ego": df["vEgo"].values,
+            "a_ego": df["aEgo"].values,
+            "target_lataccel": df["targetLateralAcceleration"].values,
+            "steer_command": -df["steerCommand"].values,
+        }
+    )
+    seed = int(md5(str(data_path).encode()).hexdigest(), 16) % 10**4
+    np.random.seed(seed)
+
+    sh, ah, lh = [], [], []
+    for i in range(CONTEXT_LENGTH):
+        row = data.iloc[i]
+        sh.append((row["roll_lataccel"], row["v_ego"], row["a_ego"]))
+        ah.append(row["steer_command"])
+        lh.append(row["target_lataccel"])
+
+    for step_idx in range(CONTEXT_LENGTH, len(data)):
+        row = data.iloc[step_idx]
+        cidx = step_idx - CONTROL_START_IDX
+        if step_idx >= CONTROL_START_IDX and 0 <= cidx < len(actions):
+            action = actions[cidx]
+        else:
+            action = row["steer_command"]
+        sim.step(sh, ah, lh, row, step_idx, action)
+
+    targets = np.array(
+        [
+            data.iloc[i]["target_lataccel"]
+            for i in range(CONTROL_START_IDX, COST_END_IDX)
+        ]
+    )
+    preds = np.array(lh[CONTROL_START_IDX:COST_END_IDX])
+    lat_cost = np.mean((targets - preds) ** 2) * 100
+    jerk_cost = np.mean((np.diff(preds) / DEL_T) ** 2) * 100
+    return lat_cost * LAT_ACCEL_COST_MULTIPLIER + jerk_cost
+
+
+# ══════════════════════════════════════════════════════════════
+#  Main
+# ══════════════════════════════════════════════════════════════
+
+
+def main():
+    print(f"exp084 — Coordinate descent MPC with RNG replay")
+    print(f"  candidates={N_CANDIDATES}  horizon={HORIZON}  passes={NUM_PASSES}")
+    print(f"  radii={SEARCH_RADII}  segments={N_SEGMENTS}  workers={N_WORKERS}")
+
+    all_csv = sorted((ROOT / "data").glob("*.csv"))[:N_SEGMENTS]
+    OUT_DIR.mkdir(exist_ok=True)
+
+    # Get policy warm-start actions for all segments
+    print(f"\nExtracting policy warm-start actions...")
+    t0 = time.time()
+
+    # Just do a few to test
+    all_results = []
+    for i, csv_path in enumerate(all_csv):
+        t_seg = time.time()
+        warm_actions = get_policy_actions(csv_path)
+        warm_cost = evaluate_actions(str(csv_path), warm_actions)
+
+        _, opt_actions, opt_cost = optimize_segment((csv_path, warm_actions))
+        dt = time.time() - t_seg
+
+        improve = warm_cost - opt_cost
+        print(
+            f"  [{i:4d}] {csv_path.name}  warm={warm_cost:.1f}  opt={opt_cost:.1f}"
+            f"  Δ={improve:.1f}  ⏱{dt:.0f}s"
+        )
+
+        all_results.append(
+            {
+                "path": str(csv_path),
+                "warm_cost": warm_cost,
+                "opt_cost": opt_cost,
+                "actions": opt_actions,
+            }
+        )
+
+        # Periodic save
+        if (i + 1) % 10 == 0 or i == len(all_csv) - 1:
+            warm_costs = [r["warm_cost"] for r in all_results]
+            opt_costs = [r["opt_cost"] for r in all_results]
+            print(
+                f"\n  [{i + 1} segs] warm={np.mean(warm_costs):.1f}  opt={np.mean(opt_costs):.1f}"
+                f"  Δ={np.mean(warm_costs) - np.mean(opt_costs):.1f}\n"
+            )
+
+            np.savez(
+                OUT_DIR / "optimized.npz",
+                paths=[r["path"] for r in all_results],
+                warm_costs=np.array(warm_costs),
+                opt_costs=np.array(opt_costs),
+                actions=np.stack([r["actions"] for r in all_results]),
+            )
+
+    wm = np.mean([r["warm_cost"] for r in all_results])
+    om = np.mean([r["opt_cost"] for r in all_results])
+    print(f"\nDone. {len(all_results)} segments.")
+    print(f"  Warm: {wm:.1f}  Optimized: {om:.1f}  Δ: {wm - om:.1f}")
+
+
+if __name__ == "__main__":
+    main()
