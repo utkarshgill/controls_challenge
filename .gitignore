@@ -40,3 +40,7 @@ Thumbs.db
 # Large data files
 *.pkl
 data/
+
+experiments/exp110_mpc/checkpoints/bc_data.npz
+
+experiments/exp110_mpc/checkpoints/bc_data.npz

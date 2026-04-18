@@ -61,6 +61,11 @@ CEM_SIGMA_START = float(os.getenv("CEM_SIGMA_START", "0.1"))
 CEM_SIGMA_END = float(os.getenv("CEM_SIGMA_END", "0.01"))
 CEM_ELITE = float(os.getenv("CEM_ELITE", "0.1"))
 N_BASIS = int(os.getenv("N_BASIS", "40"))
+# Pass 3+: per-step coord descent refinement
+CD_PASSES = int(os.getenv("CD_PASSES", "3"))
+CD_K = int(os.getenv("CD_K", "128"))
+CD_SIGMA_START = float(os.getenv("CD_SIGMA_START", "0.005"))
+CD_SIGMA_END = float(os.getenv("CD_SIGMA_END", "0.001"))
 SAVE_DIR = Path(
     os.getenv("SAVE_DIR", str(Path(__file__).resolve().parent / "checkpoints"))
 )
@@ -98,9 +103,74 @@ def mpc_pass(csv_files, mdl_path, ort_sess, csv_cache):
     err_sum = torch.zeros(N, dtype=torch.float32, device="cuda")
     obs_buf = torch.empty((N, OBS_DIM), dtype=torch.float32, device="cuda")
     hist_head = HIST_LEN - 1
-    stored = torch.zeros((N, N_CTRL), dtype=torch.float32, device="cuda")
     K = MPC_K
     H = MPC_H
+
+    # Pre-fill stored actions by running policy deterministically
+    stored = torch.zeros((N, N_CTRL), dtype=torch.float32, device="cuda")
+    _h_act_pre = torch.zeros((N, HIST_LEN), dtype=torch.float64, device="cuda")
+    _h_act32_pre = torch.zeros((N, HIST_LEN), dtype=torch.float32, device="cuda")
+    _h_lat_pre = torch.zeros((N, HIST_LEN), dtype=torch.float32, device="cuda")
+    _h_error_pre = torch.zeros((N, HIST_LEN), dtype=torch.float32, device="cuda")
+    _err_sum_pre = torch.zeros(N, dtype=torch.float32, device="cuda")
+    _hh_pre = HIST_LEN - 1
+
+    data_pre, rng_pre = csv_cache.slice(csv_files)
+    sim_pre = BatchedSimulator(
+        str(mdl_path), ort_session=ort_sess, cached_data=data_pre, cached_rng=rng_pre
+    )
+    dg_pre = sim_pre.data_gpu
+    future_pre = _precompute_future_windows(dg_pre)
+
+    def ctrl_pre(step_idx, sim_ref):
+        nonlocal _hh_pre, _err_sum_pre
+        target = dg_pre["target_lataccel"][:, step_idx]
+        current = sim_ref.current_lataccel
+        cur32 = current.float()
+        error = (target - current).float()
+        nh = (_hh_pre + 1) % HIST_LEN
+        old = _h_error_pre[:, nh]
+        _h_error_pre[:, nh] = error
+        _err_sum_pre = _err_sum_pre + error - old
+        ei = _err_sum_pre * (DEL_T / HIST_LEN)
+        if step_idx < CONTROL_START_IDX:
+            _h_act_pre[:, nh] = 0.0
+            _h_act32_pre[:, nh] = 0.0
+            _h_lat_pre[:, nh] = cur32
+            _hh_pre = nh
+            return torch.zeros(N, dtype=torch.float64, device="cuda")
+        ci = step_idx - CONTROL_START_IDX
+        fill_obs(
+            obs_buf,
+            target.float(),
+            cur32,
+            dg_pre["roll_lataccel"][:, step_idx].float(),
+            dg_pre["v_ego"][:, step_idx].float(),
+            dg_pre["a_ego"][:, step_idx].float(),
+            _h_act32_pre,
+            _h_lat_pre,
+            _hh_pre,
+            ei,
+            future_pre,
+            step_idx,
+        )
+        with torch.no_grad():
+            logits = ac.actor(obs_buf)
+        a_p = tF.softplus(logits[..., 0]) + 1.0
+        b_p = tF.softplus(logits[..., 1]) + 1.0
+        raw = 2.0 * a_p / (a_p + b_p) - 1.0
+        delta = raw.to(_h_act_pre.dtype) * ds
+        action = (_h_act_pre[:, _hh_pre] + delta).clamp(STEER_RANGE[0], STEER_RANGE[1])
+        if ci < N_CTRL:
+            stored[:, ci] = action.float()
+        _h_act_pre[:, nh] = action
+        _h_act32_pre[:, nh] = action.float()
+        _h_lat_pre[:, nh] = cur32
+        _hh_pre = nh
+        return action
+
+    sim_pre.rollout(ctrl_pre)
+    print(f"    (policy pre-fill done)")
 
     def ctrl(step_idx, sim_ref):
         nonlocal hist_head, err_sum
@@ -358,6 +428,164 @@ def cem_pass(csv_files, stored_actions, mdl_path, ort_sess, csv_cache, sigma, n_
 
 
 # ═══════════════════════════════════════════════════════════
+# Pass 3+: Per-step coord descent (from exp101, true sequential)
+# ═══════════════════════════════════════════════════════════
+
+
+def coord_descent_pass(csv_files, stored_actions, mdl_path, ort_sess, csv_cache, sigma):
+    """True sequential coord descent: perturb one step at a time, execute best."""
+    data, rng = csv_cache.slice(csv_files)
+    sim = BatchedSimulator(
+        str(mdl_path), ort_session=ort_sess, cached_data=data, cached_rng=rng
+    )
+    N = sim.N
+    K = CD_K
+    H = MPC_H
+    dg = sim.data_gpu
+    mpc_phys = BatchedPhysicsModel(str(mdl_path), ort_session=ort_sess)
+    orig_actions = stored_actions
+    live_actions = stored_actions.clone()
+    improved_count = 0
+
+    def ctrl(step_idx, sim_ref):
+        nonlocal improved_count
+        if step_idx < CONTROL_START_IDX:
+            return torch.zeros(N, dtype=torch.float64, device="cuda")
+        ci = step_idx - CONTROL_START_IDX
+        if ci >= N_CTRL:
+            return torch.zeros(N, dtype=torch.float64, device="cuda")
+
+        base_action = orig_actions[:, ci]
+        noise = torch.randn(N, K, device="cuda") * sigma
+        action_cand = (base_action.unsqueeze(1) + noise).clamp(
+            STEER_RANGE[0], STEER_RANGE[1]
+        )
+        action_cand[:, 0] = base_action
+
+        NK = N * K
+        start = max(0, step_idx - CL + 1)
+        act_h = sim_ref.action_history[:, start:step_idx].float()
+        st_h_prev = sim_ref.state_history[:, start:step_idx, :3].float()
+        cur_state = torch.stack(
+            [
+                dg["roll_lataccel"][:, step_idx].float(),
+                dg["v_ego"][:, step_idx].float(),
+                dg["a_ego"][:, step_idx].float(),
+            ],
+            dim=-1,
+        )
+        st_h = torch.cat([st_h_prev, cur_state.unsqueeze(1)], dim=1)
+        pr_h = sim_ref.current_lataccel_history[
+            :, max(0, step_idx - CL) : step_idx
+        ].float()
+
+        pa = CL - 1 - act_h.shape[1]
+        ps = CL - st_h.shape[1]
+        pp = CL - pr_h.shape[1]
+        if pa > 0:
+            act_h = tF.pad(act_h, (pa, 0))
+        if ps > 0:
+            st_h = tF.pad(st_h, (0, 0, ps, 0))
+        if pp > 0:
+            pr_h = tF.pad(pr_h, (pp, 0))
+
+        cur_la = sim_ref.current_lataccel.float()
+        act_h = act_h.unsqueeze(1).expand(-1, K, -1).reshape(NK, -1)
+        st_h = st_h.unsqueeze(1).expand(-1, K, -1, -1).reshape(NK, CL, 3)
+        pr_h = pr_h.unsqueeze(1).expand(-1, K, -1).reshape(NK, -1)
+        cur_la_k = cur_la.unsqueeze(1).expand(-1, K).reshape(NK)
+        rng_base = sim_ref._rng_all_gpu[step_idx - CL : step_idx - CL + H, :]
+
+        costs = torch.zeros(NK, device="cuda")
+        prev_la = cur_la_k.clone()
+        for h_i in range(H):
+            s = step_idx + h_i
+            if s >= dg["target_lataccel"].shape[1]:
+                break
+            s_ci = s - CONTROL_START_IDX
+            if h_i == 0:
+                cur_steer = action_cand.reshape(NK)
+            else:
+                if 0 <= s_ci < N_CTRL:
+                    cur_steer = (
+                        live_actions[:, s_ci].unsqueeze(1).expand(-1, K).reshape(NK)
+                    )
+                else:
+                    cur_steer = torch.zeros(NK, device="cuda")
+
+            a_ctx = torch.cat([act_h, cur_steer.unsqueeze(1)], dim=1)
+            s_idx = min(s, dg["roll_lataccel"].shape[1] - 1)
+            new_st = torch.stack(
+                [
+                    dg["roll_lataccel"][:, s_idx]
+                    .float()
+                    .unsqueeze(1)
+                    .expand(-1, K)
+                    .reshape(NK),
+                    dg["v_ego"][:, s_idx]
+                    .float()
+                    .unsqueeze(1)
+                    .expand(-1, K)
+                    .reshape(NK),
+                    dg["a_ego"][:, s_idx]
+                    .float()
+                    .unsqueeze(1)
+                    .expand(-1, K)
+                    .reshape(NK),
+                ],
+                dim=-1,
+            )
+            s_ctx = torch.cat([st_h[:, 1:], new_st.unsqueeze(1)], dim=1)
+            full_states = torch.cat([a_ctx.unsqueeze(-1), s_ctx], dim=-1)
+            tokens = (
+                torch.bucketize(pr_h.clamp(-5, 5), BINS, right=False)
+                .clamp(0, VOCAB_SIZE - 1)
+                .long()
+            )
+            if h_i < rng_base.shape[0]:
+                rng_h = rng_base[h_i].unsqueeze(1).expand(-1, K).reshape(NK)
+            else:
+                rng_h = torch.rand(NK, device="cuda", dtype=torch.float64)
+            sampled = mpc_phys._predict_gpu(
+                {"states": full_states, "tokens": tokens}, temperature=0.8, rng_u=rng_h
+            )
+            pred_la = (
+                BINS[sampled]
+                .float()
+                .clamp(cur_la_k - MAX_ACC_DELTA, cur_la_k + MAX_ACC_DELTA)
+            )
+            if CONTROL_START_IDX <= s < COST_END_IDX:
+                tgt = (
+                    dg["target_lataccel"][:, s]
+                    .float()
+                    .unsqueeze(1)
+                    .expand(-1, K)
+                    .reshape(NK)
+                )
+                costs += (tgt - pred_la) ** 2 * 100 * LAT_ACCEL_COST_MULTIPLIER
+                if h_i > 0:
+                    costs += ((pred_la - prev_la) / DEL_T) ** 2 * 100
+            prev_la = pred_la
+            act_h = a_ctx[:, 1:]
+            st_h = s_ctx
+            pr_h = torch.cat([pr_h[:, 1:], pred_la.unsqueeze(1)], dim=1)
+            cur_la_k = pred_la
+
+        cost_2d = costs.view(N, K)
+        best_idx = cost_2d.argmin(dim=1)
+        best_action = action_cand[torch.arange(N, device="cuda"), best_idx]
+        changed = best_idx != 0
+        if changed.any():
+            live_actions[changed, ci] = best_action[changed]
+            improved_count += changed.sum().item()
+
+        return live_actions[:, ci].double()
+
+    costs = sim.rollout(ctrl)["total_cost"]
+    return costs, live_actions
+
+
+# ═══════════════════════════════════════════════════════════
 # Main pipeline
 # ═══════════════════════════════════════════════════════════
 
@@ -389,6 +617,18 @@ def main():
         )
         dt = time.time() - t0
         print(f"    mean={np.mean(costs):.1f}  ⏱{dt:.0f}s")
+
+    # Coord descent passes: fine per-step refinement
+    if CD_PASSES > 0:
+        cd_sigmas = np.geomspace(CD_SIGMA_START, CD_SIGMA_END, CD_PASSES)
+        for p, sig in enumerate(cd_sigmas):
+            print(f"\n  CD pass {p + 1}: σ={sig:.4f} (K={CD_K}, H={MPC_H})")
+            t0 = time.time()
+            costs, stored = coord_descent_pass(
+                all_csv, stored, mdl_path, ort_sess, csv_cache, sigma=sig
+            )
+            dt = time.time() - t0
+            print(f"    mean={np.mean(costs):.1f}  ⏱{dt:.0f}s")
 
     # Final verification
     print(f"\n  Final verification:")
